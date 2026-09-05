@@ -131,10 +131,32 @@ public enum ModelCatalog {
     }
 
     /// Capabilities + pricing + quality for a model on a given provider kind.
+    ///
+    /// Order of authority: the live `models.dev` index first, because a
+    /// hand-written table always trails the models people actually run; then the
+    /// bundled patterns below; then a conservative unknown. Whichever source
+    /// answers, gaps are filled from the next one down rather than left blank.
     public static func metadata(for modelID: String, kind: ProviderKind)
         -> (capabilities: ModelCapabilities, pricing: Pricing?, quality: Double) {
 
-        guard let e = lookup(modelID) else {
+        let bundled = lookup(modelID)
+
+        if let live = RemoteModelCatalog.shared.lookup(modelID, kind: kind) {
+            var capabilities = live.capabilities
+            if let fallback = bundled {
+                capabilities = capabilities.fillingGaps(
+                    from: ModelCapabilities(flags: fallback.flags,
+                                            contextWindow: fallback.context,
+                                            maxOutputTokens: fallback.maxOutput,
+                                            source: .builtin))
+            }
+            // Local and subscription targets have no marginal per-token cost,
+            // whatever the vendor's list price is.
+            let pricing: Pricing? = (kind.isLocal || kind.isSubscription) ? .free : live.pricing
+            return (capabilities, pricing, bundled?.quality ?? qualityHeuristic(for: live))
+        }
+
+        guard let e = bundled else {
             // Unknown model: assume plain streaming chat. Tools are deliberately
             // NOT assumed — claiming a capability we lack causes hard failures,
             // while omitting one only costs us a routing option the user can
@@ -151,10 +173,36 @@ public enum ModelCatalog {
         return (caps, pricing, e.quality)
     }
 
+    /// A quality score for a model the bundled table has never heard of.
+    ///
+    /// Derived from what the live index states rather than invented: a bigger
+    /// context, tool use and reasoning all indicate a more capable model. It is
+    /// only a starting point — the score is the one number a user is expected to
+    /// tune themselves.
+    static func qualityHeuristic(for entry: RemoteModelCatalog.Entry) -> Double {
+        var score = 60.0
+        if let window = entry.contextWindow {
+            if window >= 500_000 { score += 12 }
+            else if window >= 180_000 { score += 8 }
+            else if window >= 100_000 { score += 4 }
+        }
+        if entry.toolCall { score += 6 }
+        if entry.reasoning { score += 8 }
+        if entry.inputModalities.contains("image") { score += 4 }
+        let name = (entry.id + " " + (entry.family ?? "")).lowercased()
+        if name.contains("mini") || name.contains("lite") || name.contains("small") { score -= 12 }
+        if name.contains("nano") || name.contains("tiny") { score -= 18 }
+        if name.contains("opus") || name.contains("pro") || name.contains("max") { score += 6 }
+        return Swift.min(98, Swift.max(35, score))
+    }
+
     /// Models a provider kind is known to offer, used when discovery is not
     /// available (subscription backends do not expose a /models endpoint).
     public static func presetModels(for kind: ProviderKind) -> [String] {
         switch kind {
+        case .claudeCodeCLI:
+            // The CLI resolves these aliases to the newest model in each tier.
+            return ["opus", "sonnet", "haiku"]
         case .anthropicSubscription, .anthropic:
             return ["claude-opus-4-5-20251101", "claude-sonnet-4-5-20250929", "claude-haiku-4-5-20251001"]
         case .chatgptSubscription:

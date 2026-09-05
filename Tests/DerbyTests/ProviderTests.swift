@@ -205,12 +205,39 @@ func registerProviderTests() {
         test("model discovery reads /v1/models") {
             let transport = MockTransport()
             transport.stub("/v1/models", json: """
-            {"object":"list","data":[{"id":"qwen3.5:9b"},{"id":"nomic-embed-text:latest"}]}
+            {"object":"list","data":[{"id":"gpt-test-a"},{"id":"gpt-test-b"}]}
+            """)
+            let account = Fixture.account("Compatible", kind: .openAICompatible, models: [])
+            let models = try await OpenAIAdapter().listModels(ctx(account, transport: transport))
+            try expectEqual(models.count, 2)
+            try expect(models.contains { $0.id == "gpt-test-a" })
+        }
+
+        test("Ollama discovery uses the native endpoint, which reports far more") {
+            let transport = MockTransport()
+            transport.stub("/api/tags", json: """
+            {"models":[
+              {"model":"qwen3.5:9b","size":6594474711,
+               "details":{"family":"qwen35","parameter_size":"9.7B","quantization_level":"Q4_K_M",
+                          "context_length":262144,"embedding_length":4096},
+               "capabilities":["vision","completion","tools","thinking"]},
+              {"model":"nomic-embed-text:latest","size":274302450,
+               "details":{"family":"nomic-bert","context_length":8192,"embedding_length":768},
+               "capabilities":["embedding"]}]}
             """)
             let account = Fixture.account("Ollama", kind: .ollama, models: [])
             let models = try await OpenAIAdapter().listModels(ctx(account, transport: transport))
             try expectEqual(models.count, 2)
-            try expect(models.contains { $0.id == "qwen3.5:9b" })
+            let chat = try expectNotNil(models.first { $0.id == "qwen3.5:9b" })
+            try expectEqual(chat.capabilities?.contextWindow, 262_144,
+                            "the compatible endpoint would have reported no window at all")
+            try expect(chat.capabilities?.flags.contains(.vision) == true)
+            try expectEqual(chat.profile?.parameterSize, "9.7B")
+            let embedder = try expectNotNil(models.first { $0.id == "nomic-embed-text:latest" })
+            try expect(embedder.capabilities?.flags.contains(.embeddings) == true)
+            try expectEqual(embedder.capabilities?.embeddingDimensions, 768)
+            // The native endpoint was used, not the compatible one.
+            try expect(transport.requests.allSatisfy { !$0.url.path.hasSuffix("/v1/models") })
         }
 
         test("an API key is sent as a bearer token") {
@@ -545,6 +572,76 @@ func registerProviderTests() {
             try expectEqual(frames[0].eventType, "contentBlockDelta")
             let json = try expectNotNil(JSONValue.parse(String(decoding: frames[0].payload, as: UTF8.self)))
             try expectEqual(json["delta"]?["text"]?.stringValue, "hi")
+        }
+    }
+}
+
+func registerAPIKeyTests() {
+    func ctx(_ account: ProviderAccount, transport: MockTransport,
+             secrets: InMemorySecretStore = InMemorySecretStore()) -> ProviderContext {
+        ProviderContext(account: account, transport: transport, secrets: secrets,
+                        credentials: CredentialCache(), attemptTimeout: 5)
+    }
+
+    suite("Providers / API key requirement") {
+        test("each kind declares exactly one requirement") {
+            // The Add Provider form renders one field from this, rather than
+            // overlapping conditions — which is what produced two key boxes.
+            for kind in ProviderKind.allCases {
+                let requirement = kind.apiKeyRequirement
+                if kind.cliCredentialSource != nil || kind == .bedrock {
+                    try expectEqual(requirement, .notApplicable,
+                                    "\(kind.rawValue) gets credentials elsewhere")
+                } else if kind.isLocal || kind == .openAICompatible {
+                    try expectEqual(requirement, .optional, "\(kind.rawValue) may be unauthenticated")
+                } else {
+                    try expectEqual(requirement, .required, "\(kind.rawValue) is a metered API")
+                }
+            }
+        }
+
+        test("a custom endpoint works with no key at all") {
+            // No Authorization header should be sent, and nothing should fail for
+            // want of a credential that was never needed.
+            let transport = MockTransport()
+            transport.stub("/v1/chat/completions", json: """
+            {"id":"1","model":"m","choices":[{"message":{"role":"assistant","content":"ok"},
+             "finish_reason":"stop"}]}
+            """)
+            var account = Fixture.account("Private server", kind: .openAICompatible,
+                                          models: [Fixture.model("m")])
+            account.auth = .none
+            let response = try await OpenAIAdapter().execute(CanonicalRequest(requestedModel: "l"),
+                                                             model: "m",
+                                                             ctx: ctx(account, transport: transport))
+            try expectEqual(response.message.joinedText, "ok")
+            let headers = try expectNotNil(transport.requests.first?.headers)
+            try expectNil(headers["authorization"], "no key means no Authorization header")
+        }
+
+        test("the same endpoint sends a bearer token once a key is added") {
+            let transport = MockTransport()
+            transport.stub("/v1/chat/completions", json: """
+            {"id":"1","model":"m","choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}
+            """)
+            let ref = SecretRef(account: "custom.key")
+            var account = Fixture.account("Private server", kind: .openAICompatible,
+                                          models: [Fixture.model("m")])
+            account.auth = .apiKey(ref)
+            let secrets = InMemorySecretStore(["custom.key": "sk-private"])
+            _ = try await OpenAIAdapter().execute(CanonicalRequest(requestedModel: "l"), model: "m",
+                                                   ctx: ctx(account, transport: transport, secrets: secrets))
+            try expectEqual(transport.requests.first?.headers["authorization"], "Bearer sk-private")
+        }
+
+        test("a metered provider missing its key fails with an actionable error") {
+            var account = Fixture.account("OpenAI", kind: .openai, models: [Fixture.model("m")])
+            account.auth = .apiKey(SecretRef(account: "absent"))
+            let error = try await expectFailure(.authentication) {
+                _ = try await OpenAIAdapter().execute(CanonicalRequest(requestedModel: "l"), model: "m",
+                                                       ctx: ctx(account, transport: MockTransport()))
+            }
+            try expectContains(error.message, "No API key saved")
         }
     }
 }

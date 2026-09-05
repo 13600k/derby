@@ -150,10 +150,22 @@ struct ProviderDetailView: View {
                             .textSelection(.enabled)
                     }
                     if result.ok && !result.discovered.isEmpty {
-                        Button("Import \(result.discovered.count) discovered model\(result.discovered.count == 1 ? "" : "s")") {
-                            importModels(result.discovered)
+                        VStack(alignment: .leading, spacing: 4) {
+                            ForEach(result.discovered.prefix(6), id: \.id) { item in
+                                Text(item.summary)
+                                    .font(.system(size: 10, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                            }
+                            if result.discovered.count > 6 {
+                                Text("…and \(result.discovered.count - 6) more")
+                                    .font(.caption2).foregroundStyle(.secondary)
+                            }
+                            Button("Import \(result.discovered.count) discovered model\(result.discovered.count == 1 ? "" : "s")") {
+                                importModels(result.discovered)
+                            }
+                            .buttonStyle(.link)
                         }
-                        .buttonStyle(.link)
                     }
                 }
                 Spacer()
@@ -168,14 +180,20 @@ struct ProviderDetailView: View {
         Card(title: "Authentication", subtitle: current.auth.displayName, systemImage: "key") {
             switch current.auth {
             case .none:
-                Text("This endpoint is used without credentials.")
-                    .font(.callout).foregroundStyle(.secondary)
-                Button("Add an API key") {
-                    draft?.auth = .apiKey(.new("provider.key"))
-                    apiKeyInput = ""
-                    save()
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(current.kind.apiKeyRequirement == .required
+                         ? "No credential saved. \(current.kind.displayName) will reject requests until you add one."
+                         : "This endpoint is used without credentials. Derby sends no Authorization header.")
+                        .font(.callout)
+                        .foregroundStyle(current.kind.apiKeyRequirement == .required ? .orange : .secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Button(current.kind.apiKeyRequirement == .required ? "Add the API key" : "Add an API key") {
+                        draft?.auth = .apiKey(.new("provider.key"))
+                        apiKeyInput = ""
+                        save()
+                    }
+                    .buttonStyle(.link)
                 }
-                .buttonStyle(.link)
 
             case .apiKey(let ref), .customHeader(_, let ref, _):
                 VStack(alignment: .leading, spacing: 10) {
@@ -185,6 +203,14 @@ struct ProviderDetailView: View {
                     HStack(spacing: 10) {
                         Button("Save Key") { saveSecret(ref) }
                             .disabled(apiKeyInput.isEmpty)
+                        if current.kind.apiKeyRequirement == .optional {
+                            Button("Remove Key") {
+                                try? model.engine.secrets.delete(ref)
+                                apiKeyInput = ""
+                                draft?.auth = .none
+                                save()
+                            }
+                        }
                         if model.engine.secrets.has(ref) {
                             Label("Stored in Keychain (\(model.engine.secrets.fingerprint(ref) ?? ""))",
                                   systemImage: "checkmark.shield")
@@ -398,11 +424,11 @@ struct ProviderDetailView: View {
                              onQuality: { quality in
                                  updateModel(physical.id) { $0.qualityScore = quality }
                              },
-                             onCapabilities: { flags in
-                                 updateModel(physical.id) { $0.capabilityOverrides.flags = flags }
-                             },
                              onContext: { window in
                                  updateModel(physical.id) { $0.capabilityOverrides.contextWindow = window }
+                             },
+                             onMaxOutput: { maxOutput in
+                                 updateModel(physical.id) { $0.capabilityOverrides.maxOutputTokens = maxOutput }
                              },
                              onPricing: { pricing in
                                  updateModel(physical.id) { $0.pricingOverride = pricing }
@@ -575,10 +601,17 @@ struct ProviderDetailView: View {
         // Refresh capability metadata on models that already existed, so a
         // re-discovery picks up newly reported features.
         for item in found {
-            guard let index = current.models.firstIndex(where: { $0.modelID == item.id }),
-                  let caps = item.capabilities else { continue }
-            current.models[index].capabilities = caps
+            guard let index = current.models.firstIndex(where: { $0.modelID == item.id }) else { continue }
+            if let caps = item.capabilities {
+                let known = ModelCatalog.metadata(for: item.id, kind: current.kind).capabilities
+                current.models[index].capabilities = caps.fillingGaps(from: known)
+            }
+            if let profile = item.profile { current.models[index].profile = profile }
             if current.models[index].displayName == nil { current.models[index].displayName = item.displayName }
+            // Only adopt published pricing where the user has not set their own.
+            if let pricing = item.pricing, current.models[index].pricingOverride == nil {
+                current.models[index].pricingOverride = pricing
+            }
         }
 
         // For providers whose catalog is definitive, drop models the account can

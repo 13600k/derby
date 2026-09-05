@@ -204,6 +204,29 @@ struct RequestInspector: View {
                     .font(.callout)
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
+
+                // A shortened conversation is the one thing here the user did
+                // not ask for on this request, so it gets its own callout
+                // rather than a line buried in the narrative.
+                if let c = record.compaction {
+                    Divider()
+                    Label {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("Conversation shortened to fit")
+                                .font(.callout.weight(.semibold))
+                            Text(c.summary)
+                                .font(.caption).foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                            if let f = c.summaryFailure {
+                                Text("Summary unavailable: \(f)")
+                                    .font(.caption).foregroundStyle(.orange)
+                            }
+                        }
+                    } icon: {
+                        Image(systemName: "arrow.down.right.and.arrow.up.left").foregroundStyle(.orange)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
             }
         }
     }

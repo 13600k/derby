@@ -68,6 +68,7 @@ func registerCodexCatalogTests() {
         {"fetched_at":"2026-08-27T02:05:12.219528Z","client_version":"0.147.0","models":[
           {"slug":"gpt-5.6-sol","display_name":"GPT-5.6-Sol","description":"flagship","priority":1,
            "visibility":"list","supported_in_api":true,"default_reasoning_level":"medium",
+           "context_window":272000,"max_context_window":872000,
            "supported_reasoning_levels":[{"effort":"low"},{"effort":"medium"},{"effort":"high"},
                                          {"effort":"xhigh"},{"effort":"max"},{"effort":"ultra"}]},
           {"slug":"gpt-5.6-luna","display_name":"GPT-5.6-Luna","description":"","priority":3,
@@ -137,6 +138,18 @@ func registerCodexCatalogTests() {
             try expect(caps.flags.contains(.tools))
             try expect(!caps.flags.contains(.vision), "vision is not stated by the catalog, so it is not claimed")
             try expectEqual(caps.source, .discovered)
+            // The catalog states the real window; Derby must not leave the field
+            // empty and let a name-pattern guess stand in for it.
+            try expectEqual(caps.contextWindow, 872_000)
+        }
+
+        test("a model the catalog says nothing about reports no window of its own") {
+            let url = try writeCache(sample)
+            defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+            let entry = try expectNotNil(
+                CodexModelCatalog.parse(contentsOf: url)?.entries.first { $0.slug == "gpt-5.4-mini" })
+            try expectNil(ChatGPTCodexAdapter.capabilities(for: entry).contextWindow,
+                          "nothing stated means nothing claimed; the catalog fills it in later")
         }
 
         test("a malformed or missing cache yields nothing rather than crashing") {
@@ -161,6 +174,9 @@ func registerCodexCatalogTests() {
             try expect(selectable.allSatisfy { !$0.slug.isEmpty && !$0.displayName.isEmpty })
             if let flagship = selectable.first {
                 try expect(flagship.derivedQuality >= 90, "the top-ranked model should score highly")
+                if let window = flagship.maxContextWindow ?? flagship.contextWindow {
+                    try expect(window > 100_000, "the real cache publishes a context window; parse it")
+                }
             }
         }
 

@@ -110,12 +110,25 @@ public enum LocalDiscovery {
 
     public static func scanSubscriptions() -> [SubscriptionFinding] {
         let pairs: [(CLICredentialSource, ProviderKind)] = [
-            (.claudeCode, .anthropicSubscription),
+            // The CLI path draws on plan limits; the direct-API path is billed as
+            // third-party extra usage, so this is the one to offer.
+            (.claudeCode, .claudeCodeCLI),
             (.codexCLI, .chatgptSubscription),
             (.geminiCLI, .geminiSubscription),
             (.qwenCLI, .qwenSubscription),
         ]
         return pairs.map { source, kind in
+            // The CLI-backed path needs only the executable: Derby never reads
+            // that credential, and probing the Keychain here would raise an
+            // authorization dialog on every scan.
+            if kind == .claudeCodeCLI {
+                if let binary = ProcessRunner.locate("claude") {
+                    return SubscriptionFinding(source: source, kind: kind, available: true,
+                                               detail: "Claude Code found at \(binary.path) — uses your plan limits.")
+                }
+                return SubscriptionFinding(source: source, kind: kind, available: false,
+                                           detail: "Claude Code CLI not found. Install it, then rescan.")
+            }
             do {
                 let cred = try CLICredentialReader.read(source)
                 return SubscriptionFinding(source: source, kind: kind, available: true,

@@ -4,8 +4,12 @@ public struct GatewaySettings: Codable, Sendable, Hashable {
     public var port: Int
     /// Defaults to loopback. Binding elsewhere requires an explicit opt-in.
     public var bindAddress: String
+    /// Off by default: the gateway is loopback-only, so a client needs nothing
+    /// but the port. Turning it on is the opt-in for anyone who exposes Derby
+    /// beyond this Mac (see `allowRemoteAccess`).
     public var requireAPIKey: Bool
-    /// Keychain reference for the generated local key.
+    /// Keychain reference for the local key. Only touched while `requireAPIKey`
+    /// is on, so the default configuration never reaches for the Keychain.
     public var localKeyRef: SecretRef
     public var autoStart: Bool
     /// Allow non-loopback binds. Guard-railed in the UI with a warning.
@@ -15,7 +19,7 @@ public struct GatewaySettings: Codable, Sendable, Hashable {
     public var allowedOrigins: [String]
 
     public init(port: Int = 8787, bindAddress: String = "127.0.0.1",
-                requireAPIKey: Bool = true,
+                requireAPIKey: Bool = false,
                 localKeyRef: SecretRef = SecretRef(account: "gateway.localKey"),
                 autoStart: Bool = true, allowRemoteAccess: Bool = false,
                 maxConcurrentRequests: Int = 64,
@@ -31,6 +35,17 @@ public struct GatewaySettings: Codable, Sendable, Hashable {
     public var endpointURL: String {
         let host = bindAddress == "0.0.0.0" ? "127.0.0.1" : bindAddress
         return "http://\(host):\(port)/v1"
+    }
+
+    public static func isLoopback(_ host: String) -> Bool {
+        host == "127.0.0.1" || host == "localhost" || host == "::1"
+    }
+
+    /// True when the listener is reachable from something other than this Mac.
+    /// This is the one place where dropping the client key is not free, so the
+    /// UI warns here and the 1 → 2 migration leaves such gateways alone.
+    public var isReachableOffThisMac: Bool {
+        allowRemoteAccess || !GatewaySettings.isLoopback(bindAddress)
     }
 }
 

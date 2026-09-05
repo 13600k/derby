@@ -45,9 +45,24 @@ public struct ChatGPTCodexAdapter: ProviderAdapter {
                              message: "Derby could not read the Codex model catalog at \(path). Run `\(prefix)codex` once so the CLI downloads it, then test the connection again.")
         }
         return entries.map { entry in
-            DiscoveredModel(id: entry.slug,
-                            displayName: entry.displayName,
-                            capabilities: Self.capabilities(for: entry))
+            // The Codex catalog states modalities and reasoning levels but not
+            // context size, so fill that in from Derby's bundled metadata rather
+            // than leaving the model with an unknown window.
+            let stated = Self.capabilities(for: entry)
+            let known = ModelCatalog.metadata(for: entry.slug, kind: .chatgptSubscription).capabilities
+            var profile = ModelProfile(summary: entry.description.isEmpty ? nil : entry.description,
+                                       ownedBy: "openai")
+            if !entry.supportedEfforts.isEmpty {
+                let levels = entry.supportedEfforts.joined(separator: ", ")
+                profile.summary = [profile.summary, "Reasoning levels: \(levels)"]
+                    .compactMap { $0 }.joined(separator: " · ")
+            }
+            return DiscoveredModel(id: entry.slug,
+                                   displayName: entry.displayName,
+                                   capabilities: stated.fillingGaps(from: known),
+                                   profile: profile,
+                                   // A subscription has no marginal per-token cost.
+                                   pricing: .free)
         }
     }
 
@@ -58,7 +73,12 @@ public struct ChatGPTCodexAdapter: ProviderAdapter {
     static func capabilities(for entry: CodexModelCatalog.Entry) -> ModelCapabilities {
         var flags: CapabilityFlags = [.text, .streaming, .tools, .parallelTools, .jsonSchema]
         if !entry.supportedEfforts.isEmpty { flags.insert(.reasoning) }
-        return ModelCapabilities(flags: flags, source: .discovered)
+        // The catalog states the real window. Reporting it beats leaving the
+        // field empty for Derby's pattern-matched catalog to guess at from the
+        // model's name, which for these internal slugs is guesswork.
+        return ModelCapabilities(flags: flags,
+                                 contextWindow: entry.maxContextWindow ?? entry.contextWindow,
+                                 source: .discovered)
     }
 
     public func capabilities(model: String, ctx: ProviderContext) -> ModelCapabilities {
@@ -109,7 +129,8 @@ public struct ChatGPTCodexAdapter: ProviderAdapter {
     public func stream(_ request: CanonicalRequest, model: String, ctx: ProviderContext) async throws
         -> AsyncThrowingStream<CanonicalStreamEvent, Error> {
         let auth = try await authenticate(ctx)
-        let body = buildBody(request, model: model, home: ctx.account.credentialHomeURL)
+        let body = buildBody(request, model: model, home: ctx.account.credentialHomeURL,
+                             capabilities: ctx.modelCapabilities)
         let u = try url(ctx, path: "responses", auth: auth)
         var h = headers(ctx, auth: auth)
         h["accept"] = "text/event-stream"
@@ -187,7 +208,8 @@ public struct ChatGPTCodexAdapter: ProviderAdapter {
 
     // MARK: - Body
 
-    func buildBody(_ r: CanonicalRequest, model: String, home: URL? = nil) -> JSONValue {
+    func buildBody(_ r: CanonicalRequest, model: String, home: URL? = nil,
+                   capabilities: ModelCapabilities? = nil) -> JSONValue {
         var instructions: [String] = []
         var input: [JSONValue] = []
 
@@ -239,7 +261,10 @@ public struct ChatGPTCodexAdapter: ProviderAdapter {
             "stream": .bool(true),
             "store": .bool(false),
         ]
-        if let m = r.maxOutputTokens { body["max_output_tokens"] = .number(Double(m)) }
+        // The Codex backend rejects `max_output_tokens` outright
+        // ("Unsupported parameter"), unlike the public Responses API. This is an
+        // endpoint quirk rather than a model one, so it is handled here rather
+        // than through per-model parameter support.
         if !r.tools.isEmpty {
             body["tools"] = .array(r.tools.map { t in
                 var o: [String: JSONValue] = ["type": .string("function"),
@@ -264,7 +289,9 @@ public struct ChatGPTCodexAdapter: ProviderAdapter {
         if let effort = r.reasoning?.effort {
             // Models differ in how far the scale goes; ask for the strongest
             // level this one actually supports rather than risking a 400.
-            reasoning["effort"] = .string(CodexModelCatalog.clampEffort(effort, for: model, home: home))
+            reasoning["effort"] = .string(
+                capabilities?.clampEffort(effort)
+                    ?? CodexModelCatalog.clampEffort(effort, for: model, home: home))
         }
         if r.reasoning?.include == true { reasoning["summary"] = .string("auto") }
         if !reasoning.isEmpty { body["reasoning"] = .object(reasoning) }
@@ -291,7 +318,13 @@ public struct ChatGPTCodexAdapter: ProviderAdapter {
     public func classifyError(status: Int, headers: [String: String], body: Data, model: String) -> DerbyError {
         let json = try? JSONDecoder().decode(JSONValue.self, from: body)
         let node = json?["error"] ?? json?["detail"] ?? json ?? .null
-        let message = node["message"]?.stringValue ?? "The ChatGPT backend returned HTTP \(status)"
+        // The backend often answers with a bare `{"detail": "..."}` string rather
+        // than an error object, and a generic "HTTP 400" hides exactly the part
+        // that says what was wrong.
+        let message = node["message"]?.stringValue
+            ?? json?["detail"]?.stringValue
+            ?? node.stringValue
+            ?? "The ChatGPT backend returned HTTP \(status)"
         let code = node["code"]?.stringValue ?? node["type"]?.stringValue
         let lower = (message + " " + (code ?? "")).lowercased()
 
@@ -317,7 +350,12 @@ public struct ChatGPTCodexAdapter: ProviderAdapter {
         } else if kind == .quotaExhausted {
             friendly += " — your ChatGPT plan's Codex allowance is used up; Derby will route elsewhere until it resets."
         }
-        var err = DerbyError(kind: kind, message: friendly, providerStatus: status, providerCode: code)
+        // Keep a redacted excerpt: this backend often answers with a bare status
+        // and no message, and "HTTP 400" alone is not something a user can act on.
+        let excerpt = SecretRedactor.redact(String(data: body.prefix(600), encoding: .utf8) ?? "")
+        var err = DerbyError(kind: kind, message: friendly, providerStatus: status,
+                             providerCode: code,
+                             detail: excerpt.isEmpty ? nil : excerpt)
         if let ra = headers["retry-after"].flatMap({ RateLimitSnapshot.parseDuration($0) }) { err.retryAfter = ra }
         return err
     }

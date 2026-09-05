@@ -44,17 +44,27 @@ public struct GoogleAdapter: ProviderAdapter {
             // Skip legacy/one-off endpoints that cannot serve chat or embeddings.
             guard methods.isEmpty || methods.contains("generateContent") || methods.contains("embedContent") else { continue }
             var caps = ModelCatalog.metadata(for: id, kind: ctx.account.kind).capabilities
-            if let inTok = m["inputTokenLimit"]?.intValue { caps.contextWindow = inTok; caps.source = .discovered }
+            if let inTok = m["inputTokenLimit"]?.intValue {
+                caps.maxInputTokens = inTok
+                caps.contextWindow = caps.contextWindow.map { Swift.max($0, inTok) } ?? inTok
+                caps.source = .discovered
+            }
             if let outTok = m["outputTokenLimit"]?.intValue { caps.maxOutputTokens = outTok }
             if methods.contains("embedContent") { caps.flags = [.embeddings] }
-            out.append(DiscoveredModel(id: id, displayName: m["displayName"]?.stringValue, capabilities: caps))
+            let profile = ModelProfile(summary: m["description"]?.stringValue,
+                                       ownedBy: "google",
+                                       version: m["version"]?.stringValue)
+            out.append(DiscoveredModel(id: id, displayName: m["displayName"]?.stringValue,
+                                       capabilities: caps,
+                                       profile: profile.isEmpty ? nil : profile,
+                                       pricing: ModelCatalog.metadata(for: id, kind: ctx.account.kind).pricing))
         }
         return out
     }
 
     public func execute(_ request: CanonicalRequest, model: String, ctx: ProviderContext) async throws -> CanonicalResponse {
         let auth = try await authenticate(ctx)
-        let body = buildBody(request, model: model)
+        let body = buildBody(request, model: model, capabilities: ctx.modelCapabilities)
         let u = try url(ctx, path: "models/\(model):generateContent", auth: auth)
         let req = OutboundRequest(url: u, method: "POST", headers: headers(ctx, auth: auth),
                                   body: try JSONEncoder().encode(body), timeout: ctx.attemptTimeout,
@@ -72,7 +82,7 @@ public struct GoogleAdapter: ProviderAdapter {
     public func stream(_ request: CanonicalRequest, model: String, ctx: ProviderContext) async throws
         -> AsyncThrowingStream<CanonicalStreamEvent, Error> {
         let auth = try await authenticate(ctx)
-        let body = buildBody(request, model: model)
+        let body = buildBody(request, model: model, capabilities: ctx.modelCapabilities)
         let u = try url(ctx, path: "models/\(model):streamGenerateContent", auth: auth, extraQuery: ["alt": "sse"])
         var h = headers(ctx, auth: auth)
         h["accept"] = "text/event-stream"
@@ -160,7 +170,11 @@ public struct GoogleAdapter: ProviderAdapter {
 
     // MARK: - Body
 
-    func buildBody(_ r: CanonicalRequest, model: String) -> JSONValue {
+    func buildBody(_ r: CanonicalRequest, model: String,
+                   capabilities: ModelCapabilities? = nil) -> JSONValue {
+        func allows(_ parameter: RequestParameters) -> Bool {
+            capabilities?.allows(parameter) ?? true
+        }
         var contents: [JSONValue] = []
         var systemParts: [JSONValue] = []
 
@@ -213,10 +227,10 @@ public struct GoogleAdapter: ProviderAdapter {
         }
 
         var gen: [String: JSONValue] = [:]
-        if let t = r.temperature { gen["temperature"] = .number(t) }
-        if let p = r.topP { gen["topP"] = .number(p) }
-        if let m = r.maxOutputTokens { gen["maxOutputTokens"] = .number(Double(m)) }
-        if !r.stop.isEmpty { gen["stopSequences"] = .array(r.stop.map { .string($0) }) }
+        if let t = r.temperature, allows(.temperature) { gen["temperature"] = .number(t) }
+        if let p = r.topP, allows(.topP) { gen["topP"] = .number(p) }
+        if let m = r.maxOutputTokens, allows(.maxTokens) { gen["maxOutputTokens"] = .number(Double(m)) }
+        if !r.stop.isEmpty, allows(.stop) { gen["stopSequences"] = .array(r.stop.map { .string($0) }) }
         if let rf = r.responseFormat {
             switch rf {
             case .text: break

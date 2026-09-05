@@ -13,6 +13,10 @@ public enum ProviderKind: String, Codable, Sendable, CaseIterable, Hashable {
     case openrouter, together, fireworks, groq, mistral, deepseek, xai
     case qwen                       // Alibaba DashScope compatible-mode
     // Subscription-backed consumer accounts
+    /// Runs the `claude` CLI, which is a first-party client and therefore draws
+    /// on the subscription's plan limits. Calling the API directly with the same
+    /// OAuth token is billed as third-party "extra usage" instead.
+    case claudeCodeCLI = "claude_code_cli"
     case anthropicSubscription = "anthropic_subscription"
     case chatgptSubscription = "chatgpt_subscription"
     case geminiSubscription = "gemini_subscription"
@@ -26,6 +30,7 @@ public enum ProviderKind: String, Codable, Sendable, CaseIterable, Hashable {
     public var adapterFamily: AdapterFamily {
         switch self {
         case .anthropic: return .anthropic
+        case .claudeCodeCLI: return .claudeCLI
         case .anthropicSubscription: return .anthropicOAuth
         case .google, .geminiSubscription: return .google
         case .chatgptSubscription: return .chatgptCodex
@@ -49,7 +54,8 @@ public enum ProviderKind: String, Codable, Sendable, CaseIterable, Hashable {
         case .deepseek: return "DeepSeek"
         case .xai: return "xAI"
         case .qwen: return "Qwen (DashScope)"
-        case .anthropicSubscription: return "Claude subscription"
+        case .claudeCodeCLI: return "Claude Code (plan limits)"
+        case .anthropicSubscription: return "Claude subscription (extra usage)"
         case .chatgptSubscription: return "ChatGPT subscription"
         case .geminiSubscription: return "Gemini subscription"
         case .qwenSubscription: return "Qwen subscription"
@@ -67,6 +73,7 @@ public enum ProviderKind: String, Codable, Sendable, CaseIterable, Hashable {
         switch self {
         case .openai: return "https://api.openai.com/v1"
         case .anthropic, .anthropicSubscription: return "https://api.anthropic.com/v1"
+        case .claudeCodeCLI: return nil          // spawns a CLI, not an endpoint
         case .google, .geminiSubscription: return "https://generativelanguage.googleapis.com/v1beta"
         case .openrouter: return "https://openrouter.ai/api/v1"
         case .together: return "https://api.together.xyz/v1"
@@ -98,7 +105,8 @@ public enum ProviderKind: String, Codable, Sendable, CaseIterable, Hashable {
     /// Subscription-backed accounts are flat-rate: they have a quota, not a bill.
     public var isSubscription: Bool {
         switch self {
-        case .anthropicSubscription, .chatgptSubscription, .geminiSubscription, .qwenSubscription: return true
+        case .claudeCodeCLI, .anthropicSubscription, .chatgptSubscription,
+             .geminiSubscription, .qwenSubscription: return true
         default: return false
         }
     }
@@ -106,7 +114,7 @@ public enum ProviderKind: String, Codable, Sendable, CaseIterable, Hashable {
     /// Kinds whose credentials come from an already-authenticated local CLI.
     public var cliCredentialSource: CLICredentialSource? {
         switch self {
-        case .anthropicSubscription: return .claudeCode
+        case .claudeCodeCLI, .anthropicSubscription: return .claudeCode
         case .chatgptSubscription: return .codexCLI
         case .geminiSubscription: return .geminiCLI
         case .qwenSubscription: return .qwenCLI
@@ -117,6 +125,7 @@ public enum ProviderKind: String, Codable, Sendable, CaseIterable, Hashable {
     public var supportsModelDiscovery: Bool {
         switch self {
         case .azureOpenAI: return false      // deployments are named by the user
+        case .claudeCodeCLI: return true
         default: return true
         }
     }
@@ -127,12 +136,50 @@ public enum ProviderKind: String, Codable, Sendable, CaseIterable, Hashable {
     /// forever and fails whenever it is routed to.
     public var hasAuthoritativeCatalog: Bool { isSubscription }
 
+    /// Whether this kind needs an API key, and how strictly.
+    ///
+    /// Declared here rather than derived from overlapping conditions at each call
+    /// site — that is what produced two API-key fields on the same form.
+    public var apiKeyRequirement: APIKeyRequirement {
+        // Credentials come from somewhere else entirely.
+        if cliCredentialSource != nil { return .notApplicable }
+        switch self {
+        case .bedrock:
+            return .notApplicable          // AWS access keys, not a bearer token
+        case .ollama, .lmStudio, .llamaCpp, .vllm, .sglang, .localai:
+            return .optional               // usually unauthenticated on loopback
+        case .openAICompatible:
+            return .optional               // depends entirely on the server
+        default:
+            return .required
+        }
+    }
+
     /// Grouping used by the "Add Provider" picker.
     public var category: ProviderCategory {
         if isSubscription { return .subscription }
         if isLocal { return .local }
         if self == .openAICompatible { return .custom }
         return .api
+    }
+}
+
+/// How a provider kind treats an API key.
+public enum APIKeyRequirement: Sendable, Equatable {
+    /// The provider rejects requests without one.
+    case required
+    /// Some deployments are protected, most are not.
+    case optional
+    /// Credentials come from a CLI login or AWS keys instead.
+    case notApplicable
+
+    public var isUsed: Bool { self != .notApplicable }
+    public var prompt: String {
+        switch self {
+        case .required: return "Required by this provider"
+        case .optional: return "Optional — leave empty if the endpoint needs no key"
+        case .notApplicable: return ""
+        }
     }
 }
 
@@ -151,6 +198,8 @@ public enum ProviderCategory: String, Codable, Sendable, CaseIterable {
 public enum AdapterFamily: String, Codable, Sendable, CaseIterable {
     case openai, anthropic, anthropicOAuth = "anthropic_oauth", google
     case chatgptCodex = "chatgpt_codex", bedrock
+    /// Spawns a local CLI rather than calling an HTTP endpoint.
+    case claudeCLI = "claude_cli"
 }
 
 public enum CLICredentialSource: String, Codable, Sendable, CaseIterable {
@@ -256,6 +305,8 @@ public struct PhysicalModel: Codable, Sendable, Hashable, Identifiable {
     /// 0–100 subjective quality, used by weighted-score routing.
     public var qualityScore: Double
     public var discoveredAt: Date?
+    /// Descriptive facts learned during discovery (size, quantization, family).
+    public var profile: ModelProfile?
 
     public init(id: UUID = UUID(), modelID: String, displayName: String? = nil,
                 enabled: Bool = true,
@@ -263,13 +314,15 @@ public struct PhysicalModel: Codable, Sendable, Hashable, Identifiable {
                 capabilityOverrides: PartialCapabilities = PartialCapabilities(),
                 pricingOverride: Pricing? = nil,
                 qualityScore: Double = 60,
-                discoveredAt: Date? = nil) {
+                discoveredAt: Date? = nil,
+                profile: ModelProfile? = nil) {
         self.id = id; self.modelID = modelID; self.displayName = displayName
         self.enabled = enabled; self.capabilities = capabilities
         self.capabilityOverrides = capabilityOverrides
         self.pricingOverride = pricingOverride
         self.qualityScore = qualityScore
         self.discoveredAt = discoveredAt
+        self.profile = profile
     }
 
     public var effectiveCapabilities: ModelCapabilities { capabilities.overridden(by: capabilityOverrides) }
@@ -300,6 +353,9 @@ public struct ProviderAccount: Codable, Sendable, Hashable, Identifiable {
     public var allowInsecureTLS: Bool
     /// Ranked preference used by the weighted-score strategy (0–100).
     public var preferenceScore: Double
+    /// Absolute path to the CLI a command-line-backed provider should run.
+    /// Nil means Derby locates it. Optional so older configurations decode.
+    public var executablePathOverride: String?
     /// For CLI-linked accounts, the CLI state directory to read credentials from
     /// (`CODEX_HOME` / `CLAUDE_CONFIG_DIR`). Nil means the CLI's default home.
     /// This is what lets several accounts of the *same* service coexist.
@@ -317,7 +373,8 @@ public struct ProviderAccount: Codable, Sendable, Hashable, Identifiable {
                 apiVersion: String? = nil,
                 allowInsecureTLS: Bool = false,
                 preferenceScore: Double = 50,
-                credentialHomeOverride: String? = nil) {
+                credentialHomeOverride: String? = nil,
+                executablePathOverride: String? = nil) {
         self.id = id; self.name = name; self.kind = kind; self.enabled = enabled
         self.baseURLOverride = baseURLOverride; self.auth = auth
         self.extraHeaders = extraHeaders
@@ -328,6 +385,7 @@ public struct ProviderAccount: Codable, Sendable, Hashable, Identifiable {
         self.allowInsecureTLS = allowInsecureTLS
         self.preferenceScore = preferenceScore
         self.credentialHomeOverride = credentialHomeOverride
+        self.executablePathOverride = executablePathOverride
     }
 
     /// Resolved credential home, or nil for the CLI default.

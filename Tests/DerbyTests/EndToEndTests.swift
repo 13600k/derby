@@ -115,7 +115,12 @@ func registerEndToEndTests() {
                 let coding = try expectNotNil(json["data"]?.arrayValue?.first { $0["id"]?.stringValue == "coding" })
                 try expectEqual(coding["object"]?.stringValue, "model")
                 try expectEqual(coding["owned_by"]?.stringValue, "derby")
-                try expectEqual(coding["derby"]?["targets"]?.intValue, 2)
+                try expectEqual(coding["derby"]?["target_count"]?.intValue, 2)
+                // A client that only ever asks for "coding" still learns what it resolves to.
+                try expectEqual(coding["derby"]?["active_model"]?["id"]?.stringValue, "m-a")
+                try expectEqual(coding["derby"]?["active_model"]?["provider"]?.stringValue, "Alpha")
+                try expectEqual(coding["context_window"]?.intValue, 128_000)
+                try expectEqual(coding["derby"]?["targets"]?.arrayValue?.count, 2)
             }
         }
 
@@ -289,6 +294,29 @@ func registerEndToEndTests() {
     }
 
     suite("End to end / gateway behaviour") {
+        test("a client needs nothing but the port") {
+            // The default gateway: no Authorization header at all, and the
+            // arbitrary key an OpenAI SDK insists on sending is ignored.
+            try await withDerby { _, port, _ in
+                let (open, body) = try await post(port, "/v1/chat/completions", """
+                {"model":"coding","messages":[{"role":"user","content":"hi"}]}
+                """)
+                try expectEqual(open, 200)
+                try expectNotNil(body?["choices"])
+
+                let (ignored, _) = try await post(port, "/v1/chat/completions", """
+                {"model":"coding","messages":[{"role":"user","content":"hi"}]}
+                """, key: "whatever-the-client-had-lying-around")
+                try expectEqual(ignored, 200)
+
+                let (models, _) = try await get(port, "/v1/models")
+                try expectEqual(models, 200)
+                let (landing, text) = try await get(port, "/")
+                try expectEqual(landing, 200)
+                try expectContains(text, "Authentication: none")
+            }
+        }
+
         test("the local API key is enforced when enabled") {
             try await withDerby(configure: { $0.gateway.requireAPIKey = true }) { _, port, key in
                 try expect(!key.isEmpty, "Derby must generate a local key on first run")
@@ -507,6 +535,250 @@ func registerEndToEndTests() {
                     try expectEqual(record.finalProviderName, "Alpha")
                 }
                 try expectEqual(collected.text.trimmingCharacters(in: .whitespaces), "console reply")
+            }
+        }
+    }
+
+    suite("End to end / runtime model visibility") {
+        test("the response reports the physical model and describes it in x_derby") {
+            let adapter = MockAdapter()
+            adapter.set("m-a", .succeed(text: "hi"))
+            try await withDerby(adapter: adapter) { _, port, _ in
+                let (status, body) = try await post(port, "/v1/chat/completions", """
+                {"model":"coding","messages":[{"role":"user","content":"hi"}]}
+                """)
+                try expectEqual(status, 200)
+                let json = try expectNotNil(body)
+                try expectEqual(json["model"]?.stringValue, "m-a", "never the alias the client asked for")
+                let model = try expectNotNil(json["x_derby"]?["model"])
+                try expectEqual(model["id"]?.stringValue, "m-a")
+                try expectEqual(model["provider"]?.stringValue, "Alpha")
+                try expectEqual(model["context_window"]?.intValue, 128_000)
+                try expectEqual(model["max_output_tokens"]?.intValue, 8192)
+                try expect((model["capabilities"]?.arrayValue ?? []).contains(.string("streaming")))
+            }
+        }
+
+        test("runtime metadata is also on the response headers") {
+            let adapter = MockAdapter()
+            adapter.set("m-a", .succeed(text: "hi"))
+            try await withDerby(adapter: adapter) { _, port, _ in
+                var req = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/v1/chat/completions")!)
+                req.httpMethod = "POST"
+                req.setValue("application/json", forHTTPHeaderField: "content-type")
+                req.httpBody = Data("""
+                {"model":"coding","messages":[{"role":"user","content":"hi"}]}
+                """.utf8)
+                let (_, response) = try await URLSession.shared.data(for: req)
+                let http = try expectNotNil(response as? HTTPURLResponse)
+                try expectEqual(http.value(forHTTPHeaderField: "x-derby-model"), "m-a")
+                try expectEqual(http.value(forHTTPHeaderField: "x-derby-logical-model"), "coding")
+                try expectEqual(http.value(forHTTPHeaderField: "x-derby-provider"), "Alpha")
+                try expectEqual(http.value(forHTTPHeaderField: "x-derby-context-window"), "128000")
+                try expectContains(http.value(forHTTPHeaderField: "x-derby-capabilities") ?? "", "tools")
+            }
+        }
+
+        test("a stream announces its model before the first token, not after the last") {
+            let adapter = MockAdapter()
+            adapter.set("m-a", .fail(DerbyError(kind: .rateLimit, message: "429", providerStatus: 429)))
+            adapter.set("m-b", .succeed(text: "beta streamed this"))
+            try await withDerby(adapter: adapter) { _, port, _ in
+                var req = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/v1/chat/completions")!)
+                req.httpMethod = "POST"
+                req.setValue("application/json", forHTTPHeaderField: "content-type")
+                req.httpBody = Data("""
+                {"model":"coding","messages":[{"role":"user","content":"hi"}],"stream":true}
+                """.utf8)
+                let (bytes, _) = try await URLSession.shared.bytes(for: req)
+                var parser = SSEParser()
+                var events: [SSEEvent] = []
+                for try await b in bytes { events.append(contentsOf: parser.consume(b)) }
+                let chunks = events.compactMap { $0.json }.filter { $0["object"]?.stringValue == "chat.completion.chunk" }
+
+                // The very first chunk names the model that failed over to, and describes it.
+                let first = try expectNotNil(chunks.first)
+                try expectEqual(first["model"]?.stringValue, "m-b")
+                let route = try expectNotNil(first["x_derby"])
+                try expectEqual(route["physical_model"]?.stringValue, "m-b")
+                try expectEqual(route["model"]?["provider"]?.stringValue, "Beta")
+                try expectEqual(route["model"]?["context_window"]?.intValue, 128_000)
+                try expectEqual(route["attempt"]?.stringValue, "attempt_2",
+                                "the metadata belongs to the attempt that is actually producing")
+
+                // ...and the tail chunk still carries the full record.
+                let tail = try expectNotNil(chunks.last { $0["x_derby"] != nil && $0["choices"]?.arrayValue?.isEmpty == true })
+                try expectEqual(tail["x_derby"]?["physical_model"]?.stringValue, "m-b")
+                try expectEqual(tail["x_derby"]?["failovers"]?.intValue, 1)
+            }
+        }
+
+        test("a failover before the first token corrects what the client was told") {
+            let adapter = MockAdapter()
+            adapter.set("m-a", .openThenFail(DerbyError(kind: .transient, message: "dropped", providerStatus: 500)))
+            adapter.set("m-b", .succeed(text: "beta finished it"))
+            try await withDerby(adapter: adapter) { _, port, _ in
+                var req = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/v1/chat/completions")!)
+                req.httpMethod = "POST"
+                req.setValue("application/json", forHTTPHeaderField: "content-type")
+                req.httpBody = Data("""
+                {"model":"coding","messages":[{"role":"user","content":"hi"}],"stream":true}
+                """.utf8)
+                let (bytes, _) = try await URLSession.shared.bytes(for: req)
+                var parser = SSEParser()
+                var events: [SSEEvent] = []
+                for try await b in bytes { events.append(contentsOf: parser.consume(b)) }
+                let chunks = events.compactMap { $0.json }.filter { $0["object"]?.stringValue == "chat.completion.chunk" }
+
+                // Announced as Alpha, because Alpha's stream really did open...
+                let announcements = chunks.compactMap { $0["x_derby"] }
+                    .compactMap { $0["physical_model"]?.stringValue }
+                try expectEqual(announcements.first, "m-a")
+                // ...then corrected the moment Derby moved to Beta, before any content.
+                try expect(announcements.contains("m-b"),
+                           "a transparent failover must be re-announced, not left stale")
+                let text = chunks.compactMap { $0["choices"]?[0]?["delta"]?["content"]?.stringValue }.joined()
+                try expectEqual(text.trimmingCharacters(in: .whitespaces), "beta finished it")
+                // Every chunk that carried content came from the model finally named.
+                try expectEqual(chunks.last?["x_derby"]?["physical_model"]?.stringValue, "m-b")
+            }
+        }
+
+        test("a streaming response carries the planned target on its headers") {
+            let adapter = MockAdapter()
+            adapter.set("m-a", .succeed(text: "streamed"))
+            try await withDerby(adapter: adapter) { _, port, _ in
+                var req = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/v1/chat/completions")!)
+                req.httpMethod = "POST"
+                req.setValue("application/json", forHTTPHeaderField: "content-type")
+                req.httpBody = Data("""
+                {"model":"coding","messages":[{"role":"user","content":"hi"}],"stream":true}
+                """.utf8)
+                let (bytes, response) = try await URLSession.shared.bytes(for: req)
+                let http = try expectNotNil(response as? HTTPURLResponse)
+                // Headers are flushed before any target runs, so they are the plan,
+                // named as such; the first chunk carries the authoritative answer.
+                try expectEqual(http.value(forHTTPHeaderField: "x-derby-planned-model"), "m-a")
+                try expectEqual(http.value(forHTTPHeaderField: "x-derby-planned-context-window"), "128000")
+                try expectEqual(http.value(forHTTPHeaderField: "x-derby-logical-model"), "coding")
+                for try await _ in bytes {}
+            }
+        }
+
+        test("a streamed Responses call carries the runtime model on response.created") {
+            let adapter = MockAdapter()
+            adapter.set("m-a", .succeed(text: "streamed"))
+            try await withDerby(adapter: adapter) { _, port, _ in
+                var req = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/v1/responses")!)
+                req.httpMethod = "POST"
+                req.setValue("application/json", forHTTPHeaderField: "content-type")
+                req.httpBody = Data("""
+                {"model":"coding","input":"hi","stream":true}
+                """.utf8)
+                let (bytes, _) = try await URLSession.shared.bytes(for: req)
+                var parser = SSEParser()
+                var events: [SSEEvent] = []
+                for try await b in bytes { events.append(contentsOf: parser.consume(b)) }
+                let created = try expectNotNil(events.compactMap { $0.json }
+                    .first { $0["type"]?.stringValue == "response.created" })
+                try expectEqual(created["response"]?["model"]?.stringValue, "m-a")
+                try expectEqual(created["response"]?["x_derby"]?["model"]?["id"]?.stringValue, "m-a")
+                try expectEqual(created["response"]?["x_derby"]?["model"]?["context_window"]?.intValue, 128_000)
+            }
+        }
+
+        test("embeddings report the model that ran too") {
+            try await withDerby { _, port, _ in
+                var req = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/v1/embeddings")!)
+                req.httpMethod = "POST"
+                req.setValue("application/json", forHTTPHeaderField: "content-type")
+                req.httpBody = Data("""
+                {"model":"embed","input":["hello"]}
+                """.utf8)
+                let (data, response) = try await URLSession.shared.data(for: req)
+                let http = try expectNotNil(response as? HTTPURLResponse)
+                try expectEqual(http.value(forHTTPHeaderField: "x-derby-model"), "e-1")
+                let json = try expectNotNil(JSONValue.parse(String(decoding: data, as: UTF8.self)))
+                try expectEqual(json["model"]?.stringValue, "e-1")
+                try expectEqual(json["x_derby"]?["model"]?["id"]?.stringValue, "e-1")
+                try expect((json["x_derby"]?["model"]?["capabilities"]?.arrayValue ?? [])
+                            .contains(.string("embeddings")))
+            }
+        }
+    }
+
+    suite("End to end / context compaction") {
+        test("an oversized conversation is shortened, answered, and disclosed over HTTP") {
+            let adapter = MockAdapter()
+            adapter.set("m-a", .succeed(text: "Answered from a shortened conversation.",
+                                        usage: CanonicalUsage(inputTokens: 5_000, outputTokens: 8)))
+            try await withDerby(configure: { config in
+                // One target, deliberately far too small for what the client sends.
+                let small = Fixture.account("Alpha", models: [Fixture.model("m-a", context: 16_000)])
+                var lm = Fixture.logical("coding", accounts: [small])
+                lm.compaction = CompactionPolicy(enabled: true, strategy: .dropOldest,
+                                                 keepRecentMessages: 4)
+                config.providers = [small]
+                config.logicalModels = [lm]
+            }, adapter: adapter) { _, port, _ in
+                // ~100k tokens of conversation against a 16k window.
+                var messages: [String] = []
+                for i in 0..<50 {
+                    let filler = String(repeating: "x", count: 4_000)
+                    messages.append("{\"role\":\"user\",\"content\":\"\(filler) turn \(i)\"}")
+                    messages.append("{\"role\":\"assistant\",\"content\":\"\(filler) reply \(i)\"}")
+                }
+                messages.append("{\"role\":\"user\",\"content\":\"What was the final decision?\"}")
+                let payload = "{\"model\":\"coding\",\"messages\":[\(messages.joined(separator: ","))]}"
+
+                var req = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/v1/chat/completions")!)
+                req.httpMethod = "POST"
+                req.setValue("application/json", forHTTPHeaderField: "content-type")
+                req.httpBody = Data(payload.utf8)
+                let (data, response) = try await URLSession.shared.data(for: req)
+                let http = try expectNotNil(response as? HTTPURLResponse)
+                try expectEqual(http.statusCode, 200, String(decoding: data, as: UTF8.self))
+
+                // The header a body-blind client would read.
+                let header = try expectNotNil(http.value(forHTTPHeaderField: "x-derby-compacted"))
+                try expectContains(header, "drop_oldest")
+
+                let json = try expectNotNil(JSONValue.parse(String(decoding: data, as: UTF8.self)))
+                let c = try expectNotNil(json["x_derby"]?["compaction"])
+                try expectEqual(c["applied"]?.boolValue, true)
+                try expectEqual(c["strategy"]?.stringValue, "drop_oldest")
+                try expectEqual(c["context_limit_tokens"]?.intValue, 16_000)
+                try expect((c["dropped_messages"]?.intValue ?? 0) > 50)
+                try expect((c["compacted_prompt_tokens"]?.intValue ?? .max) <= 16_000)
+
+                // The provider really was handed the shortened conversation, and
+                // the client's last question survived it.
+                let sent = try expectNotNil(adapter.lastRequest("m-a"))
+                try expect(sent.messages.count < 101)
+                try expectEqual(sent.messages.last?.joinedText, "What was the final decision?")
+            }
+        }
+
+        test("with compaction off the same request is refused as too long, not truncated") {
+            try await withDerby(configure: { config in
+                let small = Fixture.account("Alpha", models: [Fixture.model("m-a", context: 16_000)])
+                config.providers = [small]
+                config.logicalModels = [Fixture.logical("coding", accounts: [small])]
+            }) { _, port, _ in
+                var messages: [String] = []
+                for i in 0..<50 {
+                    let filler = String(repeating: "x", count: 4_000)
+                    messages.append("{\"role\":\"user\",\"content\":\"\(filler) turn \(i)\"}")
+                }
+                let payload = "{\"model\":\"coding\",\"messages\":[\(messages.joined(separator: ","))]}"
+                let (status, body) = try await post(port, "/v1/chat/completions", payload)
+                // 400, not 503: the client sent more than any target can hold,
+                // which is a problem with the request, not with a provider.
+                try expectEqual(status, 400)
+                let message = body?["error"]?["message"]?.stringValue ?? ""
+                try expectContains(message, "context window too small")
+                try expectContains(message, "Enable compaction")
+                try expectEqual(body?["error"]?["code"]?.stringValue, "context_overflow")
             }
         }
     }

@@ -3,7 +3,7 @@ import Foundation
 /// The complete persisted control-plane state. Versioned: `ConfigMigrator`
 /// upgrades older documents in place so a newer Derby can always read them.
 public struct DerbyConfig: Codable, Sendable {
-    public static let currentSchemaVersion = 1
+    public static let currentSchemaVersion = 2
 
     public var schemaVersion: Int
     public var gateway: GatewaySettings
@@ -38,19 +38,43 @@ public struct DerbyConfig: Codable, Sendable {
         self.updatedAt = updatedAt
     }
 
+    /// Sections that failed to decode and fell back to a default. Not persisted —
+    /// it exists so the failure is reported rather than silently swallowed.
+    public private(set) var decodeFailures: [String] = []
+
     // Decoding is tolerant: every section falls back to its default so a
     // partially-hand-edited or older config still loads.
+    //
+    // Tolerance without reporting is dangerous, though. A non-optional property
+    // added to a persisted type once made the whole `providers` array
+    // undecodable, and this initializer quietly replaced five configured
+    // providers with an empty list — data loss with no symptom beyond an app
+    // that had forgotten everything. Each fallback is now recorded.
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
+        var failures: [String] = []
+
+        func decode<T: Decodable>(_ type: T.Type, _ key: CodingKeys, default fallback: T,
+                                  label: String) -> T {
+            guard c.contains(key) else { return fallback }
+            do { return try c.decode(type, forKey: key) }
+            catch {
+                failures.append("\(label): \(error)")
+                return fallback
+            }
+        }
+
         schemaVersion = try c.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 1
-        gateway = (try? c.decode(GatewaySettings.self, forKey: .gateway)) ?? .default
-        providers = (try? c.decode([ProviderAccount].self, forKey: .providers)) ?? []
-        logicalModels = (try? c.decode([LogicalModel].self, forKey: .logicalModels)) ?? []
-        health = (try? c.decode(HealthSettings.self, forKey: .health)) ?? .default
-        logging = (try? c.decode(LoggingSettings.self, forKey: .logging)) ?? .default
-        app = (try? c.decode(AppSettings.self, forKey: .app)) ?? .default
-        pricingOverrides = (try? c.decode([String: Pricing].self, forKey: .pricingOverrides)) ?? [:]
+        gateway = decode(GatewaySettings.self, .gateway, default: .default, label: "gateway settings")
+        providers = decode([ProviderAccount].self, .providers, default: [], label: "providers")
+        logicalModels = decode([LogicalModel].self, .logicalModels, default: [], label: "logical models")
+        health = decode(HealthSettings.self, .health, default: .default, label: "health settings")
+        logging = decode(LoggingSettings.self, .logging, default: .default, label: "logging settings")
+        app = decode(AppSettings.self, .app, default: .default, label: "application settings")
+        pricingOverrides = decode([String: Pricing].self, .pricingOverrides, default: [:],
+                                  label: "pricing overrides")
         updatedAt = (try? c.decode(Date.self, forKey: .updatedAt)) ?? Date()
+        decodeFailures = failures
     }
 
     // MARK: - Lookups
@@ -110,8 +134,7 @@ public struct DerbyConfig: Codable, Sendable {
                                                                  health: 0.20, quota: 0.10)),
                 retry: RetryConfig(maxRetriesPerTarget: 1),
                 failover: FailoverConfig(enabled: true, maxAttempts: 4),
-                timeouts: TimeoutConfig(overallSeconds: 300, perAttemptSeconds: 180, firstTokenSeconds: 60),
-                requiredCapabilities: [.tools]),
+                timeouts: TimeoutConfig(overallSeconds: 300, perAttemptSeconds: 180, firstTokenSeconds: 60)),
             LogicalModel(
                 name: "local",
                 summary: "Never leaves this machine. Local model servers only.",
@@ -135,13 +158,26 @@ public enum ConfigMigrator {
         var notes: [String] = []
         var version = (rawObject["schemaVersion"] as? Int) ?? 1
 
-        // Future migrations go here, each bumping `version` by one, e.g.:
-        //
-        // if version == 1 {
-        //     rawObject["logicalModels"] = ...rewrite...
-        //     version = 2
-        //     notes.append("Migrated logical models to schema 2")
-        // }
+        // 1 → 2: the gateway no longer asks clients for a key. A loopback-only
+        // gateway is reachable by anything already running as this user, so the
+        // key bought nothing and cost every client a second setting. Configs
+        // that opted into a non-loopback bind keep it — there the key is the
+        // only thing standing between Derby and the LAN.
+        if version == 1 {
+            if var gateway = rawObject["gateway"] as? [String: Any],
+               gateway["requireAPIKey"] as? Bool == true {
+                let bind = (gateway["bindAddress"] as? String) ?? "127.0.0.1"
+                let remote = (gateway["allowRemoteAccess"] as? Bool) ?? false
+                if !remote && GatewaySettings.isLoopback(bind) {
+                    gateway["requireAPIKey"] = false
+                    rawObject["gateway"] = gateway
+                    notes.append("Clients no longer need Derby's local API key — the base URL is enough. Re-enable it in Settings → Access if you want it back.")
+                } else {
+                    notes.append("Derby now defaults to no client API key, but this gateway is reachable beyond 127.0.0.1, so the key requirement was left on.")
+                }
+            }
+            version = 2
+        }
 
         if version > DerbyConfig.currentSchemaVersion {
             notes.append("Configuration was written by a newer version of Derby (schema \(version)); unknown fields were preserved where possible.")

@@ -92,7 +92,7 @@ final class AppModel: ObservableObject {
     /// Full refresh, including database queries.
     func refreshAll() async {
         config = await engine.config()
-        localKey = await engine.localAPIKey()
+        await syncLocalKey()
         await refreshLive()
         await refreshUsage()
         await refreshRequests()
@@ -170,6 +170,12 @@ final class AppModel: ObservableObject {
     func completeOnboarding() async {
         await mutate { $0.app.hasCompletedOnboarding = true }
         showOnboarding = false
+    }
+
+    /// Loads the local key for display only while it is switched on: fetching it
+    /// can raise a Keychain dialog, and the default gateway has no key at all.
+    func syncLocalKey() async {
+        localKey = config.gateway.requireAPIKey ? await engine.localAPIKey() : ""
     }
 
     func regenerateLocalKey() async {

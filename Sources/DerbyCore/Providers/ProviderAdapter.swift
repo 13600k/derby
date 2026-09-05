@@ -10,20 +10,32 @@ public struct ProviderContext: Sendable {
     /// Deadline for this attempt, in monotonic seconds. Adapters pass it to the
     /// transport so a slow provider cannot outlive the request budget.
     public let attemptTimeout: Double
+    /// Resolved metadata for the model being called, so an adapter can omit a
+    /// parameter this model would reject rather than sending it and failing.
+    public let modelCapabilities: ModelCapabilities?
 
     public init(account: ProviderAccount, transport: any HTTPTransport,
                 secrets: any SecretStore, credentials: CredentialCache,
-                attemptTimeout: Double = 120) {
+                attemptTimeout: Double = 120,
+                modelCapabilities: ModelCapabilities? = nil) {
         self.account = account
         self.transport = transport
         self.secrets = secrets
         self.credentials = credentials
         self.attemptTimeout = attemptTimeout
+        self.modelCapabilities = modelCapabilities
     }
 
     public func with(timeout: Double) -> ProviderContext {
         ProviderContext(account: account, transport: transport, secrets: secrets,
-                        credentials: credentials, attemptTimeout: timeout)
+                        credentials: credentials, attemptTimeout: timeout,
+                        modelCapabilities: modelCapabilities)
+    }
+
+    /// Whether a parameter may be sent to this model. Unknown models allow
+    /// everything, so this only ever removes one a provider would reject.
+    public func allows(_ parameter: RequestParameters) -> Bool {
+        modelCapabilities?.allows(parameter) ?? true
     }
 }
 
@@ -43,8 +55,24 @@ public struct DiscoveredModel: Sendable, Hashable {
     public var id: String
     public var displayName: String?
     public var capabilities: ModelCapabilities?
-    public init(id: String, displayName: String? = nil, capabilities: ModelCapabilities? = nil) {
+    /// Descriptive metadata the provider reported alongside the capabilities.
+    public var profile: ModelProfile?
+    /// Pricing the provider published, when it does.
+    public var pricing: Pricing?
+
+    public init(id: String, displayName: String? = nil, capabilities: ModelCapabilities? = nil,
+                profile: ModelProfile? = nil, pricing: Pricing? = nil) {
         self.id = id; self.displayName = displayName; self.capabilities = capabilities
+        self.profile = profile; self.pricing = pricing
+    }
+
+    /// A short line describing what was learned, for connection-test output.
+    public var summary: String {
+        var parts: [String] = [id]
+        if let window = capabilities?.contextWindow { parts.append("\(window.formattedTokens) ctx") }
+        if let flags = capabilities?.flags, !flags.names.isEmpty { parts.append(flags.names.joined(separator: "/")) }
+        parts.append(contentsOf: profile?.descriptors ?? [])
+        return parts.joined(separator: " · ")
     }
 }
 

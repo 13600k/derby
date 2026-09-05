@@ -117,6 +117,134 @@ The fix in both places is the same — **resolve the same continuation from the 
 rather than cancelling around it. See `AsyncEventChannel.next(timeout:)` and the watchdog in
 `HTTPServer.start`.
 
+## What the client is told about the model
+
+`model` in a request is an alias. `model` in the *response* never is: it is the physical
+model that produced the answer. Around that, Derby reports what it knows about that model
+at the moment it ran — context window, capabilities, pricing, provider kind, where the
+metadata came from — as `RuntimeModelInfo`, built from the `ResolvedTarget` that served
+the request, so it reflects overrides and discovery rather than the bundled catalog alone.
+
+It reaches the client four ways:
+
+| Surface | Carries |
+| --- | --- |
+| `x_derby.model` on every response | the model that answered, after any failover |
+| `x-derby-*` response headers | model, provider, kind, context window, max output, capabilities (`x-derby-planned-*` on streams, which must send headers before a target runs) |
+| the first SSE chunk (`x_derby`) | the same, *before* the first token, re-sent if a pre-content failover changes it |
+| `GET /v1/models` | `derby.active_model` — what the alias resolves to right now — plus every target |
+
+Physical model ids stay unroutable and unadvertised, so no client can pin a target and skip
+routing; `docs/CLIENTS.md` is the client-side guide to reading the model instead of picking
+it. `active_model` is computed by the same `Router` the request path uses, so the listing and
+the next response agree. For strategies that deliberately spread traffic (weighted random,
+round robin) the alias may resolve elsewhere on the next request; `x_derby.model` on the
+response is always the authoritative answer, and `derby.targets` lists every possibility.
+
+## Conversation state, context and model swapping
+
+Derby is **stateless per request**, because the API it speaks is. A chat completion
+carries its whole conversation in the `messages` array, so "a session" is just consecutive
+requests from a client, each routed independently. Two consequences follow, and both are
+deliberate:
+
+**Derby never rewrites the conversation unless told to.** By default it does not compact,
+summarize, truncate or drop messages — the array is passed to the provider as received.
+A router that silently dropped turns would corrupt the conversation in a way the client
+could never detect.
+
+**Context is handled by *selection*, not by trimming.** The capability filter excludes any
+target whose window cannot hold `estimated prompt + reserved answer`, so a conversation that
+has outgrown a small model simply stops being routed to it. If no target fits, the request
+fails with `CONTEXT_OVERFLOW` rather than being quietly cut down — distinct from
+`CAPABILITY_MISMATCH`, because the remedy is different: shorten the conversation, rather
+than look for another model. When a provider disagrees with Derby's estimate and returns
+`CONTEXT_OVERFLOW` itself, the disposition is `failoverToLargerContext`, which reorders the
+remaining attempts to prefer a bigger window.
+
+### Opting in to compaction
+
+Selection alone has a hard edge: a 600k conversation cannot use a 262k local model even when
+that is the only target left, so the request fails. A logical model can opt out of that edge
+with a `CompactionPolicy`, which trades exactness for reach **explicitly**. It is off by
+default and every affected response says so.
+
+With it enabled, a target that is only *too small* stays eligible instead of being excluded
+(a target missing a capability is still excluded — compaction can shrink a conversation, it
+cannot give a model eyes). `ContextCompactor` then shortens the request just before dispatch,
+per target, because each attempt has its own window:
+
+- System and developer messages are pinned; they carry what makes the rest coherent.
+- The most recent turns are kept verbatim.
+- **The cut always lands on a `user` message.** A slice that begins on a `tool` result, or
+  that keeps an assistant's `tool_calls` whose results were dropped, is rejected outright by
+  every provider — that would turn a recoverable size problem into a hard 400.
+- What was cut is either dropped (`drop_oldest`) or replaced by a summary from a model the
+  user nominated (`summarize`). The transcript handed to that model is itself bounded by
+  *its* window, so summarizing cannot overflow the summarizer.
+- If summarizing fails, the turns are dropped instead and the failure is recorded. If even
+  the final user message cannot fit, the request fails with `CONTEXT_OVERFLOW`: answering
+  from a truncated question would produce a confidently wrong response.
+
+None of this is silent. The result is reported as `x_derby.compaction`, on the
+`x-derby-compacted` response header, in the routing explanation, and in request history.
+Because it runs before the first byte is written, streaming needs no special case.
+
+So when consecutive turns land on different models, the full conversation goes to whichever
+one is chosen — one for one — and any model that could not hold it was never a candidate,
+unless compaction was enabled, in which case it was shortened and the client was told.
+The reserve matters here: with no `max_tokens` from the client, a request would otherwise
+reserve nothing, and a 30k conversation could land on a 32k model with no room to reply.
+`Router.defaultOutputReserveTokens` (or the logical model's default answer size) is added to
+the requirement so a chosen target can actually answer.
+
+What Derby does **not** do today: session affinity. Nothing pins a conversation to the
+target that served its previous turn, so a spreading strategy such as weighted random or
+round robin can alternate models between turns. For deterministic behaviour within a
+conversation, use `priority` or `failover_chain`.
+
+## Facts versus policy
+
+A model's capabilities are **facts reported by its provider**, not preferences. They are
+discovered, merged with bundled metadata to fill gaps, and shown read-only in Providers.
+There is nothing to decide there: a model either accepts images or it does not.
+
+What *is* a decision is the **contract a logical model presents**, and that lives with the
+logical model:
+
+| Where | What you set | Why there |
+| --- | --- | --- |
+| **Providers** | Price per token, intelligence score | Neither is knowable from the API — pricing varies by tier and contract, and quality is a judgement |
+| **Providers** (only when unreported) | Context window, max output | A bare endpoint reports nothing, so there must be some way to supply it |
+| **Logical Models** | Which shared capabilities to offer, context and answer caps | Narrowing is policy: the same model can serve a permissive group and a restricted one |
+
+`LogicalModelConstraints` can only ever **subtract**. Unchecking vision hides a capability the
+targets have; checking one they lack would be a promise Derby cannot keep, so it is ignored.
+Constraints are enforced in the router, not merely displayed — a request needing a withheld
+capability is refused with a clear error rather than routed to a target that happens to
+support it, because otherwise `/v1/models` would be telling clients something untrue.
+
+## What a logical model advertises
+
+`/v1/models` reports two capability sets per alias, because merging them would be unsafe for
+a client deciding *how to use* the model:
+
+- `capabilities` — supported by **every** eligible target. A request relying on these keeps
+  full failover.
+- `available_capabilities` — supported by **at least one** target. These requests still work,
+  since capability filtering routes them to the targets that qualify, but with fewer
+  alternatives behind them. The difference is reported as `partial_capabilities`.
+
+This is what makes mixed groups sound. A vision-capable model and a text-only model belong in
+one alias: the group *guarantees* text and *offers* vision. A model that emits images rather
+than text does not belong there at all — it cannot answer a chat request — and is reported
+under `incompatible_targets` instead of skewing the group's advertised shape.
+
+Context is reported the same way: top-level `context_window` is the largest window reachable
+through the alias (safe, because an oversized prompt is filtered rather than truncated, and
+stable as health changes), while `derby.min_context_window` is the floor that still fits every
+target.
+
 ## Streaming failover
 
 `StreamingSemantics` states the rule in code:
@@ -144,7 +272,7 @@ does not pretend a half-sent stream can be resumed.
 Sources/DerbyCore/
 ├── Canonical/      CanonicalRequest/Response/StreamEvent/Error, capabilities
 ├── ControlPlane/   DerbyConfig, providers, logical models, policies, pricing, settings
-├── Registry/       bundled model catalog (capabilities, context, list pricing)
+├── Registry/       bundled model catalog, resolved runtime model metadata
 ├── Routing/        snapshot, router, scorer, strategies, route plan, explanations
 ├── Execution/      executor, deadlines, hedging, AsyncEventChannel
 ├── Providers/      adapter protocol, OpenAI, Anthropic, Google, Codex, Bedrock, SigV4

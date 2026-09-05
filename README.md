@@ -33,21 +33,20 @@ git clone <this repo> && cd derby
 ```
 
 On first launch Derby seeds five editable logical models (`smart`, `fast`, `cheap`,
-`coding`, `local`), starts the gateway on `127.0.0.1:8787`, generates a local API key, and
-offers to import any local model servers and signed-in AI CLIs it finds.
+`coding`, `local`), starts the gateway on `127.0.0.1:8787`, and offers to import any local
+model servers and signed-in AI CLIs it finds. Clients need nothing but that port.
 
 ### Point a client at it
 
 ```text
 Base URL:   http://127.0.0.1:8787/v1
-API key:    <Derby local key>       (Derby → Settings → Access, or the Overview screen)
+API key:    none                    (send anything; clients that demand one are humoured)
 Model:      coding                  (any logical model name)
 ```
 
 ```bash
 curl http://127.0.0.1:8787/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $DERBY_KEY" \
   -d '{
     "model": "coding",
     "messages": [{"role": "user", "content": "Explain the CAP theorem."}]
@@ -58,17 +57,30 @@ Most tools work by changing two environment variables:
 
 ```bash
 export OPENAI_BASE_URL="http://127.0.0.1:8787/v1"
-export OPENAI_API_KEY="<Derby local key>"
+export OPENAI_API_KEY="derby"     # ignored; set only because most SDKs refuse to start without it
 ```
 
-Every response carries an `x_derby` object saying which provider answered, what was tried
-before it, and why:
+You ask for an alias; you are told what actually ran. The `model` field of every response is
+the physical model, and the `x_derby` object beside it says which provider answered, what
+that model can do, what was tried before it, and why:
 
 ```json
 "x_derby": {
   "logical_model": "coding",
   "provider": "Ollama (local)",
   "physical_model": "qwen3.6:27b",
+  "model": {
+    "id": "qwen3.6:27b",
+    "provider": "Ollama (local)",
+    "provider_kind": "ollama",
+    "context_window": 262144,
+    "max_output_tokens": 32768,
+    "capabilities": ["text", "vision", "tools", "parallel-tools", "json-mode", "json-schema", "reasoning", "streaming"],
+    "metadata_source": "builtin",
+    "pricing": {"flat_rate": true, "input_per_mtok_usd": 0, "output_per_mtok_usd": 0},
+    "local": true,
+    "subscription": false
+  },
   "routing_reason": "Failed over past Claude subscription (AUTHENTICATION); Ollama (local) handled the request.",
   "attempts": [
     {"attempt": "attempt_1", "provider": "Claude subscription", "status": "failed", "failure": "AUTHENTICATION", "duration_ms": 1},
@@ -78,6 +90,50 @@ before it, and why:
 }
 ```
 
+The same metadata arrives three other ways, so a client never has to guess what it is talking
+to:
+
+- **Response headers** — `x-derby-model`, `x-derby-provider`, `x-derby-provider-kind`,
+  `x-derby-context-window`, `x-derby-max-output-tokens`, `x-derby-capabilities`,
+  `x-derby-logical-model`, `x-derby-request-id`. A streaming response has to send its
+  headers before any target has run, so there they are named `x-derby-planned-*`: the
+  target Derby intends to use, with the stream's first chunk carrying the real one.
+- **Streaming** — the *first* chunk carries `x_derby` (the Responses dialect puts it on
+  `response.created`), so a stream announces its model before the first token rather than
+  after the last one. If Derby fails over before any content is sent, it re-announces.
+- **`GET /v1/models`** — each alias reports `derby.active_model`: what it resolves to right
+  now, decided by the same router the request path uses, plus `context_window` and
+  `max_output_tokens` at the top level and every configured target under `derby.targets`
+  with its own metadata, health and rank.
+
+```json
+{
+  "id": "coding",
+  "object": "model",
+  "owned_by": "derby",
+  "context_window": 200000,
+  "max_output_tokens": 64000,
+  "derby": {
+    "kind": "logical_model",
+    "strategy": "priority",
+    "target_count": 3,
+    "active_model": {"id": "claude-opus-4-5-20251101", "provider": "Claude subscription", "context_window": 200000, "…": "…"},
+    "targets": [{"id": "claude-opus-4-5-20251101", "rank": 0, "active": true, "health": "HEALTHY", "…": "…"}],
+    "routing_reason": "Always try targets in the order you arranged them."
+  }
+}
+```
+
+Strategies that spread traffic (weighted random, round robin) can resolve elsewhere on the
+next request — `derby.targets` lists every possibility, `derby.min_context_window` is the
+floor that is safe to cache for the alias, and `x_derby.model` on the response is always the
+authoritative answer.
+
+Physical model ids are **not** routable and are never advertised as models: every request
+goes through routing, failover and budgets. If you are writing a client that needs to know
+what it is talking to, [docs/CLIENTS.md](docs/CLIENTS.md) is the complete list of places to
+read it from.
+
 ---
 
 ## The app
@@ -85,14 +141,14 @@ before it, and why:
 | Screen | What it is for |
 | --- | --- |
 | **Overview** | Gateway status, endpoint, key, today's traffic, provider health, one-click setup for anything Derby detected |
-| **Logical Models** | The routing policy editor: strategy, drag-to-reorder targets, score weights, retries, failover, timeouts, hedging, budgets, request defaults |
-| **Providers** | Accounts, credentials, model lists, capability and pricing overrides, connection tests |
+| **Logical Models** | The routing policy editor: the group's offered contract, strategy, drag-to-reorder targets, score weights, retries, failover, timeouts, hedging, budgets, request defaults |
+| **Providers** | Accounts, credentials, discovered model facts (read-only), pricing and intelligence scores, connection tests |
 | **Routing** | The simulator — describe a request, see the ranked candidates, the exclusions and the reasons, without sending anything |
 | **Test Console** | Send a real prompt through the real pipeline and see the route it took |
 | **Requests** | Every request, with its full attempt timeline and the scores behind the decision |
 | **Usage** | Tokens and estimated cost by logical model, provider, physical model and client |
 | **Logs** | Structured, credential-redacted diagnostics, with a one-click export |
-| **Settings** | Port, bind address, API key, prompt logging, retention, config import/export |
+| **Settings** | Port, bind address, optional API key, prompt logging, retention, config import/export |
 
 Derby also lives in the menu bar: status, copy endpoint, restart, **pause routing**, quit.
 
@@ -102,13 +158,13 @@ Derby also lives in the menu bar: status, copy endpoint, restart, **pause routin
 
 | Method | Path | Notes |
 | --- | --- | --- |
-| `GET` | `/v1/models` | Lists your logical models, `owned_by: derby` |
+| `GET` | `/v1/models` | Lists your logical models, `owned_by: derby`, each with the physical model it currently resolves to |
 | `POST` | `/v1/chat/completions` | Streaming and non-streaming, tools, vision, JSON schema |
 | `POST` | `/v1/responses` | The Responses dialect, answered in kind |
 | `POST` | `/v1/embeddings` | Routed like everything else |
 | `GET` | `/health` | Liveness and per-provider state (no key required) |
 | `GET` | `/metrics` | Prometheus text format (no key required) |
-| `GET` | `/v1/derby/status` | Per-target health, circuit state and latency |
+| `GET` | `/v1/derby/status` | Per-target runtime metadata, health, circuit state and latency |
 
 Paths work with or without the `/v1` prefix.
 
@@ -183,6 +239,12 @@ private servers.
 - **Streaming semantics.** Failover is transparent *only* before the first content token
   reaches the client. After that Derby ends the stream with an error rather than splicing
   two models' output together.
+- **Context compaction.** Off by default: a target whose window cannot hold the conversation
+  is skipped, and a request that fits nowhere fails with `context_overflow` instead of being
+  quietly cut down. Turn it on per logical model and an oversized conversation is shortened
+  to fit the smaller target instead — dropping the oldest turns, or replacing them with a
+  summary written by a model you nominate. Never silently: the response carries
+  `x_derby.compaction` and an `x-derby-compacted` header.
 
 ---
 
@@ -200,7 +262,7 @@ private servers.
 
 ```bash
 swift build                    # library + app
-swift run DerbyTests           # 195 tests, no network required
+swift run DerbyTests           # 363 tests, no network required
 ./Scripts/build_app.sh         # → build/Derby.app
 ./Scripts/build_app.sh --install   # also copy to /Applications
 ```
@@ -214,6 +276,9 @@ required). **No third-party dependencies.**
 
 - Provider credentials live in the **macOS Keychain**; `config.json` stores only references.
 - The gateway binds to **127.0.0.1 only** by default, and is verified to refuse LAN traffic.
-- A local API key is required by default. If the key cannot be read, Derby **fails closed**.
+  That bind — not a key — is what keeps Derby off the network, so clients need no API key.
+- A local API key is available for anyone who binds beyond loopback (Settings → Access).
+  Once required, it is enforced on every route but `/health` and `/metrics`, and if the key
+  cannot be read from the Keychain, Derby **fails closed** rather than serving open.
 - Authorization headers, API keys and JWTs are redacted from logs, errors and diagnostics.
 - Prompt bodies are **not** stored by default — metadata only.

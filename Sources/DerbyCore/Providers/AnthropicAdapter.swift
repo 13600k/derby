@@ -65,9 +65,16 @@ public struct AnthropicAdapter: ProviderAdapter {
         let items = resp.bodyJSON?["data"]?.arrayValue ?? []
         let discovered = items.compactMap { item -> DiscoveredModel? in
             guard let id = item["id"]?.stringValue else { return nil }
+            let known = ModelCatalog.metadata(for: id, kind: ctx.account.kind)
+            var profile = ModelProfile(ownedBy: "anthropic")
+            if let created = item["created_at"]?.stringValue {
+                profile.modifiedAt = ISO8601DateFormatter().date(from: created)
+            }
             return DiscoveredModel(id: id,
                                    displayName: item["display_name"]?.stringValue,
-                                   capabilities: ModelCatalog.metadata(for: id, kind: ctx.account.kind).capabilities)
+                                   capabilities: known.capabilities,
+                                   profile: profile.isEmpty ? nil : profile,
+                                   pricing: known.pricing)
         }
         return discovered.isEmpty
             ? ModelCatalog.presetModels(for: ctx.account.kind).map { DiscoveredModel(id: $0) }
@@ -254,9 +261,11 @@ public struct AnthropicAdapter: ProviderAdapter {
         ]
         if !systemBlocks.isEmpty { body["system"] = .array(systemBlocks) }
         if stream { body["stream"] = .bool(true) }
-        if let t = r.temperature { body["temperature"] = .number(t) }
-        if let p = r.topP { body["top_p"] = .number(p) }
-        if !r.stop.isEmpty { body["stop_sequences"] = .array(r.stop.map { .string($0) }) }
+        // Newer Claude models reject sampling parameters; sending one returns a
+        // deprecation error rather than being ignored.
+        if let t = r.temperature, ctx.allows(.temperature) { body["temperature"] = .number(t) }
+        if let p = r.topP, ctx.allows(.topP) { body["top_p"] = .number(p) }
+        if !r.stop.isEmpty, ctx.allows(.stop) { body["stop_sequences"] = .array(r.stop.map { .string($0) }) }
         if let u = r.user { body["metadata"] = .object(["user_id": .string(u)]) }
 
         if !r.tools.isEmpty {

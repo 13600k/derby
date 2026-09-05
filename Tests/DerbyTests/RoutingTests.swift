@@ -89,12 +89,26 @@ func registerRoutingTests() {
             try expectEqual(decision.plan.attempts[0].target.providerName, "Vision")
         }
 
-        test("a logical model can mandate capabilities beyond the request") {
-            let plain = Fixture.account("Plain", models: [Fixture.model("p", caps: [.text, .streaming])])
-            let config = Fixture.config(accounts: [plain],
-                                        logicalModels: [Fixture.logical("coding", accounts: [plain], required: [.tools])])
-            let error = try await expectFailure(.capabilityMismatch) { _ = try Fixture.decision(config, model: "coding") }
-            try expectContains(error.message, "No eligible target")
+        test("a logical model narrows what it offers rather than demanding it") {
+            // There is no user-set "required capabilities": demanding something no
+            // target has could only empty the group. Narrowing is the supported
+            // direction, and it is enforced.
+            let capable = Fixture.account("Capable", models: [
+                Fixture.model("c", caps: [.text, .streaming, .tools, .vision])])
+            var lm = Fixture.logical("coding", accounts: [capable])
+            lm.constraints = LogicalModelConstraints(allowedCapabilities: [.text, .streaming, .tools])
+            let config = Fixture.config(accounts: [capable], logicalModels: [lm])
+
+            // Text and tools still route.
+            try expectEqual(try Fixture.decision(config, model: "coding").plan.attempts.count, 1)
+
+            // Vision was withheld, so it is refused rather than routed anyway.
+            var request = CanonicalRequest(requestedModel: "coding")
+            request.messages = [CanonicalMessage(role: .user, content: [
+                .image(CanonicalImage(base64: "AAA", mimeType: "image/png"))])]
+            _ = try await expectFailure(.capabilityMismatch) {
+                _ = try Router().route(RoutingRequest(request), snapshot: Fixture.snapshot(config))
+            }
         }
 
         test("a context window that is too small is filtered, larger one kept") {
@@ -228,8 +242,11 @@ func registerRoutingTests() {
             let ok = Fixture.account("Good", models: [Fixture.model("g", caps: [.text, .streaming, .tools])])
             let bad = Fixture.account("Bad", models: [Fixture.model("b", caps: [.text, .streaming])])
             let config = Fixture.config(accounts: [ok, bad],
-                                        logicalModels: [Fixture.logical("coding", accounts: [ok, bad], required: [.tools])])
-            let decision = try Fixture.decision(config, model: "coding")
+                                        logicalModels: [Fixture.logical("coding", accounts: [ok, bad])])
+            let request = RoutingRequest(logicalModelName: "coding",
+                                         requirements: CapabilityRequirements(required: [.text, .tools]),
+                                         promptTokens: 100)
+            let decision = try Router().route(request, snapshot: Fixture.snapshot(config))
             let trace = decision.trace
             try expectContains(trace, "Requested logical model: coding")
             try expectContains(trace, "✓ Good")

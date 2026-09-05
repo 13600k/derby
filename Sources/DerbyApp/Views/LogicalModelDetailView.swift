@@ -59,13 +59,104 @@ struct LogicalModelDetailView: View {
                     }
                 }
                 identityCard(lm)
+                contractCard(lm)
                 strategyCard(lm)
                 targetsCard(lm)
                 if lm.policy.strategy.usesScoreWeights { weightsCard(lm) }
+                compactionCard(lm)
                 reliabilityCard(lm)
                 dispositionCard(lm)
                 defaultsCard(lm)
                 budgetCard(lm)
+            }
+        }
+    }
+
+
+    /// What to do when the conversation is larger than the model that has to
+    /// answer it.
+    ///
+    /// Off by default, and deliberately so: shortening a conversation changes
+    /// the answer, and a user who has not asked for that should get a clear
+    /// error instead of a quietly worse response. Turning it on trades
+    /// exactness for reach, and every affected response says it happened.
+    @ViewBuilder
+    private func compactionCard(_ lm: LogicalModel) -> some View {
+        let policy = lm.compaction ?? .disabled
+        let summary = model.snapshot.logicalModel(named: lm.name)
+            .map { LogicalModelCapabilitySummary.summarize($0) } ?? .empty
+
+        Card(title: "When the conversation is too long",
+             subtitle: "Skip the smaller target, or shorten the conversation to fit it",
+             systemImage: "arrow.down.right.and.arrow.up.left") {
+            VStack(alignment: .leading, spacing: 14) {
+                Toggle("Shorten the conversation instead of skipping the target",
+                       isOn: compactionBinding(\.enabled))
+                    .onChange(of: policy.enabled) { _, _ in save() }
+
+                if let floor = summary.guaranteedContextWindow, let ceiling = summary.maxContextWindow,
+                   floor < ceiling {
+                    Text("Targets in this group range from \(floor.formattedTokens) to \(ceiling.formattedTokens) of context. Without this, a conversation over \(floor.formattedTokens) can only use the larger ones.")
+                        .font(.caption).foregroundStyle(.secondary)
+                } else {
+                    Text("With this off, a request that does not fit a target is routed past it, and fails when no target is large enough.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+
+                if policy.enabled {
+                    Divider()
+
+                    Picker("Method", selection: compactionBinding(\.strategy)) {
+                        ForEach(CompactionPolicy.Strategy.allCases, id: \.self) { s in
+                            Text(s.displayName).tag(s)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .onChange(of: policy.strategy) { _, _ in save() }
+
+                    Text(policy.strategy.summary)
+                        .font(.caption).foregroundStyle(.secondary)
+
+                    if policy.strategy == .summarize {
+                        LabeledContent("Written by") {
+                            Picker("", selection: compactorBinding()) {
+                                Text("Choose a model…").tag(CompactorSelection?.none)
+                                ForEach(model.config.providers.filter(\.enabled)) { account in
+                                    ForEach(account.models.filter(\.enabled)) { pm in
+                                        Text("\(account.name) · \(pm.label)")
+                                            .tag(Optional(CompactorSelection(providerID: account.id, modelUUID: pm.id)))
+                                    }
+                                }
+                            }
+                            .labelsHidden()
+                            .onChange(of: policy.compactor) { _, _ in save() }
+                        }
+                        if policy.compactor == nil {
+                            Label("Without a model to write the summary, older turns are dropped instead.",
+                                  systemImage: "exclamationmark.triangle")
+                                .font(.caption).foregroundStyle(.orange)
+                        } else {
+                            Text("A cheap, large-context model is the right choice here. It reads what is being removed, so it should be one you are comfortable sending the whole conversation to.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+
+                    AdaptiveGrid(minWidth: 190) {
+                        NumberField(label: "Keep this many recent messages",
+                                    value: compactionBinding(\.keepRecentMessages),
+                                    range: 1...100, onCommit: save)
+                        NumberField(label: "Fill at most this much of the window",
+                                    value: compactionBinding(\.targetUtilization),
+                                    range: 0.1...1.0, onCommit: save)
+                        NumberField(label: "Summarizing timeout (s)",
+                                    value: compactionBinding(\.timeoutSeconds),
+                                    range: 5...600, onCommit: save)
+                    }
+
+                    Label("Every response shortened this way reports it in x_derby.compaction, on the x-derby-compacted header, and in request history.",
+                          systemImage: "info.circle")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
             }
         }
     }
@@ -90,28 +181,159 @@ struct LogicalModelDetailView: View {
                         .textFieldStyle(.roundedBorder)
                         .onSubmit(save)
                 }
-                VStack(alignment: .leading, spacing: 5) {
-                    Text("Required capabilities").font(.caption).foregroundStyle(.secondary)
-                    FlowLayout(spacing: 5) {
-                        ForEach(CapabilityFlags.allNames, id: \.1) { flag, name in
-                            Toggle(name, isOn: Binding(
-                                get: { lm.requiredCapabilities.contains(flag) },
-                                set: { on in
-                                    var flags = draft?.requiredCapabilities ?? []
-                                    if on { flags.insert(flag) } else { flags.remove(flag) }
-                                    draft?.requiredCapabilities = flags
-                                    save()
-                                }))
-                            .toggleStyle(.button)
-                            .controlSize(.small)
-                            .font(.caption2)
+            }
+        }
+    }
+
+    /// What this group offers clients, and how far the user has narrowed it.
+    ///
+    /// Model capabilities themselves are facts from the provider and are not
+    /// editable in Providers. What *is* a decision is the contract presented
+    /// here: a group whose targets all support vision can still be declared
+    /// text-only, and a 200k group can be capped lower.
+    @ViewBuilder
+    private func contractCard(_ lm: LogicalModel) -> some View {
+        let summary = model.snapshot.logicalModel(named: lm.name)
+            .map { LogicalModelCapabilitySummary.summarize($0) } ?? .empty
+        let raw = summary.unconstrained ?? summary.available
+        let guaranteedRaw = rawGuaranteed(lm)
+
+        Card(title: "What this model offers",
+             subtitle: "Derived from the targets below — narrow it here, never in Providers",
+             systemImage: "checkmark.shield") {
+            VStack(alignment: .leading, spacing: 14) {
+                if summary.targetCount == 0 {
+                    Text("No target can serve this group yet. Add one below.")
+                        .font(.callout).foregroundStyle(.secondary)
+                } else {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Supported by every target")
+                            .font(.caption).foregroundStyle(.secondary)
+                        FlowLayout(spacing: 5) {
+                            ForEach(CapabilityFlags.allNames, id: \.1) { flag, name in
+                                if guaranteedRaw.contains(flag) {
+                                    Toggle(name, isOn: Binding(
+                                        get: { summary.available.contains(flag) },
+                                        set: { on in setCapability(flag, enabled: on, offeredBy: guaranteedRaw) }))
+                                    .toggleStyle(.button)
+                                    .controlSize(.small)
+                                    .font(.caption2)
+                                }
+                            }
+                        }
+                        Text("These are the abilities all of this group's targets share, so a request using them keeps full failover. Uncheck one to stop offering it.")
+                            .font(.caption2).foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+
+                    let partialRaw = raw.subtracting(guaranteedRaw)
+                    if !partialRaw.isEmpty {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("Supported by only some targets")
+                                .font(.caption).foregroundStyle(.secondary)
+                            FlowLayout(spacing: 5) {
+                                ForEach(CapabilityFlags.allNames, id: \.1) { flag, name in
+                                    if partialRaw.contains(flag) {
+                                        Toggle(name, isOn: Binding(
+                                            get: { summary.available.contains(flag) },
+                                            set: { on in setCapability(flag, enabled: on, offeredBy: raw) }))
+                                        .toggleStyle(.button)
+                                        .controlSize(.small)
+                                        .font(.caption2)
+                                        .tint(.orange)
+                                    }
+                                }
+                            }
+                            Text("Requests using these still work — Derby routes them to the targets that qualify — but with fewer alternatives to fail over to.")
+                                .font(.caption2).foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
                     }
-                    Text("Every target must have these, on top of whatever each request needs.")
-                        .font(.caption2).foregroundStyle(.secondary)
+
+                    if !summary.incompatible.isEmpty {
+                        VStack(alignment: .leading, spacing: 4) {
+                            ForEach(summary.incompatible, id: \.targetLabel) { item in
+                                Label("\(item.targetLabel) — \(item.reason)",
+                                      systemImage: "exclamationmark.triangle.fill")
+                                    .font(.caption).foregroundStyle(.orange)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                        }
+                    }
+
+                    Divider()
+
+                    HStack(alignment: .top, spacing: 20) {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("CONTEXT").font(.system(size: 9, weight: .semibold))
+                                .tracking(0.4).foregroundStyle(.secondary)
+                            Text(summary.maxContextWindow.map { $0.formattedTokens } ?? "not reported")
+                                .font(.callout.weight(.medium))
+                            if let floor = summary.guaranteedContextWindow,
+                               floor != summary.maxContextWindow {
+                                Text("\(floor.formattedTokens) with every target")
+                                    .font(.caption2).foregroundStyle(.secondary)
+                            }
+                        }
+                        OptionalNumberField(label: "Cap prompt at (tokens)",
+                                            value: constraintBinding(\.maxContextTokens),
+                                            onCommit: save)
+                            .frame(width: 170)
+                        OptionalNumberField(label: "Cap answer at (tokens)",
+                                            value: constraintBinding(\.maxOutputTokens),
+                                            onCommit: save)
+                            .frame(width: 170)
+                        Spacer()
+                    }
+
+                    if summary.isNarrowed || lm.constraints?.maxContextTokens != nil {
+                        HStack {
+                            Label("This group deliberately offers less than its targets support.",
+                                  systemImage: "arrow.down.right.circle")
+                                .font(.caption).foregroundStyle(.orange)
+                            Spacer()
+                            Button("Reset to targets") {
+                                draft?.constraints = nil
+                                save()
+                            }
+                            .buttonStyle(.link)
+                        }
+                    }
+                    Text("Clients read this from /v1/models, and Derby enforces it: a request needing something you unchecked is refused here rather than routed anyway.")
+                        .font(.caption2).foregroundStyle(.tertiary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
         }
+    }
+
+    /// Capabilities the targets actually share, before any narrowing.
+    private func rawGuaranteed(_ lm: LogicalModel) -> CapabilityFlags {
+        guard let resolved = model.snapshot.logicalModel(named: lm.name) else { return [] }
+        var stripped = resolved
+        stripped.definition.constraints = nil
+        return LogicalModelCapabilitySummary.summarize(stripped).guaranteed
+    }
+
+    /// Ticking a box removes it from the mask; unticking adds the mask if absent.
+    private func setCapability(_ flag: CapabilityFlags, enabled: Bool, offeredBy supported: CapabilityFlags) {
+        var constraints = draft?.constraints ?? LogicalModelConstraints()
+        var allowed = constraints.allowedCapabilities ?? supported
+        if enabled { allowed.insert(flag) } else { allowed.remove(flag) }
+        // A mask that allows everything is no mask at all.
+        constraints.allowedCapabilities = allowed.isSuperset(of: supported) ? nil : allowed
+        draft?.constraints = constraints.isEmpty ? nil : constraints
+        save()
+    }
+
+    private func constraintBinding(_ keyPath: WritableKeyPath<LogicalModelConstraints, Int?>) -> Binding<Int?> {
+        Binding(
+            get: { draft?.constraints?[keyPath: keyPath] },
+            set: { newValue in
+                var constraints = draft?.constraints ?? LogicalModelConstraints()
+                constraints[keyPath: keyPath] = newValue
+                draft?.constraints = constraints.isEmpty ? nil : constraints
+            })
     }
 
     private func strategyCard(_ lm: LogicalModel) -> some View {
@@ -430,6 +652,25 @@ struct LogicalModelDetailView: View {
         save()
     }
 
+    /// `compaction` is optional on disk so older configs still decode. The UI
+    /// always edits a concrete value, materializing the default on first touch.
+    private func compactionBinding<T>(_ keyPath: WritableKeyPath<CompactionPolicy, T>) -> Binding<T> {
+        Binding(get: { (draft?.compaction ?? current?.compaction ?? .disabled)[keyPath: keyPath] },
+                set: { newValue in
+                    var policy = draft?.compaction ?? .disabled
+                    policy[keyPath: keyPath] = newValue
+                    draft?.compaction = policy
+                })
+    }
+    private func compactorBinding() -> Binding<CompactorSelection?> {
+        Binding(get: { draft?.compaction?.compactor ?? current?.compaction?.compactor },
+                set: { newValue in
+                    var policy = draft?.compaction ?? .disabled
+                    policy.compactor = newValue
+                    draft?.compaction = policy
+                })
+    }
+
     private func binding<T>(_ keyPath: WritableKeyPath<LogicalModel, T>) -> Binding<T> {
         Binding(get: { draft?[keyPath: keyPath] ?? current![keyPath: keyPath] },
                 set: { draft?[keyPath: keyPath] = $0 })
@@ -465,9 +706,13 @@ struct LogicalModelDetailView: View {
     private func runTest() {
         guard let lm = draft else { return }
         Task {
+            // Probe with what this group actually offers, so "Test Routing"
+            // exercises a request the group is expected to serve.
+            let offered = model.snapshot.logicalModel(named: lm.name)
+                .map { LogicalModelCapabilitySummary.summarize($0).guaranteed } ?? []
             var input = DerbyEngine.SimulationInput(logicalModel: lm.name)
-            input.needsTools = lm.requiredCapabilities.contains(.tools)
-            input.needsVision = lm.requiredCapabilities.contains(.vision)
+            input.needsTools = offered.contains(.tools)
+            input.needsVision = offered.contains(.vision)
             switch await model.engine.simulate(input) {
             case .success(let decision):
                 testResult = decision

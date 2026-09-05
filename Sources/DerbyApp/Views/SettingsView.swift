@@ -6,6 +6,7 @@ struct SettingsView: View {
     @EnvironmentObject private var model: AppModel
     @State private var portText = ""
     @State private var confirmReset = false
+    @State private var isRefreshingCatalog = false
 
     var body: some View {
         Page(title: "Settings", subtitle: "Gateway, application and data") {
@@ -15,6 +16,7 @@ struct SettingsView: View {
                 gatewayCard
                 securityCard
                 applicationCard
+                catalogCard
                 loggingCard
                 dataCard
                 aboutCard
@@ -53,7 +55,9 @@ struct SettingsView: View {
                     Spacer()
                 }
                 if model.config.gateway.bindAddress != "127.0.0.1" {
-                    Label("Derby is reachable from your network. Keep the local API key enabled.",
+                    Label(model.config.gateway.requireAPIKey
+                          ? "Derby is reachable from your network. Keep the local API key enabled."
+                          : "Derby is reachable from your network with no API key. Turn on \"Require the local API key\" below.",
                           systemImage: "exclamationmark.triangle.fill")
                         .font(.caption).foregroundStyle(.orange)
                 }
@@ -92,21 +96,27 @@ struct SettingsView: View {
                     set: { newValue in
                         Task {
                             await model.mutate { $0.gateway.requireAPIKey = newValue }
+                            await model.syncLocalKey()
                             await model.restartGateway()
                         }
                     }))
-                CopyableField(label: "Local API key", value: model.localKey, isSecret: true) {
-                    model.copyToPasteboard($0, label: "API key")
-                }
-                .frame(maxWidth: 460)
-                HStack {
-                    Button("Regenerate Key") {
-                        Task {
-                            await model.regenerateLocalKey()
-                            await model.restartGateway()
-                        }
+                if model.config.gateway.requireAPIKey {
+                    CopyableField(label: "Local API key", value: model.localKey, isSecret: true) {
+                        model.copyToPasteboard($0, label: "API key")
                     }
-                    Spacer()
+                    .frame(maxWidth: 460)
+                    HStack {
+                        Button("Regenerate Key") {
+                            Task {
+                                await model.regenerateLocalKey()
+                                await model.restartGateway()
+                            }
+                        }
+                        Spacer()
+                    }
+                } else {
+                    Text("Clients need only the base URL. Derby ignores any API key they send, so tools that insist on one can use any value.")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
                 Text("Credentials for providers live in the macOS Keychain. Derby's configuration file contains only references to them.")
                     .font(.caption).foregroundStyle(.secondary)
@@ -184,6 +194,44 @@ struct SettingsView: View {
                                     set: { v in Task { await model.mutate { $0.logging.logRetentionDays = v } } }),
                                 range: 0...365, onCommit: {})
                 }
+            }
+        }
+    }
+
+    private var catalogCard: some View {
+        let status = model.engine.modelCatalogStatus()
+        return Card(title: "Model metadata",
+                    subtitle: "Context windows, modalities and list prices for known models",
+                    systemImage: "books.vertical") {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Provider APIs rarely report a model's context window, so Derby keeps a catalog of model metadata and refreshes it in the background. Discovered facts from a provider always win; this fills the gaps.")
+                    .font(.callout).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                DetailRow(label: "Models known", value: status.modelCount == 0 ? "none yet" : "\(status.modelCount)")
+                DetailRow(label: "Last updated",
+                          value: status.fetchedAt.map { Format.relative($0) } ?? "never")
+                HStack(spacing: 10) {
+                    Button {
+                        Task {
+                            isRefreshingCatalog = true
+                            defer { isRefreshingCatalog = false }
+                            switch await model.engine.refreshModelCatalog() {
+                            case .success(let count):
+                                await model.refreshLive()
+                                model.show(.success, "Model catalog updated", "\(count) models known.")
+                            case .failure(let error):
+                                model.show(.error, "Could not update the model catalog", error.message)
+                            }
+                        }
+                    } label: {
+                        if isRefreshingCatalog { ProgressView().controlSize(.small) }
+                        else { Label("Update Now", systemImage: "arrow.down.circle") }
+                    }
+                    .disabled(isRefreshingCatalog)
+                    Spacer()
+                }
+                Text("Source: models.dev")
+                    .font(.caption2).foregroundStyle(.tertiary)
             }
         }
     }

@@ -18,6 +18,9 @@ public final class ConfigStore: @unchecked Sendable {
     public let url: URL
     private let lock = NSLock()
     public private(set) var migrationNotes: [String] = []
+    /// Set when `load` upgraded the document, so the caller can persist the
+    /// result once instead of migrating (and re-warning) on every launch.
+    public private(set) var didUpgradeSchema = false
 
     public init(url: URL = AppPaths.configFile) {
         self.url = url
@@ -53,11 +56,21 @@ public final class ConfigStore: @unchecked Sendable {
             let notes = ConfigMigrator.migrate(rawObject: &obj)
             migrationNotes = notes
             warnings.append(contentsOf: notes)
-            if previousVersion != (obj["schemaVersion"] as? Int) {
+            let newVersion = (obj["schemaVersion"] as? Int) ?? previousVersion
+            didUpgradeSchema = newVersion > previousVersion
+            if newVersion != previousVersion {
                 try? backup(data, tag: "schema\(previousVersion)")
             }
             let migrated = try JSONSerialization.data(withJSONObject: obj)
             let config = try Self.decoder.decode(DerbyConfig.self, from: migrated)
+            if !config.decodeFailures.isEmpty {
+                // Keep a copy before anything can save over the parts that were
+                // dropped, and say so loudly rather than losing them quietly.
+                try? backup(data, tag: "partial-decode")
+                for failure in config.decodeFailures {
+                    warnings.append("Part of the configuration could not be read and was reset (\(failure)). The previous file was copied to Backups.")
+                }
+            }
             return (config, false, warnings)
         } catch {
             let stamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")

@@ -11,6 +11,7 @@ public struct AdapterRegistry: Sendable {
             .openai: OpenAIAdapter(),
             .anthropic: AnthropicAdapter(oauth: false),
             .anthropicOAuth: AnthropicAdapter(oauth: true),
+            .claudeCLI: ClaudeCLIAdapter(),
             .google: GoogleAdapter(),
             .chatgptCodex: ChatGPTCodexAdapter(),
             .bedrock: BedrockAdapter(),

@@ -18,6 +18,10 @@ public struct OpenAIQuirks: Sendable {
     public var supportsReasoningEffort = false
     /// Some servers 400 on unknown fields; keep the payload minimal for those.
     public var strictSchema = false
+    /// How this endpoint reports its models. Declarative so the generic adapter
+    /// does not branch on provider identity.
+    public enum DiscoveryStyle: Sendable { case openAIModels, ollamaNative }
+    public var discoveryStyle: DiscoveryStyle = .openAIModels
     public var listModelsPath = "models"
     public var chatPath = "chat/completions"
     public var embeddingsPath = "embeddings"
@@ -54,6 +58,9 @@ public struct OpenAIQuirks: Sendable {
             q.supportsJSONSchema = true
             q.authStyle = .none
             q.strictSchema = true
+            // /v1/models reports only an id; the native API reports context
+            // length, modalities, parameter size and quantization.
+            q.discoveryStyle = .ollamaNative
         case .lmStudio, .llamaCpp, .localai, .sglang, .vllm:
             q.supportsStreamOptions = (kind == .vllm || kind == .sglang || kind == .lmStudio)
             q.supportsParallelToolCalls = false
@@ -127,6 +134,24 @@ public struct OpenAIAdapter: ProviderAdapter {
     public func listModels(_ ctx: ProviderContext) async throws -> [DiscoveredModel] {
         let q = quirks(ctx)
         let auth = try await authenticate(ctx)
+
+        if case .ollamaNative = q.discoveryStyle {
+            let native = try await OllamaDiscovery.listModels(
+                baseURL: auth.baseURLOverride ?? ctx.account.baseURL,
+                transport: ctx.transport,
+                timeout: min(ctx.account.requestTimeoutSeconds, 30),
+                allowInsecureTLS: ctx.account.allowInsecureTLS,
+                headers: headers(ctx, auth: auth))
+            // Complete anything the server did not state from the bundled catalog.
+            return native.map { model in
+                var enriched = model
+                let catalog = ModelCatalog.metadata(for: model.id, kind: ctx.account.kind)
+                enriched.capabilities = (model.capabilities ?? catalog.capabilities)
+                    .fillingGaps(from: catalog.capabilities)
+                return enriched
+            }
+        }
+
         let u = try url(ctx, path: q.listModelsPath, auth: auth)
         let req = OutboundRequest(url: u, method: "GET", headers: headers(ctx, auth: auth),
                                   timeout: min(ctx.account.requestTimeoutSeconds, 30),
@@ -139,25 +164,97 @@ public struct OpenAIAdapter: ProviderAdapter {
             throw DerbyError(kind: .transient, message: "Model list was not valid JSON.")
         }
         let items = json["data"]?.arrayValue ?? json.arrayValue ?? []
-        var out: [DiscoveredModel] = []
-        for item in items {
-            guard let id = item["id"]?.stringValue ?? item["name"]?.stringValue else { continue }
-            var caps = ModelCatalog.metadata(for: id, kind: ctx.account.kind).capabilities
-            // Some servers publish richer metadata than our catalog knows.
-            if let ctx2 = item["context_length"]?.intValue ?? item["context_window"]?.intValue {
-                caps.contextWindow = ctx2
-                caps.source = .discovered
-            }
-            if let arch = item["architecture"]?["input_modalities"]?.arrayValue {
-                if arch.contains(where: { $0.stringValue == "image" }) { caps.flags.insert(.vision) }
-                caps.source = .discovered
-            }
-            if let params = item["supported_parameters"]?.arrayValue {
-                if params.contains(where: { $0.stringValue == "tools" }) { caps.flags.insert(.tools) }
-            }
-            out.append(DiscoveredModel(id: id, displayName: item["name"]?.stringValue, capabilities: caps))
+        return items.compactMap { parseListedModel($0, kind: ctx.account.kind) }
+            .sorted { $0.id < $1.id }
+    }
+
+    /// Reads whatever an OpenAI-style `/models` entry chooses to publish.
+    /// Aggregators such as OpenRouter report context length, modalities,
+    /// supported parameters and pricing; bare servers report only an id, and the
+    /// bundled catalog fills the rest.
+    func parseListedModel(_ item: JSONValue, kind: ProviderKind) -> DiscoveredModel? {
+        guard let id = item["id"]?.stringValue ?? item["name"]?.stringValue else { return nil }
+        let catalog = ModelCatalog.metadata(for: id, kind: kind)
+
+        var discovered = ModelCapabilities(flags: [], source: .discovered)
+        var learnedSomething = false
+
+        if let window = item["context_length"]?.intValue ?? item["context_window"]?.intValue
+            ?? item["max_context_length"]?.intValue {
+            discovered.contextWindow = window
+            learnedSomething = true
         }
-        return out.sorted { $0.id < $1.id }
+        if let maxOut = item["top_provider"]?["max_completion_tokens"]?.intValue
+            ?? item["max_output_tokens"]?.intValue ?? item["max_tokens"]?.intValue {
+            discovered.maxOutputTokens = maxOut
+            learnedSomething = true
+        }
+        if let dimensions = item["dimensions"]?.intValue ?? item["embedding_dimensions"]?.intValue {
+            discovered.embeddingDimensions = dimensions
+            discovered.flags.insert(.embeddings)
+            learnedSomething = true
+        }
+
+        let inputModalities = (item["architecture"]?["input_modalities"]?.arrayValue ?? [])
+            .compactMap { $0.stringValue }
+        let outputModalities = (item["architecture"]?["output_modalities"]?.arrayValue ?? [])
+            .compactMap { $0.stringValue }
+        if !inputModalities.isEmpty || !outputModalities.isEmpty {
+            learnedSomething = true
+            if inputModalities.contains("text") || outputModalities.contains("text") {
+                discovered.flags.formUnion([.text, .streaming])
+            }
+            if inputModalities.contains("image") { discovered.flags.insert(.vision) }
+            if inputModalities.contains("audio") { discovered.flags.insert(.audioInput) }
+            if outputModalities.contains("audio") { discovered.flags.insert(.audioOutput) }
+        }
+
+        let supported = (item["supported_parameters"]?.arrayValue ?? []).compactMap { $0.stringValue }
+        if !supported.isEmpty {
+            learnedSomething = true
+            // An enumerated list is authoritative: anything absent is rejected.
+            discovered.unsupportedParameters = RequestParameters.known
+                .subtracting(RequestParameters(names: supported))
+            discovered.flags.formUnion([.text, .streaming])
+            if supported.contains("tools") { discovered.flags.formUnion([.tools, .parallelTools]) }
+            if supported.contains("response_format") { discovered.flags.insert(.jsonMode) }
+            if supported.contains("structured_outputs") { discovered.flags.insert(.jsonSchema) }
+            if supported.contains("reasoning") || supported.contains("include_reasoning") {
+                discovered.flags.insert(.reasoning)
+            }
+        }
+
+        // Published prices are per token; Derby works per million.
+        var pricing: Pricing?
+        if let node = item["pricing"] {
+            func perMillion(_ key: String) -> Double? {
+                guard let raw = node[key]?.doubleValue ?? node[key]?.stringValue.flatMap(Double.init),
+                      raw > 0 else { return nil }
+                return raw * 1_000_000
+            }
+            let input = perMillion("prompt") ?? perMillion("input")
+            let output = perMillion("completion") ?? perMillion("output")
+            if input != nil || output != nil {
+                pricing = Pricing(inputPerMTok: input, outputPerMTok: output,
+                                  cachedInputPerMTok: perMillion("input_cache_read"))
+                learnedSomething = true
+            }
+        }
+
+        var profile = ModelProfile(summary: item["description"]?.stringValue,
+                                   ownedBy: item["owned_by"]?.stringValue)
+        if let created = item["created"]?.doubleValue, created > 0 {
+            profile.modifiedAt = Date(timeIntervalSince1970: created)
+        }
+
+        let capabilities = learnedSomething
+            ? discovered.fillingGaps(from: catalog.capabilities)
+            : catalog.capabilities
+        return DiscoveredModel(id: id,
+                               displayName: item["name"]?.stringValue,
+                               capabilities: capabilities,
+                               profile: profile.isEmpty ? nil : profile,
+                               pricing: pricing ?? catalog.pricing)
     }
 
     // MARK: - Execute
@@ -165,7 +262,8 @@ public struct OpenAIAdapter: ProviderAdapter {
     public func execute(_ request: CanonicalRequest, model: String, ctx: ProviderContext) async throws -> CanonicalResponse {
         let q = quirks(ctx)
         let auth = try await authenticate(ctx)
-        let body = try buildChatBody(request, model: model, quirks: q, stream: false)
+        let body = try buildChatBody(request, model: model, quirks: q, stream: false,
+                                     capabilities: ctx.modelCapabilities)
         let u = try chatURL(ctx, model: model, quirks: q, auth: auth)
         let req = OutboundRequest(url: u, method: "POST", headers: headers(ctx, auth: auth),
                                   body: try encode(body), timeout: ctx.attemptTimeout,
@@ -186,7 +284,8 @@ public struct OpenAIAdapter: ProviderAdapter {
         -> AsyncThrowingStream<CanonicalStreamEvent, Error> {
         let q = quirks(ctx)
         let auth = try await authenticate(ctx)
-        let body = try buildChatBody(request, model: model, quirks: q, stream: true)
+        let body = try buildChatBody(request, model: model, quirks: q, stream: true,
+                                     capabilities: ctx.modelCapabilities)
         let u = try chatURL(ctx, model: model, quirks: q, auth: auth)
         var h = headers(ctx, auth: auth)
         h["accept"] = "text/event-stream"
@@ -312,7 +411,15 @@ public struct OpenAIAdapter: ProviderAdapter {
         try JSONEncoder().encode(v)
     }
 
-    func buildChatBody(_ r: CanonicalRequest, model: String, quirks q: OpenAIQuirks, stream: Bool) throws -> JSONValue {
+    func buildChatBody(_ r: CanonicalRequest, model: String, quirks q: OpenAIQuirks, stream: Bool,
+                       capabilities: ModelCapabilities? = nil) throws -> JSONValue {
+        // Reasoning-era models reject sampling parameters outright — sending
+        // `temperature` to one fails the request with a deprecation error rather
+        // than being ignored. Omit anything the model is known not to accept;
+        // when nothing is known, every parameter is sent exactly as before.
+        func allows(_ parameter: RequestParameters) -> Bool {
+            capabilities?.allows(parameter) ?? true
+        }
         var body: [String: JSONValue] = [
             "model": .string(model),
             "messages": .array(r.messages.map { encodeMessage($0) }),
@@ -323,16 +430,16 @@ public struct OpenAIAdapter: ProviderAdapter {
                 body["stream_options"] = .object(["include_usage": .bool(true)])
             }
         }
-        if let t = r.temperature { body["temperature"] = .number(t) }
-        if let p = r.topP { body["top_p"] = .number(p) }
-        if let m = r.maxOutputTokens {
+        if let t = r.temperature, allows(.temperature) { body["temperature"] = .number(t) }
+        if let p = r.topP, allows(.topP) { body["top_p"] = .number(p) }
+        if let m = r.maxOutputTokens, allows(.maxTokens) {
             body[q.prefersMaxCompletionTokens ? "max_completion_tokens" : "max_tokens"] = .number(Double(m))
         }
-        if !r.stop.isEmpty { body["stop"] = .array(r.stop.map { .string($0) }) }
-        if q.supportsSeed, let s = r.seed { body["seed"] = .number(Double(s)) }
+        if !r.stop.isEmpty, allows(.stop) { body["stop"] = .array(r.stop.map { .string($0) }) }
+        if q.supportsSeed, allows(.seed), let s = r.seed { body["seed"] = .number(Double(s)) }
         if q.supportsPenalties {
-            if let f = r.frequencyPenalty { body["frequency_penalty"] = .number(f) }
-            if let p = r.presencePenalty { body["presence_penalty"] = .number(p) }
+            if let f = r.frequencyPenalty, allows(.frequencyPenalty) { body["frequency_penalty"] = .number(f) }
+            if let p = r.presencePenalty, allows(.presencePenalty) { body["presence_penalty"] = .number(p) }
         }
         if let n = r.n, n != 1 { body["n"] = .number(Double(n)) }
         if let u = r.user { body["user"] = .string(u) }
@@ -354,7 +461,7 @@ public struct OpenAIAdapter: ProviderAdapter {
                                                    "function": .object(["name": .string(name)])])
                 }
             }
-            if q.supportsParallelToolCalls, let p = r.parallelToolCalls {
+            if q.supportsParallelToolCalls, allows(.parallelToolCalls), let p = r.parallelToolCalls {
                 body["parallel_tool_calls"] = .bool(p)
             }
         }
@@ -379,8 +486,12 @@ public struct OpenAIAdapter: ProviderAdapter {
             }
         }
 
-        if q.supportsReasoningEffort, let reasoning = r.reasoning, let effort = reasoning.effort {
-            body["reasoning_effort"] = .string(effort.standardOpenAIValue)
+        if q.supportsReasoningEffort, allows(.reasoningEffort),
+           let reasoning = r.reasoning, let effort = reasoning.effort {
+            // Prefer the levels this model actually publishes; fall back to the
+            // four the REST API has always accepted.
+            body["reasoning_effort"] = .string(
+                capabilities?.clampEffort(effort) ?? effort.standardOpenAIValue)
         }
 
         // Escape hatch: anything the user configured for this family wins.

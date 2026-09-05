@@ -302,6 +302,131 @@ public struct RequestDefaults: Codable, Sendable, Hashable {
     }
 }
 
+/// Identifies the model that condenses a conversation when one must be shortened.
+public struct CompactorSelection: Codable, Sendable, Hashable {
+    public var providerID: UUID
+    public var modelUUID: UUID
+    public init(providerID: UUID, modelUUID: UUID) {
+        self.providerID = providerID; self.modelUUID = modelUUID
+    }
+}
+
+/// What to do when a conversation does not fit the target chosen to answer it.
+///
+/// Off by default, and deliberately so. Derby's normal rule is that it never
+/// rewrites a conversation: a target too small to hold one is filtered out, and
+/// nothing is silently dropped. That rule is right, because a router quietly
+/// discarding turns corrupts a conversation in a way the client cannot detect.
+///
+/// But it costs reach. A 600k conversation simply cannot use a 262k local model,
+/// even when that is the only target left. Enabling compaction trades exactness
+/// for reach *explicitly*: the smaller target becomes eligible, the conversation
+/// is shortened to fit, and every response says so — in `x_derby.compaction`, in
+/// request history, and in the routing explanation.
+public struct CompactionPolicy: Codable, Sendable, Hashable {
+    public enum Strategy: String, Codable, Sendable, CaseIterable {
+        /// Drop the oldest turns. No model call, so it is free and instant.
+        case dropOldest = "drop_oldest"
+        /// Have a model condense the dropped turns into a summary that is kept.
+        case summarize
+        public var displayName: String {
+            switch self {
+            case .dropOldest: return "Drop oldest turns"
+            case .summarize: return "Summarize older turns"
+            }
+        }
+        public var summary: String {
+            switch self {
+            case .dropOldest:
+                return "Removes the oldest messages until the conversation fits. Free and instant, but the dropped content is gone."
+            case .summarize:
+                return "Asks a model to condense the older messages into a summary, which is kept in their place. Costs one extra call."
+            }
+        }
+    }
+
+    public var enabled: Bool
+    public var strategy: Strategy
+    /// Which model writes the summary. Nil means the target that will answer.
+    public var compactor: CompactorSelection?
+    /// Most recent messages always kept verbatim.
+    public var keepRecentMessages: Int
+    /// Fraction of the target's window a compacted prompt may occupy, leaving
+    /// room for the answer and for estimation error.
+    public var targetUtilization: Double
+    /// Ceiling on the summarizing call, so compaction cannot eat the deadline.
+    public var timeoutSeconds: Double
+
+    public init(enabled: Bool = false,
+                strategy: Strategy = .summarize,
+                compactor: CompactorSelection? = nil,
+                keepRecentMessages: Int = 6,
+                targetUtilization: Double = 0.75,
+                timeoutSeconds: Double = 60) {
+        self.enabled = enabled
+        self.strategy = strategy
+        self.compactor = compactor
+        self.keepRecentMessages = keepRecentMessages
+        self.targetUtilization = targetUtilization
+        self.timeoutSeconds = timeoutSeconds
+    }
+
+    public static let disabled = CompactionPolicy()
+}
+
+/// A deliberate narrowing of what a logical model offers.
+///
+/// Model capabilities are facts reported by the provider and are not editable
+/// per model. What *is* a decision is the contract a logical model presents: a
+/// group whose targets all happen to support vision can still be declared
+/// text-only, and a group of 200k models can be capped at 32k. Those are policy,
+/// so they live here rather than on the model.
+///
+/// Constraints only ever narrow. They cannot claim a capability no target has.
+public struct LogicalModelConstraints: Codable, Sendable, Hashable {
+    /// When set, the group offers only these capabilities — intersected with
+    /// what the targets actually support. Nil means "whatever the targets share".
+    public var allowedCapabilities: CapabilityFlags?
+    /// Caps the prompt size the group advertises and accepts.
+    public var maxContextTokens: Int?
+    /// Caps the answer size the group advertises and accepts.
+    public var maxOutputTokens: Int?
+
+    public init(allowedCapabilities: CapabilityFlags? = nil,
+                maxContextTokens: Int? = nil,
+                maxOutputTokens: Int? = nil) {
+        self.allowedCapabilities = allowedCapabilities
+        self.maxContextTokens = maxContextTokens
+        self.maxOutputTokens = maxOutputTokens
+    }
+
+    public var isEmpty: Bool {
+        allowedCapabilities == nil && maxContextTokens == nil && maxOutputTokens == nil
+    }
+
+    /// Applies the capability mask, if one is set.
+    public func narrowing(_ flags: CapabilityFlags) -> CapabilityFlags {
+        guard let allowedCapabilities else { return flags }
+        return flags.intersection(allowedCapabilities)
+    }
+
+    /// Applies a numeric cap, keeping the smaller of the two.
+    public func capping(context value: Int?) -> Int? {
+        switch (value, maxContextTokens) {
+        case (let v?, let cap?): return Swift.min(v, cap)
+        case (nil, let cap?): return cap
+        default: return value
+        }
+    }
+    public func capping(output value: Int?) -> Int? {
+        switch (value, maxOutputTokens) {
+        case (let v?, let cap?): return Swift.min(v, cap)
+        case (nil, let cap?): return cap
+        default: return value
+        }
+    }
+}
+
 /// A candidate target inside a logical model: a (provider account, model) pair
 /// plus the routing knobs that only make sense in this logical model's context.
 public struct TargetRef: Codable, Sendable, Hashable, Identifiable {
@@ -344,8 +469,17 @@ public struct LogicalModel: Codable, Sendable, Hashable, Identifiable {
     public var hedging: HedgeConfig
     public var budget: BudgetRules
     public var defaults: RequestDefaults
-    /// Capabilities every target must have, on top of what the request implies.
+    /// No longer used. Demanding a capability none of the targets had could only
+    /// empty the group, so what a group offers is now decided by its targets and
+    /// narrowed through `constraints`. Retained so older configurations decode.
+    @available(*, deprecated, message: "Use `constraints` to narrow what a logical model offers.")
     public var requiredCapabilities: CapabilityFlags
+    /// A deliberate narrowing of the contract this group presents. Optional so
+    /// configurations written before it existed still decode.
+    public var constraints: LogicalModelConstraints?
+    /// What to do when a conversation outgrows the target chosen to answer it.
+    /// Optional so older configurations decode; nil means disabled.
+    public var compaction: CompactionPolicy?
     public var createdAt: Date
     public var updatedAt: Date
 
@@ -355,12 +489,16 @@ public struct LogicalModel: Codable, Sendable, Hashable, Identifiable {
                 timeouts: TimeoutConfig = .default, hedging: HedgeConfig = .disabled,
                 budget: BudgetRules = .unlimited, defaults: RequestDefaults = .none,
                 requiredCapabilities: CapabilityFlags = [],
+                constraints: LogicalModelConstraints? = nil,
+                compaction: CompactionPolicy? = nil,
                 createdAt: Date = Date(), updatedAt: Date = Date()) {
         self.id = id; self.name = name; self.summary = summary; self.enabled = enabled
         self.targets = targets; self.policy = policy; self.retry = retry
         self.failover = failover; self.timeouts = timeouts; self.hedging = hedging
         self.budget = budget; self.defaults = defaults
         self.requiredCapabilities = requiredCapabilities
+        self.constraints = constraints
+        self.compaction = compaction
         self.createdAt = createdAt; self.updatedAt = updatedAt
     }
 }

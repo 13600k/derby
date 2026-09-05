@@ -19,6 +19,11 @@ public enum CodexModelCatalog {
         /// `hide` marks internal models the CLI does not offer.
         public var isListed: Bool
         public var supportedInAPI: Bool
+        /// The window the CLI actually works to, and the ceiling the model
+        /// supports. The backend publishes both; Derby reports the larger as the
+        /// model's capability and leaves the CLI's working figure alone.
+        public var contextWindow: Int?
+        public var maxContextWindow: Int?
 
         /// Quality derived from the provider's own ordering rather than invented.
         public var derivedQuality: Double {
@@ -76,7 +81,9 @@ public enum CodexModelCatalog {
                          defaultEffort: item["default_reasoning_level"] as? String,
                          priority: item["priority"] as? Int ?? 99,
                          isListed: (item["visibility"] as? String ?? "list") == "list",
-                         supportedInAPI: item["supported_in_api"] as? Bool ?? true)
+                         supportedInAPI: item["supported_in_api"] as? Bool ?? true,
+                         contextWindow: item["context_window"] as? Int,
+                         maxContextWindow: item["max_context_window"] as? Int)
         }
         guard !entries.isEmpty else { return nil }
 

@@ -55,7 +55,7 @@ public actor HTTPServer {
         // it restricts peers to the local link but still binds every interface,
         // so the listener would show up as *:port. Pinning the local endpoint is
         // what actually keeps a loopback gateway off the network.
-        let isLoopback = (host == "127.0.0.1" || host == "localhost" || host == "::1")
+        let isLoopback = GatewaySettings.isLoopback(host)
         if isLoopback {
             params.requiredLocalEndpoint = NWEndpoint.hostPort(host: .ipv4(.loopback), port: nwPort)
         } else if host != "0.0.0.0" && !host.isEmpty {

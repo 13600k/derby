@@ -140,8 +140,8 @@ struct ModelRow: View {
     var isProbing: Bool
     var onToggle: (Bool) -> Void
     var onQuality: (Double) -> Void
-    var onCapabilities: (CapabilityFlags) -> Void
     var onContext: (Int?) -> Void
+    var onMaxOutput: (Int?) -> Void
     var onPricing: (Pricing?) -> Void
     var onProbe: () -> Void
     var onRemove: () -> Void
@@ -198,7 +198,10 @@ struct ModelRow: View {
     private var subtitle: String {
         var parts: [String] = []
         if let window = caps.contextWindow { parts.append("\(window.formattedTokens) ctx") }
-        parts.append(caps.flags.names.joined(separator: " · "))
+        if let out = caps.maxOutputTokens { parts.append("\(out.formattedTokens) out") }
+        if let dimensions = caps.embeddingDimensions { parts.append("\(dimensions)-dim") }
+        parts.append(contentsOf: physical.profile?.descriptors ?? [])
+        if !caps.flags.names.isEmpty { parts.append(caps.flags.names.joined(separator: "/")) }
         if health.totalSamples > 0 {
             parts.append("\(Format.percent(health.successRate)) ok")
             if let p = health.p50Seconds { parts.append("p50 \(p.msString)") }
@@ -206,43 +209,102 @@ struct ModelRow: View {
         return parts.joined(separator: "  ·  ")
     }
 
+    /// Named so the user can fill in what discovery could not establish, rather
+    /// than a silently blank field.
+    private var missingFacts: [String] { caps.missingFacts }
+
     private var detail: some View {
         VStack(alignment: .leading, spacing: 12) {
             Divider()
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Quality score: \(Int(physical.qualityScore))").font(.caption)
-                Slider(value: Binding(get: { physical.qualityScore }, set: onQuality), in: 0...100, step: 1)
-                Text("Your subjective ranking, used by weighted-score routing.")
-                    .font(.caption2).foregroundStyle(.secondary)
-            }
 
-            VStack(alignment: .leading, spacing: 4) {
+            // What the model *is* comes from the provider and is not editable
+            // here. Narrowing belongs to a logical model, where it is a policy
+            // decision about the contract that group presents.
+            VStack(alignment: .leading, spacing: 6) {
                 HStack {
-                    Text("Capabilities").font(.caption)
+                    Text("Reported by the provider").font(.caption).foregroundStyle(.secondary)
                     Spacer()
-                    Text(caps.source == .userOverride ? "overridden" : caps.source.rawValue)
-                        .font(.caption2).foregroundStyle(.secondary)
+                    StatusPill(text: sourceLabel, tint: sourceTint)
                 }
                 FlowLayout(spacing: 5) {
-                    ForEach(CapabilityFlags.allNames, id: \.1) { flag, name in
-                        Toggle(name, isOn: Binding(
-                            get: { caps.flags.contains(flag) },
-                            set: { on in
-                                var flags = caps.flags
-                                if on { flags.insert(flag) } else { flags.remove(flag) }
-                                onCapabilities(flags)
-                            }))
-                        .toggleStyle(.button)
-                        .controlSize(.small)
+                    ForEach(caps.flags.names, id: \.self) { name in
+                        Text(name)
+                            .font(.caption2)
+                            .padding(.horizontal, 7).padding(.vertical, 3)
+                            .background(Color.accentColor.opacity(0.12), in: Capsule())
+                    }
+                }
+                HStack(spacing: 16) {
+                    factView("Context window", caps.contextWindow.map { $0.formattedTokens })
+                    factView("Max output", caps.maxOutputTokens.map { $0.formattedTokens })
+                    if caps.flags.contains(.embeddings) {
+                        factView("Dimensions", caps.embeddingDimensions.map(String.init))
+                    }
+                    Spacer()
+                }
+                if !caps.unsupportedParameters.isEmpty {
+                    Text("Rejects: \(caps.unsupportedParameters.names.joined(separator: ", "))")
                         .font(.caption2)
+                        .foregroundStyle(.orange)
+                        .help("Derby omits these from requests to this model.")
+                }
+                if let efforts = caps.supportedReasoningEfforts, !efforts.isEmpty {
+                    Text("Reasoning levels: \(efforts.joined(separator: ", "))")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+                if let profile = physical.profile, !profile.descriptors.isEmpty {
+                    Text(profile.descriptors.joined(separator: " · "))
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+                if let summary = physical.profile?.summary {
+                    Text(summary).font(.caption2).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Text("Use Discover Models to refresh these from the provider. To offer less than a model supports, narrow the logical model that uses it.")
+                    .font(.caption2).foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            // The one exception: a provider that reported nothing leaves Derby
+            // guessing, and there would otherwise be no way to correct it.
+            if !missingFacts.isEmpty {
+                Divider()
+                VStack(alignment: .leading, spacing: 6) {
+                    Label("\(physical.modelID) did not report: \(missingFacts.joined(separator: ", ")).",
+                          systemImage: "questionmark.circle")
+                        .font(.caption).foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text("Routing still works — an unknown limit is never used to exclude a model — but supplying it lets Derby fit conversations to this model.")
+                        .font(.caption2).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    HStack(spacing: 12) {
+                        if caps.contextWindow == nil {
+                            OptionalNumberField(label: "Context window (tokens)",
+                                                value: Binding(get: { caps.contextWindow }, set: onContext)) {}
+                                .frame(width: 180)
+                        }
+                        if caps.maxOutputTokens == nil {
+                            OptionalNumberField(label: "Max output (tokens)",
+                                                value: Binding(get: { caps.maxOutputTokens }, set: onMaxOutput)) {}
+                                .frame(width: 160)
+                        }
+                        Spacer()
                     }
                 }
             }
 
+            Divider()
+
+            // What a person legitimately decides about a model.
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Intelligence score: \(Int(physical.qualityScore))").font(.callout)
+                Slider(value: Binding(get: { physical.qualityScore }, set: onQuality), in: 0...100, step: 1)
+                Text("Your ranking of this model's quality, used by weighted-score routing.")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+
             HStack(spacing: 12) {
-                OptionalNumberField(label: "Context window (tokens)",
-                                    value: Binding(get: { caps.contextWindow }, set: onContext)) {}
-                    .frame(width: 180)
                 OptionalDoubleField(label: "Input $/Mtok",
                                     value: Binding(
                                         get: { physical.pricingOverride?.inputPerMTok },
@@ -263,14 +325,28 @@ struct ModelRow: View {
                                         }),
                                     placeholder: "unknown") {}
                     .frame(width: 130)
+                OptionalDoubleField(label: "Cached input $/Mtok",
+                                    value: Binding(
+                                        get: { physical.pricingOverride?.cachedInputPerMTok },
+                                        set: { newValue in
+                                            var p = physical.pricingOverride ?? Pricing()
+                                            p.cachedInputPerMTok = newValue
+                                            onPricing(p)
+                                        }),
+                                    placeholder: "unknown") {}
+                    .frame(width: 150)
                 Spacer()
+            }
+            if physical.pricingOverride?.isFlatRate == true {
+                Text("Local and subscription targets are flat-rate: no marginal cost per token.")
+                    .font(.caption2).foregroundStyle(.secondary)
             }
 
             if health.totalSamples > 0 || health.circuit != .closed {
                 Divider()
                 HStack(spacing: 16) {
                     VStack(alignment: .leading, spacing: 3) {
-                        Text("Health").font(.caption).foregroundStyle(.secondary)
+                        Text("Measured by Derby").font(.caption).foregroundStyle(.secondary)
                         Text(health.summaryLine).font(.caption)
                         if let failure = health.lastFailureMessage, health.lastFailureAt != nil {
                             Text(failure).font(.caption2).foregroundStyle(.red).lineLimit(2)
@@ -286,6 +362,34 @@ struct ModelRow: View {
         }
         .padding(.horizontal, 12)
         .padding(.bottom, 12)
+    }
+
+    private func factView(_ label: String, _ value: String?) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(label.uppercased())
+                .font(.system(size: 9, weight: .semibold)).tracking(0.4)
+                .foregroundStyle(.secondary)
+            Text(value ?? "not reported")
+                .font(.callout.weight(.medium))
+                .foregroundStyle(value == nil ? .secondary : .primary)
+        }
+    }
+
+    private var sourceLabel: String {
+        switch caps.source {
+        case .discovered: return "FROM PROVIDER"
+        case .builtin: return "KNOWN MODEL"
+        case .userOverride: return "SET BY YOU"
+        case .unknown: return "NOT REPORTED"
+        }
+    }
+    private var sourceTint: Color {
+        switch caps.source {
+        case .discovered: return .green
+        case .builtin: return .accentColor
+        case .userOverride: return .orange
+        case .unknown: return .secondary
+        }
     }
 }
 

@@ -35,7 +35,14 @@ BUNDLE_ID="com.derby.gateway"
 VERSION="1.0"
 BUILD_NUMBER="$(date +%Y%m%d%H%M)"
 OUT_DIR="$ROOT/build"
-APP="$OUT_DIR/$APP_NAME.app"
+# Assemble and sign in a scratch directory, then copy the finished bundle into
+# place. A repository under an iCloud/file-provider path keeps re-applying
+# extended attributes (com.apple.FinderInfo among them) that make codesign
+# refuse the bundle outright, and they reappear faster than they can be stripped.
+STAGE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/derby-build.XXXXXX")"
+trap 'rm -rf "$STAGE_DIR"' EXIT
+APP="$STAGE_DIR/$APP_NAME.app"
+FINAL_APP="$OUT_DIR/$APP_NAME.app"
 CONTENTS="$APP/Contents"
 MACOS_DIR="$CONTENTS/MacOS"
 RESOURCES="$CONTENTS/Resources"
@@ -49,18 +56,22 @@ if [ ! -x "$BIN_PATH/DerbyApp" ]; then
   exit 1
 fi
 
-echo "==> Assembling $APP"
+echo "==> Assembling $FINAL_APP"
 rm -rf "$APP"
 mkdir -p "$MACOS_DIR" "$RESOURCES"
 
-cp "$BIN_PATH/DerbyApp" "$MACOS_DIR/$APP_NAME"
+# `ditto --norsrc --noextattr` rather than `cp`: recent macOS tags build products
+# with extended attributes (com.apple.provenance among them) that codesign
+# rejects as "resource fork, Finder information, or similar detritus", and which
+# `xattr -c` cannot always remove.
+ditto --norsrc --noextattr "$BIN_PATH/DerbyApp" "$MACOS_DIR/$APP_NAME"
 chmod +x "$MACOS_DIR/$APP_NAME"
 
 # Any resource bundles SwiftPM produced (none today, but keep the app correct
 # if a target later adds resources).
 for bundle in "$BIN_PATH"/*.bundle; do
   [ -e "$bundle" ] || continue
-  cp -R "$bundle" "$RESOURCES/"
+  ditto --norsrc --noextattr "$bundle" "$RESOURCES/$(basename "$bundle")"
 done
 
 echo "==> Rendering app icon"
@@ -109,6 +120,8 @@ echo "==> Signing (ad-hoc)"
 # Finder/quarantine metadata makes codesign refuse the bundle.
 xattr -cr "$APP" 2>/dev/null || true
 find "$APP" -name '.DS_Store' -delete 2>/dev/null || true
+# Any signature left from a previous build must go before re-signing.
+codesign --remove-signature "$APP" 2>/dev/null || true
 # An ad-hoc signature is enough for local use and for Keychain access. Replace
 # "-" with a Developer ID identity to produce a distributable build.
 SIGN_IDENTITY="${DERBY_SIGN_IDENTITY:--}"
@@ -117,6 +130,12 @@ codesign --force --sign "$SIGN_IDENTITY" --timestamp=none \
   || codesign --force --sign "$SIGN_IDENTITY" "$APP"
 
 codesign --verify --deep --strict "$APP" && echo "    signature OK"
+
+echo "==> Installing to $FINAL_APP"
+mkdir -p "$OUT_DIR"
+rm -rf "$FINAL_APP"
+ditto --norsrc --noextattr "$APP" "$FINAL_APP"
+APP="$FINAL_APP"
 
 if [ "$INSTALL" = "1" ]; then
   echo "==> Installing to /Applications"

@@ -69,14 +69,16 @@ public actor DerbyEngine {
     }
 
     public func bootstrap() async {
-        // Reading the Keychain can raise a system authorization dialog, and that
-        // call blocks until the user answers it. Doing it here — rather than in
-        // `init` — keeps it off the launch path, so the window is already on
+        let config = await state.currentConfig()
+        // Clients need nothing but the port by default, so the Keychain is not
+        // touched at all unless the local key is switched on. When it is,
+        // reading the Keychain can raise a system authorization dialog that
+        // blocks until the user answers it — doing it here rather than in
+        // `init` keeps it off the launch path, so the window is already on
         // screen when the prompt appears.
-        await ensureLocalAPIKey()
+        if config.gateway.requireAPIKey { await ensureLocalAPIKey() }
         do { try await telemetry.open() }
         catch { startupWarnings.append("Request history is unavailable: \(error.localizedDescription)") }
-        let config = await state.currentConfig()
         await telemetry.update(settings: config.logging)
         await healthRegistry.update(settings: config.health)
         await healthRegistry.update(accountLimits: accountLimits(config))
@@ -84,8 +86,10 @@ public actor DerbyEngine {
                             credentials: credentials, health: healthRegistry, telemetry: telemetry)
         await telemetry.pruneNow()
         // Write the seeded configuration out immediately, so a first-run install
-        // has a config file on disk even if the user never changes anything.
-        if isFirstRun {
+        // has a config file on disk even if the user never changes anything. A
+        // migrated document is written back for the same reason: otherwise it is
+        // upgraded again — and its notes shown again — on every launch.
+        if isFirstRun || configStore.didUpgradeSchema {
             do { try configStore.save(config) }
             catch { startupWarnings.append("Could not write the initial configuration: \(error.localizedDescription)") }
         }
@@ -172,6 +176,9 @@ public actor DerbyEngine {
         return await state.snapshot(health: h)
     }
 
+    /// The local key, generating and storing one on first use. Only call this
+    /// when the key is actually wanted — it can raise a Keychain dialog, and the
+    /// default gateway never needs a key at all.
     public func localAPIKey() async -> String {
         if let cachedLocalKey { return cachedLocalKey }
         await ensureLocalAPIKey()
@@ -192,6 +199,9 @@ public actor DerbyEngine {
         guard !status.isRunning else { return }
         status = .starting
         let config = await state.currentConfig()
+        // The toggle can be flipped on long after bootstrap, which is the only
+        // moment the key has to exist.
+        if config.gateway.requireAPIKey && cachedLocalKey == nil { await ensureLocalAPIKey() }
         if executor == nil {
             executor = Executor(registry: adapters, transport: transport, secrets: secrets,
                                 credentials: credentials, health: healthRegistry, telemetry: telemetry)
@@ -260,9 +270,23 @@ public actor DerbyEngine {
 
     // MARK: - Provider operations
 
-    private func context(for account: ProviderAccount, timeout: Double = 30) -> ProviderContext {
-        ProviderContext(account: account, transport: transport, secrets: secrets,
-                        credentials: credentials, attemptTimeout: timeout)
+    private func context(for account: ProviderAccount, timeout: Double = 30,
+                         modelID: String? = nil) -> ProviderContext {
+        // Resolve the model's metadata when one is named, so a probe shapes its
+        // request the same way the executor would — including omitting
+        // parameters the model rejects.
+        let capabilities = modelID.map { id -> ModelCapabilities in
+            let stored = account.model(modelID: id)
+            let catalog = ModelCatalog.metadata(for: id, kind: account.kind).capabilities
+            guard let stored else { return catalog }
+            let base = stored.capabilities.source == .discovered || stored.capabilities.source == .userOverride
+                ? stored.capabilities.completed(by: catalog)
+                : catalog
+            return base.overridden(by: stored.capabilityOverrides)
+        }
+        return ProviderContext(account: account, transport: transport, secrets: secrets,
+                               credentials: credentials, attemptTimeout: timeout,
+                               modelCapabilities: capabilities)
     }
 
     public func testConnection(_ account: ProviderAccount) async -> ConnectionTestResult {
@@ -285,10 +309,13 @@ public actor DerbyEngine {
         var request = CanonicalRequest(requestedModel: modelID)
         request.messages = [.user("Reply with the single word: ok")]
         request.maxOutputTokens = 16
+        // Deliberately set: the adapter drops it for a model that rejects
+        // sampling parameters, so the probe also exercises that shaping.
         request.temperature = 0
+        let ctx = context(for: account, timeout: 60, modelID: modelID)
         let t0 = Clock.monotonic
         do {
-            let response = try await adapter.execute(request, model: modelID, ctx: context(for: account, timeout: 60))
+            let response = try await adapter.execute(request, model: modelID, ctx: ctx)
             let ms = Int((Clock.monotonic - t0) * 1000)
             return ConnectionTestResult(
                 ok: true, headline: "Model responded",
@@ -424,6 +451,26 @@ public actor DerbyEngine {
     public func resetHealth() async {
         await healthRegistry.reset()
     }
+    /// Re-downloads the model metadata catalog and rebuilds the snapshot so the
+    /// new numbers take effect immediately.
+    public func refreshModelCatalog() async -> Result<Int, DerbyError> {
+        let result = await RemoteModelCatalog.shared.refresh()
+        if case .success = result { await rebuildSnapshot() }
+        return result
+    }
+
+    /// Re-derives the routing snapshot from the current configuration. Model
+    /// metadata is resolved during that build, so this is how improved catalog
+    /// data reaches the request path without any config change.
+    private func rebuildSnapshot() async {
+        let current = await state.currentConfig()
+        await state.setConfig(current)
+    }
+
+    public func modelCatalogStatus() -> (modelCount: Int, fetchedAt: Date?) {
+        RemoteModelCatalog.shared.status
+    }
+
     public func exportDiagnostics() async -> String {
         let config = await state.currentConfig()
         var out = "Derby diagnostics\n"

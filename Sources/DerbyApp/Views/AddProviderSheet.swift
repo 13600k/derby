@@ -146,15 +146,21 @@ struct AddProviderSheet: View {
                             .font(.system(size: 12, design: .monospaced))
                     }
                 }
-                if kind.cliCredentialSource == nil && kind != .bedrock && !kind.isLocal {
-                    LabeledContent("API key") {
-                        SecureField("Required for this provider", text: $apiKey)
-                            .textFieldStyle(.roundedBorder)
-                    }
-                }
-                if kind.isLocal || kind == .openAICompatible {
-                    LabeledContent("API key") {
-                        SecureField("Optional", text: $apiKey).textFieldStyle(.roundedBorder)
+                if kind.apiKeyRequirement.isUsed {
+                    LabeledContent(kind.apiKeyRequirement == .required ? "API key" : "API key (optional)") {
+                        VStack(alignment: .leading, spacing: 4) {
+                            SecureField(kind.apiKeyRequirement.prompt, text: $apiKey)
+                                .textFieldStyle(.roundedBorder)
+                            if kind.apiKeyRequirement == .optional {
+                                Text("Many local and self-hosted endpoints accept requests without one. Leave this empty and Derby will not send an Authorization header at all.")
+                                    .font(.caption2).foregroundStyle(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            } else if apiKey.isEmpty {
+                                Text("\(kind.displayName) will reject requests without a key. You can add it later in Providers.")
+                                    .font(.caption2).foregroundStyle(.orange)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                        }
                     }
                 }
                 if let source = kind.cliCredentialSource {

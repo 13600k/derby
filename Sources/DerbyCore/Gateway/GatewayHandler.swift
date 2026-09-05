@@ -101,6 +101,9 @@ public struct GatewayHandler: Sendable {
     }
 
     private func authorize(_ request: HTTPServerRequest) -> DerbyError? {
+        // Off by default. Clients that cannot be configured without an API key
+        // (most OpenAI SDKs demand a non-empty string) send whatever they like
+        // and it is ignored.
         guard gatewaySettings.requireAPIKey else { return nil }
         // Authentication is required but no key could be loaded (for example the
         // Keychain was unavailable). Refuse everything rather than silently
@@ -144,7 +147,32 @@ public struct GatewayHandler: Sendable {
     // MARK: - Endpoints
 
     private func modelsResponse(headers: [String: String]) async -> HTTPServerResponse {
-        .json(200, OpenAIResponseWriter.modelsList(await snapshot()), headers: headers)
+        .json(200, OpenAIResponseWriter.modelsList(await snapshot(), router: router), headers: headers)
+    }
+
+    /// Response headers describing the physical model that ran, for clients
+    /// that read headers but not response bodies (proxies, curl, shell scripts).
+    private func runtimeHeaders(_ info: RuntimeModelInfo, logicalModel: String) -> [String: String] {
+        var h: [String: String] = [
+            "x-derby-logical-model": headerSafe(logicalModel),
+            "x-derby-provider": headerSafe(info.providerName),
+            "x-derby-provider-kind": headerSafe(info.providerKind),
+            "x-derby-model": headerSafe(info.modelID),
+        ]
+        if let c = info.contextWindow { h["x-derby-context-window"] = String(c) }
+        if let m = info.maxOutputTokens { h["x-derby-max-output-tokens"] = String(m) }
+        let caps = info.capabilities.names
+        if !caps.isEmpty { h["x-derby-capabilities"] = caps.joined(separator: ",") }
+        return h
+    }
+
+    /// Provider and model names come from the user's own config, but they still
+    /// must not be able to inject a header break or a non-ASCII byte.
+    private func headerSafe(_ value: String) -> String {
+        let cleaned = value.unicodeScalars.map { s -> Character in
+            (s.value >= 32 && s.value < 127) ? Character(s) : " "
+        }
+        return String(cleaned).trimmingCharacters(in: .whitespaces)
     }
 
     private func healthResponse(headers: [String: String]) async -> HTTPServerResponse {
@@ -177,16 +205,8 @@ public struct GatewayHandler: Sendable {
             models.append(.object([
                 "name": .string(lm.name),
                 "strategy": .string(lm.definition.policy.strategy.rawValue),
-                "targets": .array(lm.targets.map { t in
-                    let h = snap.health(for: t.key)
-                    return .object([
-                        "provider": .string(t.providerName),
-                        "model": .string(t.modelID),
-                        "enabled": .bool(t.unavailableReason == nil),
-                        "health": .string(h.state.rawValue),
-                        "circuit": .string(h.circuit.rawValue),
-                        "p50_ms": h.p50Seconds.map { .number(Double($0.msRounded)) } ?? .null,
-                    ])
+                "targets": .array(lm.targets.map {
+                    OpenAIResponseWriter.targetJSON($0, snapshot: snap)
                 }),
             ]))
         }
@@ -252,7 +272,9 @@ public struct GatewayHandler: Sendable {
           GET  /health
           GET  /metrics
 
-        Authentication: \(gatewaySettings.requireAPIKey ? "send the Derby local key as 'Authorization: Bearer <key>' (Derby → Settings)" : "disabled")
+        Authentication: \(gatewaySettings.requireAPIKey
+            ? "send the Derby local key as 'Authorization: Bearer <key>' (Derby → Settings)"
+            : "none — the base URL is all a client needs. Any API key a client insists on sending is ignored.")
 
         Ask for a logical model name (for example "coding") as the `model` field.
         """
@@ -330,8 +352,13 @@ public struct GatewayHandler: Sendable {
                 : OpenAIResponseWriter.chatCompletion(outcome.response, record: outcome.record)
             var h = headers
             h["x-derby-request-id"] = outcome.record.id
-            h["x-derby-provider"] = outcome.target.providerName
-            h["x-derby-model"] = outcome.target.modelID
+            for (k, v) in runtimeHeaders(RuntimeModelInfo(target: outcome.target),
+                                         logicalModel: decision.logicalModelName) { h[k] = v }
+            // A header too, so a client that never parses the body still learns
+            // that its conversation was shortened.
+            if let c = outcome.record.compaction {
+                h["x-derby-compacted"] = "\(c.originalTokens);\(c.compactedTokens);\(c.strategy.rawValue)"
+            }
             return .json(200, payload, headers: h)
         } catch {
             let e = error as? DerbyError ?? DerbyError(kind: .unknown, message: error.localizedDescription)
@@ -355,6 +382,17 @@ public struct GatewayHandler: Sendable {
                                    dialect: APIDialect) -> HTTPServerResponse {
         var h = headers
         h["x-derby-request-id"] = meta.requestID
+        // Headers are flushed before any target has actually run, so these
+        // describe the target Derby *intends* to use. The authoritative answer
+        // rides on the stream's first chunk, which is re-sent if a failover
+        // changes it — hence the distinct `planned` names.
+        if let planned = decision.plan.attempts.first?.target {
+            for (k, v) in runtimeHeaders(RuntimeModelInfo(target: planned),
+                                         logicalModel: decision.logicalModelName) {
+                h[k.replacingOccurrences(of: "x-derby-", with: "x-derby-planned-")] = v
+            }
+            h["x-derby-logical-model"] = headerSafe(decision.logicalModelName)
+        }
         let executor = self.executor
         let telemetry = self.telemetry
 
@@ -363,6 +401,7 @@ public struct GatewayHandler: Sendable {
                                                                 model: decision.plan.attempts.first?.target.modelID
                                                                     ?? decision.logicalModelName)
             var lastRecord: RequestRecord?
+            var announcedRoute = false
             var pendingUsage: CanonicalUsage?
             var sentAnything = false
             var responsesTextIndex = 0
@@ -375,20 +414,39 @@ public struct GatewayHandler: Sendable {
             do {
                 for try await event in executor.stream(canonical, decision: decision, meta: meta) {
                     switch event {
-                    case .attemptStarted(let target, _):
+                    case .attemptStarted(let target, let attemptIndex):
                         // The model name is only known once a target is chosen.
                         emitter.model = target.modelID
+                        // Hand the client the runtime metadata of the model that
+                        // is about to produce, before the first token — waiting
+                        // for the tail chunk is too late to act on it.
+                        let route = OpenAIResponseWriter.routeMetadata(
+                            requestID: meta.requestID,
+                            logicalModel: decision.logicalModelName,
+                            strategy: decision.strategy.rawValue,
+                            target: target,
+                            attemptIndex: attemptIndex,
+                            routingReason: decision.explanation)
                         if dialect == .responses {
-                            try await writer.writeSSE(event: "response.created", data: JSONValue.object([
-                                "type": .string("response.created"),
+                            // One `response.created`; a transparent failover is a
+                            // progress update on the same response, not a new one.
+                            let type = announcedRoute ? "response.in_progress" : "response.created"
+                            try await writer.writeSSE(event: type, data: JSONValue.object([
+                                "type": .string(type),
                                 "response": .object(["id": .string("resp_\(meta.requestID)"),
                                                      "status": .string("in_progress"),
-                                                     "model": .string(target.modelID)]),
+                                                     "model": .string(target.modelID),
+                                                     "x_derby": route]),
                             ]).compactJSONString)
                             sentAnything = true
-                        } else if let role = emitter.roleChunkIfNeeded() {
+                        } else if let role = emitter.roleChunkIfNeeded(extra: ["x_derby": route]) {
                             try await send(role)
+                        } else {
+                            // Failover before the first token: correct the model
+                            // the client was told about a moment ago.
+                            try await send(emitter.routeChunk(route))
                         }
+                        announcedRoute = true
 
                     case .canonical(let c):
                         switch c {
@@ -462,6 +520,10 @@ public struct GatewayHandler: Sendable {
                         } else {
                             if let u = pendingUsage ?? (record.usage.isEmpty ? nil : record.usage) {
                                 try await send(emitter.usageChunk(u, record: record))
+                            } else {
+                                // No usage to report, but the client should still
+                                // end up knowing what answered it.
+                                try await send(emitter.metadataChunk(record: record))
                             }
                             try await writer.writeSSEDone()
                         }
@@ -518,7 +580,8 @@ public struct GatewayHandler: Sendable {
             }
             var h = headers
             h["x-derby-request-id"] = requestID
-            h["x-derby-provider"] = outcome.target.providerName
+            for (k, v) in runtimeHeaders(RuntimeModelInfo(target: outcome.target),
+                                         logicalModel: decision.logicalModelName) { h[k] = v }
             return .json(200, .object([
                 "object": .string("list"),
                 "data": .array(data),

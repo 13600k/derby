@@ -137,7 +137,9 @@ struct OnboardingView: View {
                     model.copyToPasteboard($0, label: "API key")
                 }
             }
-            Text("The gateway binds to 127.0.0.1 only, so nothing outside this Mac can reach it.")
+            Text(model.config.gateway.requireAPIKey
+                 ? "The gateway binds to 127.0.0.1 only, so nothing outside this Mac can reach it."
+                 : "The gateway binds to 127.0.0.1 only, so nothing outside this Mac can reach it — and clients need no API key, just this URL.")
                 .font(.caption).foregroundStyle(.secondary)
         }
     }
@@ -262,6 +264,9 @@ struct OnboardingView: View {
                         CopyableField(label: "API key", value: model.localKey, isSecret: true) {
                             model.copyToPasteboard($0, label: "API key")
                         }
+                    } else {
+                        Text("API key: not required. Clients that demand one can send any value.")
+                            .font(.caption).foregroundStyle(.secondary)
                     }
                     CopyableField(label: "Model", value: model.config.logicalModels.first?.name ?? "coding") {
                         model.copyToPasteboard($0, label: "Model")

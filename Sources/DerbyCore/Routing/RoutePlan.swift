@@ -25,13 +25,20 @@ public struct RoutePlan: Sendable {
     public var hedging: HedgeConfig
     public var defaults: RequestDefaults
     public var budget: BudgetRules
+    /// What to do when a conversation does not fit the chosen target.
+    public var compaction: CompactionPolicy
+    /// The model that writes the summary, already resolved. Nil means the target
+    /// answering the request does it itself.
+    public var compactor: ResolvedTarget?
 
     public var isEmpty: Bool { attempts.isEmpty }
 
     public init(logicalModelName: String, attempts: [PlannedAttempt],
                 overallDeadlineSeconds: Double, firstTokenTimeoutSeconds: Double,
                 retry: RetryConfig, failover: FailoverConfig, hedging: HedgeConfig,
-                defaults: RequestDefaults, budget: BudgetRules) {
+                defaults: RequestDefaults, budget: BudgetRules,
+                compaction: CompactionPolicy = .disabled,
+                compactor: ResolvedTarget? = nil) {
         self.logicalModelName = logicalModelName
         self.attempts = attempts
         self.overallDeadlineSeconds = overallDeadlineSeconds
@@ -41,6 +48,8 @@ public struct RoutePlan: Sendable {
         self.hedging = hedging
         self.defaults = defaults
         self.budget = budget
+        self.compaction = compaction
+        self.compactor = compactor
     }
 }
 
@@ -49,6 +58,11 @@ public struct RoutePlan: Sendable {
 public struct ExclusionRecord: Sendable, Hashable, Codable {
     public enum Stage: String, Sendable, Codable {
         case disabled, capability, health, quota, budget, cap
+        /// Separate from `capability` because the remedy is different: a model
+        /// that cannot see images will never serve this request, while one whose
+        /// window is too small becomes usable the moment the conversation is
+        /// shortened or compaction is enabled.
+        case contextWindow = "context_window"
         public var displayName: String {
             switch self {
             case .disabled: return "Disabled"
@@ -57,6 +71,7 @@ public struct ExclusionRecord: Sendable, Hashable, Codable {
             case .quota: return "Quota"
             case .budget: return "Budget"
             case .cap: return "Candidate cap"
+            case .contextWindow: return "Context window"
             }
         }
     }

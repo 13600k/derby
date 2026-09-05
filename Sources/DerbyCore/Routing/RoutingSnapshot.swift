@@ -85,7 +85,22 @@ public struct RoutingSnapshot: Sendable {
                 else if !model.enabled { unavailable = "model turned off on \(account.name)" }
 
                 let catalog = ModelCatalog.metadata(for: model.modelID, kind: account.kind)
-                var caps = model.capabilities.source == .unknown ? catalog.capabilities : model.capabilities
+                // Metadata is re-resolved on every snapshot, not frozen at the
+                // moment a model was added, so an improved catalog corrects a
+                // stored guess without the user re-running discovery.
+                //
+                //  * `.discovered` — the provider itself stated this; keep it and
+                //    fill the gaps it left (discovery reports features but seldom
+                //    a context window).
+                //  * `.builtin` / `.unknown` — Derby guessed from a table. Re-derive:
+                //    the table may since have learned the real numbers.
+                var caps: ModelCapabilities
+                switch model.capabilities.source {
+                case .discovered, .userOverride:
+                    caps = model.capabilities.completed(by: catalog.capabilities)
+                case .builtin, .unknown:
+                    caps = catalog.capabilities
+                }
                 caps = caps.overridden(by: model.capabilityOverrides)
 
                 let overrideKey = "\(account.id.uuidString)/\(model.modelID)"

@@ -37,6 +37,11 @@ public struct RoutingRequest: Sendable {
 /// how it got there. Pure and synchronous — no I/O, no actor hops — which is
 /// what makes the simulator and the routing tests possible.
 public struct Router: Sendable {
+    /// Room kept free for the answer when a client specifies no `max_tokens`.
+    /// Small enough not to exclude modest local models, large enough that a
+    /// chosen target can actually reply.
+    public static let defaultOutputReserveTokens = 1024
+
     public var scorer: TargetScorer
 
     public init(scorer: TargetScorer = TargetScorer()) {
@@ -77,16 +82,72 @@ public struct Router: Sendable {
                              providerStatus: 503)
         }
 
-        // 2. Capability filter — request-derived plus logical-model-mandated.
+        // 2. Capability filter, from what the request itself needs.
+        //
+        // There is deliberately no user-set "required capabilities" here. Demanding
+        // a capability no target has could only ever empty the group — an error the
+        // user would be creating for themselves. What a group offers is decided by
+        // its targets, narrowed by the contract below.
         var requirements = request.requirements
-        requirements.required.formUnion(lm.requiredCapabilities)
+
+        // The group's declared contract is enforced, not just advertised. If it
+        // has been narrowed to text, a vision request is refused here rather
+        // than being quietly routed to a target that happens to support it —
+        // otherwise `/v1/models` would be telling clients something untrue.
+        let constraints = lm.constraints ?? LogicalModelConstraints()
+        if let allowed = constraints.allowedCapabilities {
+            let withheld = requirements.required.subtracting(allowed)
+            if !withheld.isEmpty {
+                throw DerbyError(
+                    kind: .capabilityMismatch,
+                    message: "'\(lm.name)' is configured to offer only \(allowed.names.joined(separator: ", ")); this request needs \(withheld.label). Enable it for this logical model, or use one that offers it.",
+                    providerStatus: 400)
+            }
+        }
+        if let cap = constraints.maxContextTokens, request.promptTokens > cap {
+            throw DerbyError(
+                kind: .contextOverflow,
+                message: "'\(lm.name)' is capped at \(cap.formattedTokens) of prompt; this request is about \(request.promptTokens.formattedTokens). Raise the cap for this logical model, or send less context.",
+                providerStatus: 400)
+        }
+
+        // A prompt that merely *fits* is not enough: the model still needs room
+        // to answer. When the client sends no `max_tokens` the request itself
+        // reserves nothing, which would let a 30k conversation land on a 32k
+        // model with no space for a reply. Reserve the logical model's default
+        // answer size, or a modest floor.
+        if request.maxOutputTokens == nil {
+            let reserve = constraints.maxOutputTokens
+                ?? lm.defaults.maxOutputTokens
+                ?? Router.defaultOutputReserveTokens
+            requirements.minContextTokens = (requirements.minContextTokens ?? 0) + reserve
+        }
+        //
+        // Capability *flags* always bind: a model without vision cannot be given
+        // an image. The context limit is different — when compaction is enabled
+        // the conversation can be shortened to fit, so a target that is merely
+        // too small stays eligible and is marked instead of dropped.
+        let compaction = lm.compaction ?? .disabled
+        var needsCompaction: Set<UUID> = []
+
+        var flagsOnly = requirements
+        flagsOnly.minContextTokens = nil
+        flagsOnly.minOutputTokens = nil
+
         eligible = eligible.filter { t in
-            if let reason = requirements.unmetReason(for: t.capabilities) {
+            if let reason = flagsOnly.unmetReason(for: t.capabilities) {
                 exclusions.append(ExclusionRecord(targetLabel: t.label, providerName: t.providerName,
                                                   modelID: t.modelID, stage: .capability, reason: reason))
                 return false
             }
-            return true
+            guard let reason = requirements.unmetReason(for: t.capabilities) else { return true }
+            if compaction.enabled {
+                needsCompaction.insert(t.id)
+                return true
+            }
+            exclusions.append(ExclusionRecord(targetLabel: t.label, providerName: t.providerName,
+                                              modelID: t.modelID, stage: .contextWindow, reason: reason))
+            return false
         }
 
         // 3. Health filter.
@@ -156,8 +217,25 @@ public struct Router: Sendable {
 
         guard !eligible.isEmpty else {
             let reason = exclusions.first?.reason ?? "no targets configured"
-            throw DerbyError(kind: exclusions.contains(where: { $0.stage == .capability }) ? .capabilityMismatch : .modelUnavailable,
-                             message: "No eligible target for '\(lm.name)'. \(exclusions.count) candidate\(exclusions.count == 1 ? " was" : "s were") filtered out; first reason: \(reason).",
+            // Distinguish "too long" from "cannot do this". A client that hears
+            // CONTEXT_OVERFLOW knows to shorten the conversation; hearing
+            // CAPABILITY_MISMATCH it would go looking for a different model.
+            let onlyContext = !exclusions.isEmpty
+                && exclusions.allSatisfy { $0.stage == .contextWindow }
+            let kind: FailureKind
+            if onlyContext {
+                kind = .contextOverflow
+            } else if exclusions.contains(where: { $0.stage == .capability }) {
+                kind = .capabilityMismatch
+            } else {
+                kind = .modelUnavailable
+            }
+            var message = "No eligible target for '\(lm.name)'. \(exclusions.count) candidate\(exclusions.count == 1 ? " was" : "s were") filtered out; first reason: \(reason)."
+            if onlyContext && !compaction.enabled {
+                message += " Enable compaction on this model to let a shorter version of the conversation run on a smaller target."
+            }
+            throw DerbyError(kind: kind,
+                             message: message,
                              providerStatus: 503,
                              detail: exclusions.map { "\($0.targetLabel): \($0.reason)" }.joined(separator: "; "))
         }
@@ -199,6 +277,15 @@ public struct Router: Sendable {
         var hedging = lm.hedging
         if lm.policy.strategy == .failoverChain { hedging.enabled = false }
 
+        // Resolve the compactor here, where the snapshot is available, so the
+        // executor only has to run what it is given.
+        var compactor: ResolvedTarget?
+        if compaction.enabled, compaction.strategy == .summarize, let choice = compaction.compactor {
+            compactor = snapshot.logicalModels.values
+                .flatMap(\.targets)
+                .first { $0.account.id == choice.providerID && $0.model.id == choice.modelUUID }
+        }
+
         let plan = RoutePlan(logicalModelName: lm.name,
                              attempts: attempts,
                              overallDeadlineSeconds: lm.timeouts.overallSeconds,
@@ -207,16 +294,23 @@ public struct Router: Sendable {
                              failover: lm.failover,
                              hedging: hedging,
                              defaults: lm.defaults,
-                             budget: lm.budget)
+                             budget: lm.budget,
+                             compaction: compaction,
+                             compactor: compactor)
 
         let evaluations = ranked.enumerated().map { i, r in
-            CandidateEvaluation(targetLabel: r.target.label,
-                                providerName: r.target.providerName,
-                                modelID: r.target.modelID,
-                                rank: i,
-                                score: r.score,
-                                components: r.components,
-                                note: r.note)
+            var note = r.note
+            if needsCompaction.contains(r.target.id) {
+                let shortened = "conversation will be shortened to fit \((r.target.capabilities.effectiveInputLimit ?? 0).formattedTokens)"
+                note = note.map { "\($0) · \(shortened)" } ?? shortened
+            }
+            return CandidateEvaluation(targetLabel: r.target.label,
+                                       providerName: r.target.providerName,
+                                       modelID: r.target.modelID,
+                                       rank: i,
+                                       score: r.score,
+                                       components: r.components,
+                                       note: note)
         }
 
         return RoutingDecision(logicalModelName: lm.name,

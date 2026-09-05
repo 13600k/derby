@@ -9,7 +9,11 @@ enum ProviderFactory {
         account.baseURLOverride = kind.defaultBaseURL
         if let source = kind.cliCredentialSource {
             account.auth = .cli(source: source, allowRefresh: false)
-        } else if kind.isLocal {
+        } else if kind.apiKeyRequirement == .optional {
+            // Start with no credential at all, so an endpoint that needs none
+            // works immediately. Entering a key upgrades this to `.apiKey`;
+            // leaving it empty means Derby sends no Authorization header, rather
+            // than sending an empty one or failing with "no API key saved".
             account.auth = .none
         } else if kind == .bedrock {
             account.auth = .awsSigV4(accessKeyRef: .new("aws.access"),
@@ -19,6 +23,12 @@ enum ProviderFactory {
             account.auth = .apiKey(.new("provider.key"))
         }
         if kind.isLocal { account.requestTimeoutSeconds = 600 }
+        if kind == .claudeCodeCLI {
+            // Spawning a process and running an agent turn is slower than one
+            // HTTP round trip.
+            account.requestTimeoutSeconds = 600
+            account.rateLimits.maxConcurrentRequests = 2
+        }
         if kind.isSubscription { account.preferenceScore = 70 }
         // Seed the models a subscription backend is known to serve, since it
         // cannot be asked.
@@ -30,12 +40,17 @@ enum ProviderFactory {
 
     static func makeModel(id: String, kind: ProviderKind, discovered: DiscoveredModel? = nil) -> PhysicalModel {
         let catalog = ModelCatalog.metadata(for: id, kind: kind)
+        // Whatever the provider stated wins; anything it left out is completed
+        // from the bundled catalog rather than left unknown.
+        let capabilities = (discovered?.capabilities ?? catalog.capabilities)
+            .fillingGaps(from: catalog.capabilities)
         var model = PhysicalModel(modelID: id,
                                   displayName: discovered?.displayName,
-                                  capabilities: discovered?.capabilities ?? catalog.capabilities,
+                                  capabilities: capabilities,
                                   qualityScore: catalog.quality,
-                                  discoveredAt: discovered == nil ? nil : Date())
-        if let p = catalog.pricing { model.pricingOverride = p }
+                                  discoveredAt: discovered == nil ? nil : Date(),
+                                  profile: discovered?.profile)
+        if let pricing = discovered?.pricing ?? catalog.pricing { model.pricingOverride = pricing }
         return model
     }
 

@@ -55,9 +55,12 @@ struct OverviewView: View {
                             model.copyToPasteboard($0, label: "API key")
                         }
                         .frame(maxWidth: 420)
-                    } else {
-                        Label("Gateway authentication is disabled", systemImage: "lock.open")
+                    } else if model.config.gateway.isReachableOffThisMac {
+                        Label("Reachable from your network with no API key", systemImage: "exclamationmark.triangle.fill")
                             .font(.caption).foregroundStyle(.orange)
+                    } else {
+                        Label("No API key needed — the base URL is all a client needs", systemImage: "lock.open")
+                            .font(.caption).foregroundStyle(.secondary)
                     }
                 }
 

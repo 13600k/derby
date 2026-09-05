@@ -100,6 +100,63 @@ func registerPersistenceTests() {
             try expectEqual(loaded.config.gateway.port, GatewaySettings.default.port)
         }
 
+        test("an existing loopback config drops the client key requirement") {
+            var raw: [String: Any] = [
+                "schemaVersion": 1,
+                "gateway": ["port": 8787, "bindAddress": "127.0.0.1", "requireAPIKey": true,
+                            "localKeyRef": ["account": "gw"], "autoStart": true,
+                            "allowRemoteAccess": false, "maxConcurrentRequests": 64,
+                            "allowedOrigins": []],
+            ]
+            let notes = ConfigMigrator.migrate(rawObject: &raw)
+            try expectEqual(raw["schemaVersion"] as? Int, 2)
+            try expectEqual((raw["gateway"] as? [String: Any])?["requireAPIKey"] as? Bool, false)
+            try expect(notes.contains { $0.contains("no longer need") })
+        }
+
+        test("a config reachable off this Mac keeps its key requirement") {
+            var raw: [String: Any] = [
+                "schemaVersion": 1,
+                "gateway": ["port": 8787, "bindAddress": "0.0.0.0", "requireAPIKey": true,
+                            "localKeyRef": ["account": "gw"], "autoStart": true,
+                            "allowRemoteAccess": true, "maxConcurrentRequests": 64,
+                            "allowedOrigins": []],
+            ]
+            let notes = ConfigMigrator.migrate(rawObject: &raw)
+            try expectEqual(raw["schemaVersion"] as? Int, 2)
+            try expectEqual((raw["gateway"] as? [String: Any])?["requireAPIKey"] as? Bool, true,
+                            "a LAN-reachable gateway must not be opened up by a migration")
+            try expect(notes.contains { $0.contains("left on") })
+        }
+
+        test("a fresh install asks clients for nothing but the port") {
+            let loaded = ConfigStore(url: tempURL("missing.json")).load()
+            try expect(!loaded.config.gateway.requireAPIKey)
+            try expect(!loaded.config.gateway.isReachableOffThisMac)
+        }
+
+        test("an upgraded document is written back so it migrates only once") {
+            let url = tempURL("config.json")
+            let json = """
+            {"schemaVersion":1,"providers":[],"logicalModels":[],
+             "gateway":{"port":8787,"bindAddress":"127.0.0.1","requireAPIKey":true,
+             "localKeyRef":{"account":"gw"},"autoStart":true,"allowRemoteAccess":false,
+             "maxConcurrentRequests":64,"allowedOrigins":[]}}
+            """
+            try Data(json.utf8).write(to: url)
+            let first = ConfigStore(url: url)
+            let loaded = first.load()
+            try expect(!loaded.config.gateway.requireAPIKey, "an upgraded config must not ask clients for a key")
+            try expect(first.didUpgradeSchema)
+            try first.save(loaded.config)
+
+            let second = ConfigStore(url: url)
+            let again = second.load()
+            try expect(!second.didUpgradeSchema, "the same document must not be migrated twice")
+            try expect(again.warnings.isEmpty)
+            try expectEqual(again.config.schemaVersion, DerbyConfig.currentSchemaVersion)
+        }
+
         test("a newer schema version is tolerated with a warning") {
             var raw: [String: Any] = ["schemaVersion": 99]
             let notes = ConfigMigrator.migrate(rawObject: &raw)
@@ -304,6 +361,80 @@ func registerCredentialTests() {
         test("origin is reported for display") {
             let c = cred("x", expiresIn: 60, source: .keychain(service: "Claude Code-credentials", account: nil))
             try expectContains(c.origin, "Keychain")
+        }
+    }
+}
+
+func registerForwardCompatibilityTests() {
+    suite("Persistence / forward compatibility") {
+        test("a model saved before newer capability fields still decodes") {
+            // The exact shape written by earlier builds. Adding a non-optional
+            // property to `ModelCapabilities` once made this undecodable, which
+            // silently emptied the entire providers array.
+            let json = """
+            {"flags":["text","vision","tools","streaming"],
+             "contextWindow":200000,"maxOutputTokens":64000,"source":"builtin"}
+            """
+            let caps = try JSONDecoder().decode(ModelCapabilities.self, from: Data(json.utf8))
+            try expectEqual(caps.contextWindow, 200_000)
+            try expect(caps.flags.contains(.vision))
+            try expect(caps.unsupportedParameters.isEmpty, "an absent deny-list means nothing is denied")
+            try expectNil(caps.supportedReasoningEfforts)
+        }
+
+        test("an entire provider written by an earlier build still decodes") {
+            let json = """
+            {"id":"\(UUID().uuidString)","name":"Claude subscription","kind":"anthropic_subscription",
+             "enabled":true,"auth":{"cli":{"source":"claude_code","allowRefresh":false}},
+             "extraHeaders":{},"requestTimeoutSeconds":300,"connectTimeoutSeconds":10,
+             "rateLimits":{"maxConcurrentRequests":2},
+             "models":[{"id":"\(UUID().uuidString)","modelID":"claude-sonnet-5","enabled":true,
+                        "capabilities":{"flags":["text","streaming"],"source":"unknown"},
+                        "capabilityOverrides":{},"qualityScore":90}],
+             "notes":"","createdAt":"2026-09-01T00:00:00Z","allowInsecureTLS":false,
+             "preferenceScore":70}
+            """
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            let account = try decoder.decode(ProviderAccount.self, from: Data(json.utf8))
+            try expectEqual(account.models.count, 1)
+            try expectEqual(account.models[0].modelID, "claude-sonnet-5")
+            try expectNil(account.credentialHomeOverride)
+            try expectNil(account.models[0].profile)
+        }
+
+        test("a section that cannot be read is reported, not silently dropped") {
+            // Tolerance is right; silence is not. Losing five configured providers
+            // with no message is far worse than starting with a visible warning.
+            let json = """
+            {"schemaVersion":1,"providers":"this is not an array","logicalModels":[]}
+            """
+            let config = try JSONDecoder().decode(DerbyConfig.self, from: Data(json.utf8))
+            try expect(config.providers.isEmpty)
+            try expect(config.decodeFailures.contains { $0.contains("providers") },
+                       "the failure must be recorded so the user is told")
+        }
+
+        test("a config that reads cleanly reports no failures") {
+            let data = try ConfigStore.export(DerbyConfig.seeded())
+            let (config, _) = try ConfigStore.importConfig(from: data)
+            try expect(config.decodeFailures.isEmpty)
+        }
+
+        test("loading a damaged section warns and preserves the original file") {
+            let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+                .appendingPathComponent("derby-decode-\(UUID().uuidString)", isDirectory: true)
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: dir) }
+            let url = dir.appendingPathComponent("config.json")
+            try Data(#"{"schemaVersion":1,"providers":42,"logicalModels":[]}"#.utf8).write(to: url)
+
+            let loaded = ConfigStore(url: url).load()
+            try expect(!loaded.isFirstRun)
+            try expect(loaded.warnings.contains { $0.contains("could not be read") },
+                       "the user must be told which part was reset")
+            try expect(FileManager.default.fileExists(atPath: url.path),
+                       "the original must survive so nothing is lost")
         }
     }
 }

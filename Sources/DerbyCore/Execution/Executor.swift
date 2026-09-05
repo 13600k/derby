@@ -139,7 +139,8 @@ public final class Executor: Sendable {
 
             let adapter = registry.adapter(for: target.account.kind)
             let ctx = ProviderContext(account: target.account, transport: transport, secrets: secrets,
-                                      credentials: credentials, attemptTimeout: min(planned.timeout, remaining))
+                                      credentials: credentials, attemptTimeout: min(planned.timeout, remaining),
+                                      modelCapabilities: target.capabilities)
             let attemptStart = Clock.monotonic
             do {
                 let response = try await withDeadline(min(planned.timeout, remaining),
@@ -180,6 +181,61 @@ public final class Executor: Sendable {
         throw lastError
     }
 
+    // MARK: - Context compaction
+
+    /// Adapts `request` to one target's context window.
+    ///
+    /// Returns it untouched whenever it already fits, which is the ordinary
+    /// case — the work only happens on a target too small for the conversation,
+    /// and only when the logical model opted in. Throwing here fails this
+    /// attempt like any other, so the plan simply moves to the next target.
+    private func prepareRequest(_ request: CanonicalRequest, for target: ResolvedTarget,
+                                plan: RoutePlan, deadline: Double,
+                                meta: RequestMeta) async throws -> (CanonicalRequest, CompactionRecord?) {
+        guard plan.compaction.enabled else { return (request, nil) }
+        let reserve = request.maxOutputTokens ?? Router.defaultOutputReserveTokens
+        guard let limit = target.capabilities.effectiveInputLimit, limit > 0,
+              ContextCompactor.needsCompaction(request, inputLimit: limit, outputReserve: reserve) else {
+            return (request, nil)
+        }
+
+        var summarizerName: String?
+        var summarize: ContextCompactor.Summarizer?
+        if plan.compaction.strategy == .summarize, let compactor = plan.compactor {
+            summarizerName = compactor.label
+            // Never let summarizing eat the whole request budget: it is
+            // preparation, not the answer.
+            let budget = min(plan.compaction.timeoutSeconds, max(deadline - Clock.monotonic - 1, 1))
+            summarize = { dropped in
+                try await self.summarize(dropped, using: compactor, timeout: budget)
+            }
+        }
+
+        let outcome = try await ContextCompactor.compact(request, inputLimit: limit, outputReserve: reserve,
+                                                        policy: plan.compaction, targetLabel: target.label,
+                                                        summarizerName: summarizerName, summarize: summarize)
+        await telemetry.log(LogEntry(level: .info, category: "compaction",
+                                     message: outcome.record.summary, requestID: meta.requestID))
+        return (outcome.request, outcome.record)
+    }
+
+    private func summarize(_ dropped: [CanonicalMessage], using compactor: ResolvedTarget,
+                           timeout: Double) async throws -> String {
+        let adapter = registry.adapter(for: compactor.account.kind)
+        let ctx = ProviderContext(account: compactor.account, transport: transport, secrets: secrets,
+                                  credentials: credentials, attemptTimeout: timeout,
+                                  modelCapabilities: compactor.capabilities)
+        // Leave room for the instructions and the summary itself.
+        let transcriptBudget = compactor.capabilities.effectiveInputLimit.map { max($0 - 2_000, 1_000) }
+        let req = ContextCompactor.summarizationRequest(for: dropped, model: compactor.modelID,
+                                                        transcriptTokenBudget: transcriptBudget)
+        let response = try await withDeadline(timeout,
+                                              message: "The compaction model \(compactor.label) did not respond within \(timeout.msString).") {
+            try await adapter.execute(req, model: compactor.modelID, ctx: ctx)
+        }
+        return response.message.joinedText
+    }
+
     // MARK: - Attempt execution
 
     struct AttemptResult: Sendable {
@@ -198,7 +254,7 @@ public final class Executor: Sendable {
     }
 
     private func runAttemptWithRetries(_ planned: PlannedAttempt, index: Int,
-                                       request: CanonicalRequest, plan: RoutePlan,
+                                       request original: CanonicalRequest, plan: RoutePlan,
                                        deadline: Double, meta: RequestMeta) async -> AttemptResult {
         let target = planned.target
         let key = target.key
@@ -224,6 +280,23 @@ public final class Executor: Sendable {
         let attemptStartedAt = Date()
         let attemptT0 = Clock.monotonic
 
+        // Each target has its own window, so this is per attempt rather than
+        // per request: a conversation that overflows the local model may fit
+        // the cloud one the plan falls back to.
+        let request: CanonicalRequest
+        let compaction: CompactionRecord?
+        do {
+            (request, compaction) = try await prepareRequest(original, for: target, plan: plan,
+                                                             deadline: deadline, meta: meta)
+        } catch {
+            let derby = normalize(error)
+            var rec = failureRecord(target: target, index: index, error: derby,
+                                    duration: Clock.monotonic - attemptT0, retries: 0,
+                                    score: planned.score, circuit: circuit, startedAt: attemptStartedAt)
+            rec.compaction = nil
+            return .failure(target, derby, rec)
+        }
+
         while true {
             let remaining = deadline - Clock.monotonic
             if remaining <= 0.05 {
@@ -232,7 +305,8 @@ public final class Executor: Sendable {
             }
             let timeout = min(planned.timeout, remaining)
             let ctx = ProviderContext(account: target.account, transport: transport, secrets: secrets,
-                                      credentials: credentials, attemptTimeout: timeout)
+                                      credentials: credentials, attemptTimeout: timeout,
+                                          modelCapabilities: target.capabilities)
             let callStart = Clock.monotonic
             do {
                 let response = try await withDeadline(timeout,
@@ -252,7 +326,8 @@ public final class Executor: Sendable {
                                         durationSeconds: Clock.monotonic - attemptT0,
                                         httpStatus: 200, retryCount: retries,
                                         usage: response.usage, costUSD: cost,
-                                        circuitState: circuit, routingScore: planned.score)
+                                        circuitState: circuit, routingScore: planned.score,
+                                        compaction: compaction)
                 return .success(target, response, rec)
             } catch {
                 let derby = normalize(error)
@@ -276,10 +351,12 @@ public final class Executor: Sendable {
                 do { try await backoffSleep(wait) } catch { break }
             }
         }
-        return .failure(target, lastError, failureRecord(target: target, index: index, error: lastError,
-                                                         duration: Clock.monotonic - attemptT0,
-                                                         retries: retries, score: planned.score,
-                                                         circuit: circuit, startedAt: attemptStartedAt))
+        var failed = failureRecord(target: target, index: index, error: lastError,
+                                   duration: Clock.monotonic - attemptT0,
+                                   retries: retries, score: planned.score,
+                                   circuit: circuit, startedAt: attemptStartedAt)
+        failed.compaction = compaction
+        return .failure(target, lastError, failed)
     }
 
     /// Runs two attempts with a delay between them; the first success wins and
@@ -407,15 +484,37 @@ public final class Executor: Sendable {
             var ttft: Double?
             var failure: DerbyError?
 
+            // Same per-target shaping as the non-streaming path. It happens
+            // before the first byte is written, so a stream never has to be
+            // rewound because of it.
+            let outbound: CanonicalRequest
+            let compaction: CompactionRecord?
+            do {
+                (outbound, compaction) = try await prepareRequest(applied, for: target, plan: plan,
+                                                                  deadline: deadline, meta: meta)
+            } catch {
+                let derby = normalize(error)
+                await health.release(key, accountID: target.account.id)
+                records.append(failureRecord(target: target, index: attemptIndex, error: derby,
+                                             duration: Clock.monotonic - attemptT0, retries: 0,
+                                             score: planned.score, circuit: circuit,
+                                             startedAt: attemptStartedAt))
+                lastError = derby
+                attemptIndex += 1
+                failoverTotal += 1
+                continue
+            }
+
             do {
                 let timeout = min(planned.timeout, deadline - Clock.monotonic)
                 let ctx = ProviderContext(account: target.account, transport: transport, secrets: secrets,
-                                          credentials: credentials, attemptTimeout: timeout)
+                                          credentials: credentials, attemptTimeout: timeout,
+                                          modelCapabilities: target.capabilities)
                 // Opening the stream (headers + auth) is bounded by the
                 // first-token timeout; the body is bounded by the attempt timeout.
                 let events = try await withDeadline(min(plan.firstTokenTimeoutSeconds, timeout),
                                                     message: "\(target.label) did not start streaming within \(plan.firstTokenTimeoutSeconds.msString)") {
-                    try await adapter.stream(applied, model: target.modelID, ctx: ctx)
+                    try await adapter.stream(outbound, model: target.modelID, ctx: ctx)
                 }
                 continuation.yield(.attemptStarted(target: target, attemptIndex: attemptIndex))
 
@@ -470,9 +569,11 @@ public final class Executor: Sendable {
                                                    totalSeconds: duration, timeToFirstTokenSeconds: ttft,
                                                    httpStatus: f.providerStatus, usage: usage))
                 await health.recordFailureMessage(key, message: f.message)
-                records.append(failureRecord(target: target, index: attemptIndex, error: f, duration: duration,
-                                             retries: 0, score: planned.score, circuit: circuit,
-                                             startedAt: attemptStartedAt, ttft: ttft, usage: usage))
+                var failedRecord = failureRecord(target: target, index: attemptIndex, error: f, duration: duration,
+                                                 retries: 0, score: planned.score, circuit: circuit,
+                                                 startedAt: attemptStartedAt, ttft: ttft, usage: usage)
+                failedRecord.compaction = compaction
+                records.append(failedRecord)
                 lastError = f
                 attemptIndex += 1
 
@@ -504,7 +605,7 @@ public final class Executor: Sendable {
                 // Some OpenAI-compatible servers never report usage on a stream.
                 // Derive a rough count so token and cost views are not blank,
                 // flagged so the UI can show it as approximate.
-                response.usage = .estimated(promptTokens: applied.estimatedPromptTokens,
+                response.usage = .estimated(promptTokens: outbound.estimatedPromptTokens,
                                             completionText: accumulator.text,
                                             reasoningText: accumulator.reasoning)
             }
@@ -518,7 +619,8 @@ public final class Executor: Sendable {
                                          targetLabel: target.label, status: .success, startedAt: attemptStartedAt,
                                          durationSeconds: duration, timeToFirstTokenSeconds: ttft,
                                          httpStatus: 200, usage: response.usage, costUSD: cost,
-                                         circuitState: circuit, routingScore: planned.score))
+                                         circuitState: circuit, routingScore: planned.score,
+                                         compaction: compaction))
             let record = makeRecord(meta: meta, decision: decision, attempts: records, startedAt: startedAt,
                                     totalSeconds: Clock.monotonic - t0, ttft: ttft, finalTarget: target,
                                     response: response, error: nil, retryCount: 0, failoverCount: failoverTotal)
@@ -644,6 +746,7 @@ public final class Executor: Sendable {
             finalProviderName: finalTarget?.providerName,
             finalProviderID: finalTarget?.account.id,
             finalModelID: finalTarget?.modelID,
+            runtimeModel: finalTarget.map(RuntimeModelInfo.init(target:)),
             totalSeconds: totalSeconds,
             timeToFirstTokenSeconds: ttft,
             usage: usage,
@@ -652,12 +755,20 @@ public final class Executor: Sendable {
             evaluations: decision.evaluations,
             exclusions: decision.exclusions,
             routingStrategy: decision.strategy.rawValue,
-            routingExplanation: routingNarrative(decision: decision, attempts: attempts, error: error, midStream: midStream),
+            routingExplanation: routingNarrative(decision: decision, attempts: attempts, error: error,
+                                                 midStream: midStream, finalTarget: finalTarget),
             failureKind: error?.kind,
             errorMessage: error?.message,
             retryCount: retryCount,
             failoverCount: failoverCount,
             httpStatus: error?.clientHTTPStatus ?? 200)
+        // The compaction that mattered is the one applied for the target that
+        // answered; earlier attempts may have shortened differently or not at all.
+        if let label = finalTarget?.label {
+            record.compaction = attempts.last { $0.targetLabel == label }?.compaction
+        } else {
+            record.compaction = attempts.last { $0.compaction != nil }?.compaction
+        }
         if meta.promptLogging.storesContent {
             record.promptExcerpt = meta.promptExcerpt
             if let text = response?.message.joinedText, !text.isEmpty {
@@ -669,7 +780,8 @@ public final class Executor: Sendable {
 
     /// Human-readable "why did it end up here", built from what actually happened.
     private func routingNarrative(decision: RoutingDecision, attempts: [AttemptRecord],
-                                  error: DerbyError?, midStream: Bool) -> String {
+                                  error: DerbyError?, midStream: Bool,
+                                  finalTarget: ResolvedTarget? = nil) -> String {
         var parts = [decision.explanation]
         let failedBefore = attempts.filter { $0.status == .failed || $0.status == .skipped }
         if let success = attempts.first(where: { $0.status == .success }), !failedBefore.isEmpty {
@@ -685,6 +797,10 @@ public final class Executor: Sendable {
             } else {
                 parts.append("All \(attempts.count) attempt(s) failed; last error was \(error.kind.rawValue): \(error.message)")
             }
+        }
+        if let label = finalTarget?.label,
+           let c = attempts.last(where: { $0.targetLabel == label })?.compaction {
+            parts.append(c.summary + ". The answering model did not see the full conversation.")
         }
         return parts.joined(separator: " ")
     }

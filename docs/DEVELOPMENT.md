@@ -128,7 +128,10 @@ The previous document is backed up automatically when the version changes.
 - **Logs** screen, or `~/Library/Application Support/Derby/derby.sqlite3`.
 - **Requests** screen shows every attempt, score and exclusion for a request.
 - **Routing** screen simulates a decision without spending tokens.
-- `GET /v1/derby/status` dumps per-target health, circuit state and latency.
+- `GET /v1/derby/status` dumps every target of every logical model: its runtime metadata
+  (`id`, `provider`, `context_window`, `capabilities`, `pricing`, …) alongside `available`,
+  `health`, `circuit` and `p50_ms`. Same per-target shape as `derby.targets` in
+  `GET /v1/models`.
 - `GET /metrics` is Prometheus text.
 - Settings → *Export Diagnostics* writes a redacted dump.
 

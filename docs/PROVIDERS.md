@@ -29,7 +29,47 @@ finding: **consumer AI subscriptions do not publish a general inference API**, b
 first-party CLIs that ship with them authenticate with OAuth and store a token locally.
 Derby reuses that credential — the same way the CLI does, against the same endpoint.
 
-### Claude subscription — verified working
+### Claude subscription — two paths, and they bill differently
+
+Anthropic distinguishes first-party clients from third-party ones. Presenting the CLI's OAuth
+token to `api.anthropic.com` directly is treated as a **third-party app** and charged against
+*extra usage*, which is what produces:
+
+> Third-party apps now draw from your extra usage, not your plan limits.
+
+Running the `claude` CLI is a first-party client, so the same request draws on the plan you
+already pay for. The CLI reports `"provider": "firstParty"` for these calls, which is how that
+is confirmed rather than assumed.
+
+Derby therefore offers both, named so the difference is unmissable:
+
+| Provider kind | Transport | Billing |
+| --- | --- | --- |
+| **Claude Code (plan limits)** | Spawns the `claude` CLI | Your subscription's plan limits |
+| **Claude subscription (extra usage)** | `POST /v1/messages` with the OAuth token | Extra usage |
+
+The CLI path is what discovery now offers. Its cost:
+
+- **No tool calling and no images.** The CLI runs its own agent loop and accepts no
+  caller-supplied tool schemas, so this provider does not advertise those capabilities and
+  such requests route to another target.
+- **No sampling parameters.** `temperature` and friends are not exposed by the CLI.
+- **Process overhead.** Claude Code's own system prompt, tool schemas and project context cost
+  about 27k tokens per call; `--tools "" --setting-sources "" --strict-mcp-config` with an
+  explicit `--system-prompt` brings that down to roughly 300.
+- **One turn per call.** The CLI answers every input message in sequence, so a conversation is
+  rendered into a single prompt rather than replayed as separate messages.
+
+In exchange it reports **live plan utilization** — the rolling five-hour and seven-day windows —
+which Derby converts into quota pressure, so routing moves away from a nearly-exhausted plan on
+its own.
+
+**One-time macOS prompt.** The first time Derby launches the CLI, macOS raises a Keychain
+authorization dialog for it, and the process waits silently until it is answered. Derby gives
+up after 20 seconds and says exactly that rather than hanging for the request deadline. Choose
+**Always Allow**, or run `claude` once in Terminal.
+
+### Claude subscription (direct API) — verified working
 
 - **Credential.** Claude Code stores its session in the **`Claude Code-credentials`
   Keychain item on macOS**, and often leaves a stale `~/.claude/.credentials.json`
@@ -69,10 +109,10 @@ Derby reuses that credential — the same way the CLI does, against the same end
   `ultra` alongside the classic four. Derby models the full scale and asks each model for the
   strongest level it actually supports; the OpenAI REST API, which only accepts four, gets
   the nearest level it understands rather than a value it would reject.
-- **Verified:** the endpoint and header set are correct — the backend answered with a
-  specific `token_expired` error rather than rejecting the shape.
-- **Unverified:** a successful completion. The local token was already expired, and
-  refreshing it would have rotated the user's `codex` credentials without their consent.
+- **Verified end to end.** Completions now succeed through this backend, on two separate
+  accounts simultaneously. Getting there required dropping `max_output_tokens`, which this
+  endpoint rejects as an unsupported parameter, and surfacing the backend's `{"detail": …}`
+  body — it answers with a bare status otherwise, and "HTTP 400" alone is not actionable.
 
 ### Gemini and Qwen subscriptions — implemented, unverified
 
@@ -168,7 +208,7 @@ to fill in capabilities.
 
 | Server | Default probe | Notes |
 | --- | --- | --- |
-| Ollama | `127.0.0.1:11434/v1` | **Verified live.** Current builds honour `stream_options` and report usage on the final chunk; older ones ignore it, so Derby estimates instead. Reasoning models return `reasoning` alongside `content`. |
+| Ollama | `127.0.0.1:11434/v1` | **Verified live.** Discovery uses the native `/api/tags`, not the OpenAI shim: the shim returns only an id, while the native endpoint reports real context length, the model's own capability list (vision/tools/thinking/embedding), parameter size, quantization and family — in one request. Current builds honour `stream_options` and report usage on the final chunk; older ones ignore it, so Derby estimates instead. Reasoning models return `reasoning` alongside `content`. |
 | LM Studio | `127.0.0.1:1234/v1` | |
 | vLLM | `127.0.0.1:8000/v1` | Full `stream_options` support |
 | SGLang | `127.0.0.1:30000/v1` | |
@@ -183,12 +223,73 @@ Local targets are flat-rate (zero marginal cost), which is what makes `lowest_co
 
 ## Capability metadata
 
+Derby collects the attributes it can **obtain** and **act on** — the ones that change a
+routing decision or that a client needs in order to use a model:
+
+| Attribute | Used for |
+| --- | --- |
+| Context window, max input, max output | Filtering targets a conversation fits, context-headroom scoring |
+| Input modalities (text, image, audio) | Capability filtering — a vision request only reaches vision models |
+| Output modalities (text, image, audio, embedding) | Group compatibility — a model that emits no text cannot serve chat |
+| Tools, parallel tools | Capability filtering for tool-calling requests |
+| JSON mode, JSON schema | Structured-output requests |
+| Reasoning support and effort levels | Reasoning requests, per-model effort clamping |
+| Embedding dimensions | Embedding routing |
+| Price per input/output/cached token | Cost-aware routing and spend reporting |
+| Parameter size, quantization, family | Displayed so a person can judge a local model |
+| Latency, TTFT, success rate, rate-limit headroom | Measured by Derby itself, not declared |
+
+Benchmark scores, training compute, safety certifications and hardware requirements are not
+collected: no provider API reports them, and Derby has no routing decision that would consume
+them. The one subjective dimension is a per-model **quality score**, which the user sets and
+weighted-score routing reads.
+
+### Parameters, as distinct from capabilities
+
+What a model *can do* and what it will *accept being sent* are different things. Reasoning-era
+models are highly capable yet reject `temperature` outright — the request fails with a
+deprecation error rather than the parameter being ignored. In the current index, **1357 of
+7526 models** declare `temperature: false`, including every `gpt-5.x` and most of the Claude 5
+family.
+
+Derby therefore records `unsupportedParameters` per model and omits them when building a
+request. It is a **deny-list**: a model nothing is known about still receives every parameter,
+so this can only ever remove one a provider would have rejected. Sources are the live index's
+`temperature` flag and reasoning levels, and OpenRouter's `supported_parameters` array, which
+enumerates exactly what it accepts and is therefore treated as authoritative.
+
+Reasoning effort is clamped the same way — a request for `ultra` becomes the strongest level
+the model actually publishes, and OpenAI's vocabulary spelling of the weakest level (`none`)
+is mapped rather than sent as `minimal`.
+
+Endpoint quirks are separate from model quirks and stay in the adapter. The Codex backend, for
+instance, rejects `max_output_tokens` even though the public Responses API accepts it.
+
+### Where the numbers come from
+
+Provider `/models` endpoints almost never report a context window — OpenAI and Anthropic
+return little more than an id. A hand-written table cannot cover that gap for long: a model
+released after the table was written falls through to "unknown" and loses not just its
+window but its tool and vision support.
+
+So Derby's bundled table is the **offline fallback**, and the source of truth is
+[models.dev](https://models.dev), a community-maintained index carrying context and output
+limits, modalities, tool/reasoning/structured-output support and list pricing. It is fetched
+on launch, cached to `model-catalog.json`, and re-read from disk thereafter, so Derby works
+offline and never blocks on the network. Settings → *Model metadata* shows how many models are
+known and when it last updated, with a manual refresh.
+
+Model metadata is **re-resolved on every snapshot**, not frozen when a model was added, so an
+improved catalog corrects a stored guess without the user re-running discovery. What the
+provider itself reported is never overwritten, and a user override still beats everything.
+
 Three sources, in increasing precedence:
 
-1. **Bundled catalog** — pattern-matched against the model id, carrying capabilities,
-   context window, max output and list pricing for ~60 model families.
-2. **Discovery** — whatever `/v1/models` (or Gemini's/Bedrock's equivalent) reports.
-3. **User overrides** — per model, in the Providers screen.
+1. **Bundled catalog** — pattern-matched against the model id; the offline fallback.
+2. **Live catalog** (models.dev) — keyed by vendor and model id, with dated snapshots,
+   aggregator namespaces and Ollama tags all resolved to the same entry.
+3. **Discovery** — whatever the provider itself reports; always wins where it says anything.
+4. **User overrides** — only for facts nothing else could supply.
 
 An unknown model degrades to plain streaming chat with **no assumed tool support**. Claiming
 a capability a model lacks causes hard failures; omitting one only costs a routing option the

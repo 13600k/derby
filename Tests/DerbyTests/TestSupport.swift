@@ -91,6 +91,9 @@ final class MockAdapter: ProviderAdapter, @unchecked Sendable {
         case succeed(text: String, delay: Double = 0,
                      usage: CanonicalUsage = CanonicalUsage(inputTokens: 10, outputTokens: 5))
         case fail(DerbyError)
+        /// Open the stream, then fail before producing any content — the case
+        /// where streaming failover is still transparent to the client.
+        case openThenFail(DerbyError)
         /// Fail the first `count` calls, then succeed.
         case failThenSucceed(count: Int, error: DerbyError, text: String)
         case hang(seconds: Double)
@@ -100,6 +103,18 @@ final class MockAdapter: ProviderAdapter, @unchecked Sendable {
     private var behaviours: [String: Behaviour] = [:]
     private var callCounts: [String: Int] = [:]
     private var _defaultBehaviour: Behaviour = .succeed(text: "ok")
+    /// Every request the adapter was handed, so a test can assert on what the
+    /// provider actually received rather than what the client sent.
+    private var _seen: [(model: String, request: CanonicalRequest)] = []
+
+    var seen: [(model: String, request: CanonicalRequest)] {
+        lock.lock(); defer { lock.unlock() }
+        return _seen
+    }
+    func lastRequest(_ model: String) -> CanonicalRequest? {
+        lock.lock(); defer { lock.unlock() }
+        return _seen.last { $0.model == model }?.request
+    }
 
     var defaultBehaviour: Behaviour {
         get { lock.lock(); defer { lock.unlock() }; return _defaultBehaviour }
@@ -137,12 +152,13 @@ final class MockAdapter: ProviderAdapter, @unchecked Sendable {
     }
 
     func execute(_ request: CanonicalRequest, model: String, ctx: ProviderContext) async throws -> CanonicalResponse {
+        lock.lock(); _seen.append((model, request)); lock.unlock()
         switch nextBehaviour(model) {
         case .succeed(let text, let delay, let usage):
             if delay > 0 { try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) }
             return CanonicalResponse(id: IDGenerator.requestID(), model: model,
                                      message: .assistant(text), usage: usage)
-        case .fail(let e):
+        case .fail(let e), .openThenFail(let e):
             throw e
         case .hang(let s):
             try await Task.sleep(nanoseconds: UInt64(s * 1_000_000_000))
@@ -154,6 +170,7 @@ final class MockAdapter: ProviderAdapter, @unchecked Sendable {
 
     func stream(_ request: CanonicalRequest, model: String, ctx: ProviderContext) async throws
         -> AsyncThrowingStream<CanonicalStreamEvent, Error> {
+        lock.lock(); _seen.append((model, request)); lock.unlock()
         let behaviour = nextBehaviour(model)
         // Errors that happen before the stream opens must surface here, so the
         // executor can fail over transparently.
@@ -173,6 +190,9 @@ final class MockAdapter: ProviderAdapter, @unchecked Sendable {
                 case .hang(let s):
                     try? await Task.sleep(nanoseconds: UInt64(s * 1_000_000_000))
                     c.finish(throwing: DerbyError(kind: .unknown, message: "hang should have been cancelled"))
+                case .openThenFail(let e):
+                    c.yield(.start(id: IDGenerator.requestID(), model: model))
+                    c.finish(throwing: e)
                 case .fail(let e):
                     c.finish(throwing: e)
                 case .failThenSucceed:
@@ -229,8 +249,12 @@ enum Fixture {
                       caps: CapabilityFlags = [.text, .streaming, .tools],
                       context: Int? = 128_000, pricing: Pricing? = nil) -> PhysicalModel {
         PhysicalModel(modelID: id, enabled: true,
+                      // `.discovered` — a fixture declaring capabilities is
+                      // asserting facts about the target, the way a provider
+                      // would. `.builtin` would mean "guessed from a table",
+                      // which the snapshot now re-derives.
                       capabilities: ModelCapabilities(flags: caps, contextWindow: context,
-                                                      maxOutputTokens: 8192, source: .builtin),
+                                                      maxOutputTokens: 8192, source: .discovered),
                       pricingOverride: pricing,
                       qualityScore: quality)
     }
