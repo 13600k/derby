@@ -206,7 +206,11 @@ extension ProviderAdapter {
     func headers(_ ctx: ProviderContext, auth: ResolvedAuth, contentType: String = "application/json") -> [String: String] {
         var h = auth.headers
         h["content-type"] = contentType
-        h["user-agent"] = "Derby/1.0 (macOS)"
+        // Only a default. An adapter that must present a specific identity —
+        // Claude Code's OAuth path, where the user-agent is part of what the
+        // provider authorizes on — sets its own in `authenticate`, and
+        // overwriting it here silently undid that.
+        if h["user-agent"] == nil { h["user-agent"] = "Derby/1.0 (macOS)" }
         for (k, v) in ctx.account.extraHeaders where !k.isEmpty { h[k.lowercased()] = v }
         return h
     }

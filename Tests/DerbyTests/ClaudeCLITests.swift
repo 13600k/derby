@@ -25,10 +25,11 @@ func registerClaudeCLITests() {
         }
 
         test("the two Claude subscription paths are distinguishable in the UI") {
-            // One draws on plan limits, the other on extra usage; the names have
-            // to say so, because picking the wrong one is the whole problem.
+            // One is a guaranteed plan-limits path, the other a direct API call
+            // whose lane depends on the account; the names have to say which is
+            // which, because picking the wrong one is the whole problem.
             try expectContains(ProviderKind.claudeCodeCLI.displayName, "plan limits")
-            try expectContains(ProviderKind.anthropicSubscription.displayName, "extra usage")
+            try expectContains(ProviderKind.anthropicSubscription.displayName, "direct API")
         }
     }
 

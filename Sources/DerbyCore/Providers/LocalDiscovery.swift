@@ -110,8 +110,9 @@ public enum LocalDiscovery {
 
     public static func scanSubscriptions() -> [SubscriptionFinding] {
         let pairs: [(CLICredentialSource, ProviderKind)] = [
-            // The CLI path draws on plan limits; the direct-API path is billed as
-            // third-party extra usage, so this is the one to offer.
+            // The CLI path draws on plan limits unconditionally; the direct-API
+            // path may bill as extra usage depending on the account, so this is
+            // the one to offer by default.
             (.claudeCode, .claudeCodeCLI),
             (.codexCLI, .chatgptSubscription),
             (.geminiCLI, .geminiSubscription),

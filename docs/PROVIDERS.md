@@ -31,22 +31,33 @@ Derby reuses that credential — the same way the CLI does, against the same end
 
 ### Claude subscription — two paths, and they bill differently
 
-Anthropic distinguishes first-party clients from third-party ones. Presenting the CLI's OAuth
-token to `api.anthropic.com` directly is treated as a **third-party app** and charged against
-*extra usage*, which is what produces:
+Anthropic distinguishes first-party clients from third-party ones, which is what produces:
 
 > Third-party apps now draw from your extra usage, not your plan limits.
 
-Running the `claude` CLI is a first-party client, so the same request draws on the plan you
-already pay for. The CLI reports `"provider": "firstParty"` for these calls, which is how that
-is confirmed rather than assumed.
+Running the `claude` CLI is unambiguously a first-party client, so the request draws on the plan
+you already pay for. The CLI reports `"provider": "firstParty"` for these calls, which is how
+that is confirmed rather than assumed.
 
-Derby therefore offers both, named so the difference is unmissable:
+The direct API path is the uncertain one. **The classification is not made on the token** — it
+is made on the identity the request presents, and the token is only part of that. Derby sends
+the whole set the CLI does (see `ClaudeCodeIdentity`): the `oauth-2025-04-20` and
+`claude-code-20250219` betas, a `user-agent` naming the installed CLI version, `x-app: cli`, and
+the Claude Code system block. Which lane that lands in has been reported both ways and appears
+to depend on the account, so Derby does not claim an answer for yours — **read the response
+headers and find out**:
+
+| Response headers | Lane |
+| --- | --- |
+| `anthropic-ratelimit-unified-*` (5h / 7d windows) | Plan limits |
+| `anthropic-ratelimit-requests-*`, `...-input-tokens-*` | Metered — API billing or extra usage |
+
+Derby offers both transports:
 
 | Provider kind | Transport | Billing |
 | --- | --- | --- |
 | **Claude Code (plan limits)** | Spawns the `claude` CLI | Your subscription's plan limits |
-| **Claude subscription (extra usage)** | `POST /v1/messages` with the OAuth token | Extra usage |
+| **Claude subscription (direct API)** | `POST /v1/messages` with the OAuth token | Account-dependent — verify with the headers above |
 
 The CLI path is what discovery now offers. Its cost:
 
@@ -79,11 +90,22 @@ up after 20 seconds and says exactly that rather than hanging for the request de
 - **Write-back targets the store the credential came from.** Refresh rotates the refresh
   token, so updating the stale copy while the live store kept the old one would have logged
   the user out of their own CLI — the exact outcome the read-only default exists to prevent.
-- **Call.** `POST https://api.anthropic.com/v1/messages` with
-  `authorization: Bearer <token>` and `anthropic-beta: oauth-2025-04-20`.
+- **Call.** `POST https://api.anthropic.com/v1/messages` with `authorization: Bearer <token>`
+  plus the rest of the CLI's identity, which is one unit and lives in `ClaudeCodeIdentity`:
+  `anthropic-beta: interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14,claude-code-20250219,oauth-2025-04-20`,
+  `user-agent: claude-code/<version> (external, cli)`, and `x-app: cli`.
 - **Requirement.** The **first system block must identify the caller as Claude Code**, or
   the token is rejected. `AnthropicAdapter` injects it in OAuth mode; a test asserts it is
   first and that the user's own system prompt follows it.
+- **Version.** The user-agent must name a version close to the current release, so it is read
+  from the installed CLI (`claude --version`, probed once per process behind a 5s deadline) and
+  only falls back to a constant when there is no CLI to ask.
+- **Withheld deliberately.** `context-1m-2025-08-07`. An account without the long-context beta
+  answers HTTP 400 to *every* request carrying it, so claiming it would break short calls to
+  buy a window most subscriptions cannot use.
+- **Not done:** rewriting the caller's own system prompt. Other gateways substitute their
+  product name out of it to avoid being fingerprinted; that silently alters what the client
+  sent, which Derby does not do to a conversation anywhere else.
 - **Verified live** during development: a real completion returned `200` with usage.
 - Later in the same session the token expired, and Derby classified it as `AUTHENTICATION`
   in 1 ms and failed over to a local model — which is exactly the intended behaviour, and

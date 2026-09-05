@@ -377,6 +377,76 @@ func registerProviderTests() {
             try expectEqual(system[1]["text"]?.stringValue, "user system prompt")
         }
 
+        test("the OAuth identity is the CLI's, not a bare bearer token") {
+            let h = ClaudeCodeIdentity.headers(version: "9.9.9")
+            try expectEqual(h["user-agent"], "claude-code/9.9.9 (external, cli)")
+            try expectEqual(h["x-app"], "cli")
+            let betas = try expectNotNil(h["anthropic-beta"])
+            // Both halves matter: one authorizes the bearer token, the other
+            // names the caller. Sending only the first is what Derby used to do.
+            for beta in ClaudeCodeIdentity.oauthBetas + ClaudeCodeIdentity.sessionBetas {
+                try expectContains(betas, beta)
+            }
+        }
+
+        test("the 1M-context beta is withheld, because it 400s accounts without it") {
+            let betas = try expectNotNil(ClaudeCodeIdentity.headers(version: "1.0.0")["anthropic-beta"])
+            for beta in ClaudeCodeIdentity.withheldBetas {
+                try expect(!betas.contains(beta), "\(beta) breaks every request on an account that lacks it")
+            }
+        }
+
+        test("an adapter's own user-agent survives the shared header helper") {
+            let account = Fixture.account("Claude sub", kind: .anthropicSubscription,
+                                          models: [Fixture.model("claude-x")])
+            let context = ctx(account, transport: MockTransport())
+            let adapter = AnthropicAdapter(oauth: true)
+
+            let identity = ResolvedAuth(headers: ["user-agent": "claude-code/9.9.9 (external, cli)"])
+            try expectEqual(adapter.headers(context, auth: identity)["user-agent"],
+                            "claude-code/9.9.9 (external, cli)")
+            // ...and the default still applies when an adapter states no identity.
+            try expectEqual(adapter.headers(context, auth: ResolvedAuth())["user-agent"],
+                            "Derby/1.0 (macOS)")
+        }
+
+        test("an OAuth account sends the identity on the wire, not just the token") {
+            // A private credential home reads only its own file and never the
+            // Keychain, so this runs offline and touches nothing the user owns.
+            let home = FileManager.default.temporaryDirectory
+                .appendingPathComponent("derby-oauth-identity-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: home) }
+            let expiry = (Date().timeIntervalSince1970 + 3600) * 1000
+            try #"{"claudeAiOauth":{"accessToken":"tok-abc","expiresAt":\#(expiry)}}"#
+                .write(to: home.appendingPathComponent(".credentials.json"), atomically: true, encoding: .utf8)
+
+            var account = Fixture.account("Claude sub", kind: .anthropicSubscription,
+                                          models: [Fixture.model("claude-x")])
+            account.auth = .cli(source: .claudeCode, allowRefresh: false)
+            account.credentialHomeOverride = home.path
+
+            // Seeded so the suite never spawns `claude --version`.
+            await ClaudeCodeVersion.shared.seed("9.9.9")
+            let adapter = AnthropicAdapter(oauth: true)
+            let auth = try await adapter.authenticate(ctx(account, transport: MockTransport()))
+            let sent = adapter.headers(ctx(account, transport: MockTransport()), auth: auth)
+
+            try expectEqual(sent["authorization"], "Bearer tok-abc")
+            try expectEqual(sent["user-agent"], "claude-code/9.9.9 (external, cli)")
+            try expectEqual(sent["x-app"], "cli")
+            try expectContains(try expectNotNil(sent["anthropic-beta"]), "claude-code-20250219")
+            try expectContains(try expectNotNil(sent["anthropic-beta"]), "oauth-2025-04-20")
+        }
+
+        test("the declared CLI version is the installed one, or nothing") {
+            try expectEqual(ClaudeCodeVersion.parse("2.1.259 (Claude Code)"), "2.1.259")
+            try expectEqual(ClaudeCodeVersion.parse("2.1.259"), "2.1.259")
+            try expectNil(ClaudeCodeVersion.parse("Claude Code 2.1.259"),
+                          "a non-numeric leading token is not a version")
+            try expectNil(ClaudeCodeVersion.parse(""))
+        }
+
         test("extended thinking sets a budget below max_tokens and drops temperature") {
             let adapter = AnthropicAdapter(oauth: false)
             var r = CanonicalRequest(requestedModel: "l")
@@ -420,6 +490,30 @@ func registerProviderTests() {
                                                 body: Data(#"{"error":{"message":"invalid token"}}"#.utf8), model: "m")
             try expectEqual(authError.kind, .authentication)
             try expectContains(authError.message, "sign in again")
+        }
+
+        test("a spent subscription allowance is quota, not a malformed request") {
+            // Anthropic sends this as HTTP 400. Read literally that is
+            // `invalidRequest`, whose disposition returns to the client — so a
+            // healthy target that could have served the request never got tried.
+            let body = Data(#"{"error":{"type":"invalid_request_error","message":"Third-party apps now draw from your extra usage, not your plan limits. Add more at claude.ai/settings/usage and keep going."}}"#.utf8)
+            let oauth = AnthropicAdapter(oauth: true)
+            let error = oauth.classifyError(status: 400, headers: [:], body: body, model: "claude-sonnet-4-5")
+            try expectEqual(error.kind, .quotaExhausted)
+            try expect(error.kind.defaultDisposition.allowsFailover,
+                       "an exhausted allowance must fail over to a target that still has capacity")
+            try expectContains(error.message, "Claude Code (plan limits)")
+
+            // The metered 429 wording still classifies the same way.
+            try expectEqual(AnthropicAdapter(oauth: false).classifyError(
+                status: 429, headers: [:],
+                body: Data(#"{"error":{"message":"Your credit balance is too low"}}"#.utf8),
+                model: "m").kind, .quotaExhausted)
+            // ...and an ordinary 400 is still an ordinary 400.
+            try expectEqual(AnthropicAdapter(oauth: false).classifyError(
+                status: 400, headers: [:],
+                body: Data(#"{"error":{"message":"messages: at least one message is required"}}"#.utf8),
+                model: "m").kind, .invalidRequest)
         }
 
         test("streaming events are translated") {

@@ -13,9 +13,10 @@ public enum ProviderKind: String, Codable, Sendable, CaseIterable, Hashable {
     case openrouter, together, fireworks, groq, mistral, deepseek, xai
     case qwen                       // Alibaba DashScope compatible-mode
     // Subscription-backed consumer accounts
-    /// Runs the `claude` CLI, which is a first-party client and therefore draws
-    /// on the subscription's plan limits. Calling the API directly with the same
-    /// OAuth token is billed as third-party "extra usage" instead.
+    /// Runs the `claude` CLI, which is unambiguously a first-party client and
+    /// therefore draws on the subscription's plan limits. The direct-API sibling
+    /// below presents the same identity over HTTP, but which lane Anthropic puts
+    /// that in is account-dependent — see `ClaudeCodeIdentity`.
     case claudeCodeCLI = "claude_code_cli"
     case anthropicSubscription = "anthropic_subscription"
     case chatgptSubscription = "chatgpt_subscription"
@@ -55,7 +56,7 @@ public enum ProviderKind: String, Codable, Sendable, CaseIterable, Hashable {
         case .xai: return "xAI"
         case .qwen: return "Qwen (DashScope)"
         case .claudeCodeCLI: return "Claude Code (plan limits)"
-        case .anthropicSubscription: return "Claude subscription (extra usage)"
+        case .anthropicSubscription: return "Claude subscription (direct API)"
         case .chatgptSubscription: return "ChatGPT subscription"
         case .geminiSubscription: return "Gemini subscription"
         case .qwenSubscription: return "Qwen subscription"

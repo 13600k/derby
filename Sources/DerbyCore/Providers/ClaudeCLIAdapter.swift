@@ -2,13 +2,15 @@ import Foundation
 
 /// Uses a Claude subscription by running the `claude` CLI.
 ///
-/// Anthropic distinguishes first-party clients from third-party ones. Presenting
-/// the CLI's OAuth token to `api.anthropic.com` directly is treated as a
-/// third-party app and billed against *extra usage* — the source of
-/// "Third-party apps now draw from your extra usage, not your plan limits."
-/// Running the CLI itself is a first-party client, so the request draws on the
-/// plan the user already pays for. The CLI reports `provider: firstParty` for
-/// these calls, which is how that is confirmed rather than assumed.
+/// Anthropic distinguishes first-party clients from third-party ones — the
+/// source of "Third-party apps now draw from your extra usage, not your plan
+/// limits." Running the CLI is unambiguously first-party, so the request draws
+/// on the plan the user already pays for. The CLI reports `provider: firstParty`
+/// for these calls, which is how that is confirmed rather than assumed.
+///
+/// `AnthropicAdapter` in OAuth mode presents the same identity over HTTP and may
+/// well land in the same lane, but that is account-dependent and unproven; this
+/// path is the one that does not have to be verified.
 ///
 /// The trade-off is that the CLI is a turn-based agent, not a chat endpoint:
 /// tool definitions cannot be passed through, so this provider advertises no
@@ -62,24 +64,7 @@ public struct ClaudeCLIAdapter: ProviderAdapter {
     /// request to that key instead of the subscription, which is the very thing
     /// this provider exists to avoid.
     func environment(_ ctx: ProviderContext) -> [String: String] {
-        var env = ProcessInfo.processInfo.environment
-
-        // A GUI app launched from Finder inherits only a minimal PATH
-        // (/usr/bin:/bin:/usr/sbin:/sbin). The `claude` CLI is a Node script, so
-        // without this it starts and immediately fails to find its interpreter —
-        // working perfectly from a terminal and not at all from the app.
-        let home = CLICredentialReader.home().path
-        var searchPaths = env["PATH"].map { $0.split(separator: ":").map(String.init) } ?? []
-        if let binary = try? executable(ctx) {
-            searchPaths.insert(binary.deletingLastPathComponent().path, at: 0)
-        }
-        for extra in ["\(home)/.local/bin", "\(home)/.bun/bin", "\(home)/.nvm/current/bin",
-                      "\(home)/.volta/bin", "\(home)/n/bin", "/opt/homebrew/bin",
-                      "/usr/local/bin", "/usr/bin", "/bin"] where !searchPaths.contains(extra) {
-            searchPaths.append(extra)
-        }
-        env["PATH"] = searchPaths.joined(separator: ":")
-        if env["HOME"] == nil { env["HOME"] = home }
+        var env = ProcessRunner.toolEnvironment(preferring: try? executable(ctx))
 
         env.removeValue(forKey: "ANTHROPIC_API_KEY")
         env.removeValue(forKey: "ANTHROPIC_AUTH_TOKEN")

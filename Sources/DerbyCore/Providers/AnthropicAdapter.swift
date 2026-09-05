@@ -4,10 +4,12 @@ import Foundation
 ///
 /// * `anthropic` — a metered API key in the `x-api-key` header.
 /// * `anthropic_subscription` — the OAuth access token issued to Claude Code,
-///   read from the local CLI credential store and sent as a bearer token with
-///   the `oauth-2025-04-20` beta flag. That path additionally requires the first
-///   system block to identify the caller as Claude Code, which this adapter
-///   injects; without it the token is rejected.
+///   read from the local CLI credential store and sent as a bearer token
+///   alongside the rest of the CLI's wire identity: the beta flags, the
+///   `user-agent` and `x-app` headers, and a first system block naming Claude
+///   Code, without which the token is rejected. `ClaudeCodeIdentity` owns that
+///   set; this adapter applies the headers in `authenticate` and the system
+///   block in `buildBody`.
 public struct AnthropicAdapter: ProviderAdapter {
     public let family: AdapterFamily
     private let oauthMode: Bool
@@ -18,8 +20,10 @@ public struct AnthropicAdapter: ProviderAdapter {
     }
 
     public static let anthropicVersion = "2023-06-01"
-    /// Required as the first system block when using subscription OAuth.
-    public static let claudeCodeIdentity = "You are Claude Code, Anthropic's official CLI for Claude."
+    /// Required as the first system block when using subscription OAuth. One
+    /// part of the identity in `ClaudeCodeIdentity`, aliased here because this is
+    /// where it is injected into the body.
+    public static let claudeCodeIdentity = ClaudeCodeIdentity.systemPrompt
 
     public func authenticate(_ ctx: ProviderContext) async throws -> ResolvedAuth {
         var auth = ResolvedAuth()
@@ -30,7 +34,12 @@ public struct AnthropicAdapter: ProviderAdapter {
             let cred = try await ctx.credentials.credential(for: source, allowRefresh: allowRefresh,
                                                              home: ctx.account.credentialHomeURL)
             auth.headers["authorization"] = "Bearer \(cred.accessToken)"
-            auth.headers["anthropic-beta"] = "oauth-2025-04-20"
+            // The bearer token is only half of it: Anthropic reads the betas,
+            // the user-agent and `x-app` to decide *which client* is calling.
+            // See `ClaudeCodeIdentity` for what each part is doing.
+            for (name, value) in ClaudeCodeIdentity.headers(version: await ClaudeCodeVersion.shared.current()) {
+                auth.headers[name] = value
+            }
         case .apiKey(let ref):
             auth.headers["x-api-key"] = try requireSecret(ref, ctx: ctx, label: "API key")
         case .customHeader(let name, let ref, let prefix):
@@ -377,6 +386,13 @@ public struct AnthropicAdapter: ProviderAdapter {
         }
     }
 
+    /// Whether the provider is saying "you have run out", in any of the several
+    /// shapes it says it — and on either status code, because the subscription
+    /// wording arrives as a 400 while metered exhaustion arrives as a 429.
+    static func indicatesExhaustedAllowance(_ lower: String) -> Bool {
+        ["extra usage", "usage limit", "quota", "credit"].contains { lower.contains($0) }
+    }
+
     public func classifyError(status: Int, headers: [String: String], body: Data, model: String) -> DerbyError {
         let json = try? JSONDecoder().decode(JSONValue.self, from: body)
         let node = json?["error"] ?? json ?? .null
@@ -389,6 +405,12 @@ public struct AnthropicAdapter: ProviderAdapter {
         case 400:
             if lower.contains("prompt is too long") || lower.contains("context") || lower.contains("max_tokens") && lower.contains("exceed") {
                 kind = .contextOverflow
+            } else if Self.indicatesExhaustedAllowance(lower) {
+                // Anthropic reports a spent subscription allowance as a 400 with
+                // prose, not as a 429. Read literally that is a malformed
+                // request, whose disposition is `returnToClient` — so the client
+                // got a hard failure while a target with capacity sat unused.
+                kind = .quotaExhausted
             } else if lower.contains("model") && lower.contains("not") {
                 kind = .modelUnavailable
             } else {
@@ -401,8 +423,7 @@ public struct AnthropicAdapter: ProviderAdapter {
         case 404: kind = .modelUnavailable
         case 413: kind = .contextOverflow
         case 429:
-            kind = lower.contains("credit") || lower.contains("quota") || lower.contains("usage limit")
-                ? .quotaExhausted : .rateLimit
+            kind = Self.indicatesExhaustedAllowance(lower) ? .quotaExhausted : .rateLimit
         case 500, 502, 504: kind = .transient
         case 503, 529: kind = .providerDown
         default: kind = status >= 500 ? .providerDown : .unknown
@@ -412,6 +433,9 @@ public struct AnthropicAdapter: ProviderAdapter {
         var friendly = SecretRedactor.redact(message)
         if kind == .authentication, usesOAuth {
             friendly += " — run `claude` and sign in again, or enable managed token refresh for this account."
+        }
+        if kind == .quotaExhausted, usesOAuth {
+            friendly += " — Anthropic is billing this path as a third-party app. The Claude Code (plan limits) provider runs the CLI instead, which draws on the plan itself."
         }
         var err = DerbyError(kind: kind, message: friendly, providerStatus: status, providerCode: code)
         if let ra = headers["retry-after"].flatMap({ RateLimitSnapshot.parseDuration($0) }) { err.retryAfter = ra }

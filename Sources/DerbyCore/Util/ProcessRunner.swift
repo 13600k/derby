@@ -46,6 +46,28 @@ public enum ProcessRunner {
         return nil
     }
 
+    /// A process environment that can actually find a user-installed CLI.
+    ///
+    /// The same reason `locate` exists: a GUI app launched from Finder inherits
+    /// only a minimal `PATH`, and these tools are Node shims that then fail to
+    /// find their own interpreter — working perfectly from a terminal and not at
+    /// all from the app. `preferred`, when given, goes first, so a configured
+    /// override wins over whatever else is on `PATH`.
+    public static func toolEnvironment(preferring preferred: URL? = nil) -> [String: String] {
+        var env = ProcessInfo.processInfo.environment
+        let home = CLICredentialReader.home().path
+        var searchPaths = env["PATH"].map { $0.split(separator: ":").map(String.init) } ?? []
+        if let preferred { searchPaths.insert(preferred.deletingLastPathComponent().path, at: 0) }
+        for extra in ["\(home)/.local/bin", "\(home)/.bun/bin", "\(home)/.nvm/current/bin",
+                      "\(home)/.volta/bin", "\(home)/n/bin", "/opt/homebrew/bin",
+                      "/usr/local/bin", "/usr/bin", "/bin"] where !searchPaths.contains(extra) {
+            searchPaths.append(extra)
+        }
+        env["PATH"] = searchPaths.joined(separator: ":")
+        if env["HOME"] == nil { env["HOME"] = home }
+        return env
+    }
+
     /// Launches `executable` and yields its stdout as lines.
     ///
     /// The stream terminates when the process exits; a non-zero exit throws a
