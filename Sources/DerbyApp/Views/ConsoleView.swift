@@ -25,7 +25,7 @@ struct ConsoleView: View {
                     if isRunning { ProgressView().controlSize(.small).frame(width: 60) }
                     else { Text("Send").frame(width: 60) }
                 }
-                .buttonStyle(.borderedProminent)
+                .derbyProminentButton()
                 .disabled(isRunning || prompt.isEmpty || logicalModel.isEmpty)
                 .keyboardShortcut(.return, modifiers: .command)
             }
@@ -62,7 +62,8 @@ struct ConsoleView: View {
                     TextEditor(text: $prompt)
                         .font(.system(size: 13))
                         .frame(height: 92)
-                        .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Color.primary.opacity(0.12)))
+                        .scrollContentBackground(.hidden)
+                        .glassSurface(.inset, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
                 }
                 Text("⌘↩ to send. This uses the same router, executor and adapters as the HTTP gateway.")
                     .font(.caption).foregroundStyle(.secondary)
@@ -81,7 +82,7 @@ struct ConsoleView: View {
                 }
                 .frame(minHeight: 90, maxHeight: 300)
                 .padding(10)
-                .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 7))
+                .glassSurface(.inset, in: RoundedRectangle(cornerRadius: 13, style: .continuous))
                 HStack {
                     if isRunning, let startedAt {
                         Label("streaming · \(Date().timeIntervalSince(startedAt).msString)",

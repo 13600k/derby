@@ -22,11 +22,11 @@ struct LogicalModelsView: View {
                                message: "A logical model is the name your applications ask for. Each one carries its own routing policy, targets, retry rules and budgets.",
                                actionTitle: "New Logical Model") { showNew = true }
                 .frame(maxWidth: .infinity)
-                .background(Color(nsColor: .windowBackgroundColor))
+                .glassPane(stain: 0.04)
             }
         }
         .task { if selectedID == nil { selectedID = model.config.logicalModels.first?.id } }
-        .sheet(isPresented: $showNew) { newSheet }
+        .sheet(isPresented: $showNew) { newSheet.derbyGlassSheet() }
     }
 
     private var list: some View {
@@ -60,8 +60,9 @@ struct LogicalModelsView: View {
                 }
             }
             .listStyle(.sidebar)
+            .clearScrollBackground()
         }
-        .background(Color(nsColor: .windowBackgroundColor))
+        .glassSurface(.chrome, in: Rectangle())
     }
 
     private func usableTargets(_ lm: LogicalModel) -> Int {
@@ -86,7 +87,7 @@ struct LogicalModelsView: View {
                 Button("Cancel") { showNew = false; newName = "" }
                     .keyboardShortcut(.cancelAction)
                 Button("Create") { create() }
-                    .buttonStyle(.borderedProminent)
+                    .derbyProminentButton()
                     .disabled(!model.config.isLogicalModelNameAvailable(newName))
             }
         }
@@ -152,7 +153,7 @@ struct LogicalModelRow: View {
     var body: some View {
         HStack(spacing: 8) {
             Image(systemName: lm.enabled ? "square.stack.3d.up.fill" : "square.stack.3d.up.slash")
-                .foregroundStyle(lm.enabled ? Color.accentColor : .secondary)
+                .foregroundStyle(lm.enabled ? Color.derbyAccent : .secondary)
                 .frame(width: 16)
             VStack(alignment: .leading, spacing: 1) {
                 Text(lm.name)

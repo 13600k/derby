@@ -19,7 +19,7 @@ struct RequestsView: View {
                                title: "No request selected",
                                message: "Every request Derby handles is recorded with its candidates, attempts, timings and the reason a provider was chosen.")
                     .frame(maxWidth: .infinity)
-                    .background(Color(nsColor: .windowBackgroundColor))
+                    .glassPane(stain: 0.04)
             }
         }
         .task { await model.refreshRequests() }
@@ -78,9 +78,10 @@ struct RequestsView: View {
                     RequestRow(record: record).tag(record.id)
                 }
                 .listStyle(.inset)
+                .clearScrollBackground()
             }
         }
-        .background(Color(nsColor: .windowBackgroundColor))
+        .glassSurface(.chrome, in: Rectangle())
     }
 }
 
@@ -147,7 +148,7 @@ struct RequestInspector: View {
                 if record.promptExcerpt != nil || record.responseExcerpt != nil { contentCard }
             }
         }
-        .background(Color(nsColor: .windowBackgroundColor))
+        .glassPane(stain: 0.04)
     }
 
     private var summaryCard: some View {
@@ -197,7 +198,7 @@ struct RequestInspector: View {
         Card(title: "Why this provider", systemImage: "questionmark.circle") {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 8) {
-                    StatusPill(text: record.routingStrategy.uppercased(), tint: .accentColor)
+                    StatusPill(text: record.routingStrategy.uppercased(), tint: .derbyAccent)
                     Spacer()
                 }
                 Text(record.routingExplanation)
@@ -267,7 +268,7 @@ struct RequestInspector: View {
                             .textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .padding(8)
-                            .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 6))
+                            .glassSurface(.inset, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
                     }
                 }
                 if let response = record.responseExcerpt {
@@ -277,7 +278,7 @@ struct RequestInspector: View {
                             .textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .padding(8)
-                            .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 6))
+                            .glassSurface(.inset, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
                     }
                 }
             }

@@ -171,7 +171,8 @@ struct AddProviderSheet: View {
                     TextEditor(text: $modelNames)
                         .font(.system(size: 12, design: .monospaced))
                         .frame(height: 70)
-                        .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Color.primary.opacity(0.12)))
+                        .scrollContentBackground(.hidden)
+                        .glassSurface(.inset, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
                     Text(kind.supportsModelDiscovery
                          ? "Leave empty to discover models automatically after adding."
                          : "This provider does not publish a model list; Derby pre-fills the known ones.")
@@ -249,7 +250,7 @@ struct AddProviderSheet: View {
                                 .textSelection(.enabled)
                                 .padding(7)
                                 .frame(maxWidth: .infinity, alignment: .leading)
-                                .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 6))
+                                .glassSurface(.inset, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
                             Button { model.copyToPasteboard(command, label: "Command") } label: {
                                 Image(systemName: "doc.on.doc")
                             }
@@ -290,7 +291,7 @@ struct AddProviderSheet: View {
             Button("Cancel") { dismiss() }
                 .keyboardShortcut(.cancelAction)
             Button("Add Provider") { add() }
-                .buttonStyle(.borderedProminent)
+                .derbyProminentButton()
                 .keyboardShortcut(.defaultAction)
         }
         .padding(16)

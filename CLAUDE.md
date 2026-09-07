@@ -186,6 +186,23 @@ base URL and quirk flags — do not add a new adapter for these.
   They are independent — reasoning-era models are highly capable yet reject `temperature`,
   returning a deprecation error rather than ignoring it. `ModelCapabilities.unsupportedParameters`
   is a *deny-list*, so a model nothing is known about still receives everything.
+- **The look lives in `Views/Glass.swift`, and no other file branches on macOS
+  version.** Derby's surfaces are tinted glass stained with `Color.derbyAccent`
+  (teal, `#008080`). macOS 26 renders them as real Liquid Glass (`glassEffect`,
+  `GlassEffectContainer`, `.buttonStyle(.glass)`); macOS 14/15 fall back to a
+  blurred material under a tinted wash. Call sites say what a surface *is*
+  (`.chrome`, `.panel`, `.chip`, `.raised`, `.inset`) and never which API drew it.
+  The whole effect rests on one thing: `GlassWindowConfigurator` keeps the window
+  non-opaque with a clear background. Restore an opaque fill anywhere — a
+  `windowBackgroundColor` background, a solid `List` fill — and the glass has
+  nothing to refract, so it collapses into flat coloured rectangles. Opacity is
+  the *window's* job and transparency the *surfaces'*: the window carries a
+  frosted backdrop under a pooled teal ground (`GlassTuning`), while the panes
+  stay `Glass.clear` and refract it. Text never sits on bare glass — every
+  surface lays `Color.derbyGlassScrim` between the glass and the content. The
+  system appearance picks the text colour, so only an adaptive scrim can
+  guarantee a background whose brightness matches it; without one, black text
+  in light mode lands on whatever dark window happens to be behind Derby.
 - Keychain reads can block on a system dialog. Keep them off the launch path and under a
   deadline; when a required key is unavailable the gateway must **fail closed**.
 

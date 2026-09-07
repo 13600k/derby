@@ -11,6 +11,9 @@ struct DerbyApplication: App {
         WindowGroup("Derby") {
             RootView()
                 .environmentObject(model)
+                // Derby's teal accent, so system controls match `.derbyAccent`
+                // instead of following the user's macOS accent colour.
+                .tint(.derbyAccent)
                 .frame(minWidth: 1000, minHeight: 640)
                 .task { await model.bootstrap() }
                 .onAppear { appDelegate.model = model }

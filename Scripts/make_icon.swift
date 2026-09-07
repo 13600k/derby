@@ -24,8 +24,9 @@ func drawIcon(size: CGFloat) -> NSImage {
     context.saveGState()
     context.addPath(path)
     context.clip()
-    let colors = [NSColor(calibratedRed: 0.20, green: 0.22, blue: 0.42, alpha: 1).cgColor,
-                  NSColor(calibratedRed: 0.09, green: 0.10, blue: 0.20, alpha: 1).cgColor]
+    // Derby teal (#008080), lifted at the top-left and deepened at the bottom-right.
+    let colors = [NSColor(calibratedRed: 0.02, green: 0.44, blue: 0.44, alpha: 1).cgColor,
+                  NSColor(calibratedRed: 0.00, green: 0.17, blue: 0.18, alpha: 1).cgColor]
     if let gradient = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(),
                                  colors: colors as CFArray, locations: [0, 1]) {
         context.drawLinearGradient(gradient,
@@ -78,18 +79,30 @@ func drawIcon(size: CGFloat) -> NSImage {
     context.setFillColor(NSColor.white.cgColor)
     let hub = lane * 2.1
     context.fillEllipse(in: CGRect(x: hubX - hub / 2, y: midY - hub / 2, width: hub, height: hub))
-    context.setFillColor(NSColor(calibratedRed: 0.11, green: 0.12, blue: 0.24, alpha: 1).cgColor)
+    context.setFillColor(NSColor(calibratedRed: 0.00, green: 0.20, blue: 0.21, alpha: 1).cgColor)
     let inner = hub * 0.42
     context.fillEllipse(in: CGRect(x: hubX - inner / 2, y: midY - inner / 2, width: inner, height: inner))
 
     context.restoreGState()
 
-    // Subtle top highlight so the tile has depth.
+    // Glass: a specular bloom off the top-left corner, then a bright inner rim.
+    // Together they read as a curved, lit surface rather than a flat tile — the
+    // same cue the app's Liquid Glass surfaces use.
     context.saveGState()
     context.addPath(path)
     context.clip()
-    context.setStrokeColor(NSColor.white.withAlphaComponent(0.16).cgColor)
-    context.setLineWidth(2.5 * scale * 2)
+    let bloomColors = [NSColor.white.withAlphaComponent(0.30).cgColor,
+                       NSColor.white.withAlphaComponent(0.0).cgColor]
+    if let bloom = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(),
+                              colors: bloomColors as CFArray, locations: [0, 1]) {
+        let origin = CGPoint(x: rect.minX + rect.width * 0.24, y: rect.maxY - rect.height * 0.16)
+        context.drawRadialGradient(bloom,
+                                   startCenter: origin, startRadius: 0,
+                                   endCenter: origin, endRadius: rect.width * 0.62,
+                                   options: [])
+    }
+    context.setStrokeColor(NSColor.white.withAlphaComponent(0.22).cgColor)
+    context.setLineWidth(3.0 * scale * 2)
     context.addPath(path)
     context.strokePath()
     context.restoreGState()

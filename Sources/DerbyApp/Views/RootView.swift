@@ -78,9 +78,13 @@ struct RootView: View {
             }
             .animation(.easeInOut(duration: 0.2), value: model.banner)
         }
+        // Every pane below is transparent, so this is what shows through all of
+        // them — and what the cards and pills on top of them refract.
+        .derbyGlassBackground()
         .sheet(isPresented: $model.showOnboarding) {
             OnboardingView(selection: $selection)
                 .environmentObject(model)
+                .derbyGlassSheet()
         }
     }
 
@@ -97,6 +101,8 @@ struct RootView: View {
             }
         }
         .listStyle(.sidebar)
+        .clearScrollBackground()
+        .glassSurface(.chrome, in: Rectangle())
         .navigationSplitViewColumnWidth(min: 196, ideal: 208, max: 260)
         .safeAreaInset(edge: .bottom) { gatewayFooter }
     }
@@ -118,7 +124,6 @@ struct RootView: View {
 
     private var gatewayFooter: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Divider()
             HStack(spacing: 7) {
                 Circle()
                     .fill(model.status.tint)
@@ -146,8 +151,10 @@ struct RootView: View {
                 }
             }
             .padding(.horizontal, 12)
+            .padding(.top, 10)
             .padding(.bottom, 10)
         }
+        .glassSurface(.chrome, in: Rectangle())
     }
 
     @ViewBuilder
@@ -183,15 +190,14 @@ struct BannerView: View {
             Spacer(minLength: 0)
         }
         .padding(12)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
-        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(tint.opacity(0.35)))
-        .shadow(color: .black.opacity(0.12), radius: 8, y: 3)
+        .glassSurface(.raised, in: RoundedRectangle(cornerRadius: 17, style: .continuous), tint: tint)
+        .shadow(color: .black.opacity(0.18), radius: 12, y: 4)
         .frame(maxWidth: 520, alignment: .leading)
     }
 
     private var tint: Color {
         switch banner.kind {
-        case .info: return .accentColor
+        case .info: return .derbyAccent
         case .success: return .green
         case .warning: return .orange
         case .error: return .red

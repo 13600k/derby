@@ -191,7 +191,7 @@ struct ModelRow: View {
 
             if expanded { detail }
         }
-        .background(Color.primary.opacity(0.03), in: RoundedRectangle(cornerRadius: 8))
+        .glassSurface(.inset, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Color.primary.opacity(0.06)))
     }
 
@@ -231,7 +231,7 @@ struct ModelRow: View {
                         Text(name)
                             .font(.caption2)
                             .padding(.horizontal, 7).padding(.vertical, 3)
-                            .background(Color.accentColor.opacity(0.12), in: Capsule())
+                            .glassSurface(.chip, in: Capsule())
                     }
                 }
                 HStack(spacing: 16) {
@@ -386,7 +386,7 @@ struct ModelRow: View {
     private var sourceTint: Color {
         switch caps.source {
         case .discovered: return .green
-        case .builtin: return .accentColor
+        case .builtin: return .derbyAccent
         case .userOverride: return .orange
         case .unknown: return .secondary
         }

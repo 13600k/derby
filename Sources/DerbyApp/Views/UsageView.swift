@@ -67,10 +67,10 @@ struct UsageView: View {
                     VStack(spacing: 4) {
                         ZStack(alignment: .bottom) {
                             RoundedRectangle(cornerRadius: 3)
-                                .fill(Color.accentColor.opacity(0.15))
+                                .fill(Color.derbyAccent.opacity(0.15))
                                 .frame(height: 90)
                             RoundedRectangle(cornerRadius: 3)
-                                .fill(Color.accentColor)
+                                .fill(Color.derbyAccent)
                                 .frame(height: max(2, 90 * CGFloat(bucket.requests) / CGFloat(maxValue)))
                         }
                         Text(String(bucket.key.suffix(5)))

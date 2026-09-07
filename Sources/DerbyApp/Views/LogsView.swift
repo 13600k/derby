@@ -90,7 +90,7 @@ struct LogsView: View {
     private func tint(_ level: LogLevel) -> Color {
         switch level {
         case .debug: return .secondary
-        case .info: return .accentColor
+        case .info: return .derbyAccent
         case .warn: return .orange
         case .error: return .red
         }

@@ -21,13 +21,14 @@ struct LogicalModelDetailView: View {
             }
         }
         .onAppear { draft = current }
-        .background(Color(nsColor: .windowBackgroundColor))
+        .glassPane(stain: 0.04)
         .sheet(isPresented: $showAddTarget) {
             AddTargetSheet(existing: draft?.targets ?? []) { refs in
                 draft?.targets.append(contentsOf: refs)
                 save()
             }
             .environmentObject(model)
+            .derbyGlassSheet()
         }
     }
 
@@ -42,7 +43,7 @@ struct LogicalModelDetailView: View {
                 } label: {
                     Label("Test Routing", systemImage: "play.circle")
                 }
-                .buttonStyle(.borderedProminent)
+                .derbyProminentButton()
             }
         } content: {
             VStack(alignment: .leading, spacing: 16) {
@@ -594,7 +595,8 @@ struct LogicalModelDetailView: View {
                         set: { draft?.defaults.systemPrompt = $0.isEmpty ? nil : $0 }))
                         .font(.callout)
                         .frame(height: 60)
-                        .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Color.primary.opacity(0.12)))
+                        .scrollContentBackground(.hidden)
+                        .glassSurface(.inset, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
                         .onChange(of: lm.defaults.systemPrompt) { _, _ in save() }
                     Picker("Applied by", selection: binding(\.defaults.systemPromptMode)) {
                         ForEach(RequestDefaults.SystemPromptMode.allCases, id: \.self) {
@@ -800,7 +802,7 @@ struct TargetRow: View {
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
-        .background(Color.primary.opacity(0.03), in: RoundedRectangle(cornerRadius: 8))
+        .glassSurface(.inset, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Color.primary.opacity(0.06)))
         .opacity(ref.enabled ? 1 : 0.55)
     }
@@ -895,7 +897,7 @@ struct AddTargetSheet: View {
                 Spacer()
                 Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
                 Button("Add") { add() }
-                    .buttonStyle(.borderedProminent)
+                    .derbyProminentButton()
                     .disabled(chosen.isEmpty)
                     .keyboardShortcut(.defaultAction)
             }

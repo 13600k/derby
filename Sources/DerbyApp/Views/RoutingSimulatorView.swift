@@ -31,7 +31,7 @@ struct RoutingDecisionCard: View {
                         Spacer()
                     }
                     .padding(10)
-                    .background(Color.green.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+                    .glassSurface(.inset, in: RoundedRectangle(cornerRadius: 14, style: .continuous), tint: .green)
                 }
 
                 if !decision.evaluations.isEmpty {
@@ -177,7 +177,7 @@ struct RoutingSimulatorView: View {
             } label: {
                 Label("Simulate", systemImage: "play.fill")
             }
-            .buttonStyle(.borderedProminent)
+            .derbyProminentButton()
             .disabled(logicalModel.isEmpty)
         } content: {
             VStack(alignment: .leading, spacing: 16) {
@@ -258,7 +258,7 @@ struct RoutingSimulatorView: View {
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(10)
-                    .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 7))
+                    .glassSurface(.inset, in: RoundedRectangle(cornerRadius: 13, style: .continuous))
                 Button("Copy trace") { model.copyToPasteboard(decision.trace, label: "Trace") }
                     .buttonStyle(.link)
             }
@@ -274,7 +274,7 @@ struct RoutingSimulatorView: View {
                         Text(lm.name)
                             .font(.system(size: 12, weight: .medium, design: .monospaced))
                             .frame(width: 110, alignment: .leading)
-                        StatusPill(text: lm.policy.strategy.displayName.uppercased(), tint: .accentColor)
+                        StatusPill(text: lm.policy.strategy.displayName.uppercased(), tint: .derbyAccent)
                         Text(lm.policy.strategy.summary)
                             .font(.caption).foregroundStyle(.secondary)
                             .lineLimit(1)

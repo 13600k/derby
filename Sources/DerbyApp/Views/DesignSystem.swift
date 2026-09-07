@@ -99,8 +99,7 @@ struct Card<Content: View>: View {
         }
         .padding(16)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
-        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Color.primary.opacity(0.07)))
+        .glassSurface(.panel, in: RoundedRectangle(cornerRadius: 17, style: .continuous))
     }
 }
 
@@ -136,8 +135,7 @@ struct StatTile: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(14)
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
-        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Color.primary.opacity(0.07)))
+        .glassSurface(.panel, in: RoundedRectangle(cornerRadius: 17, style: .continuous))
     }
 }
 
@@ -157,10 +155,12 @@ struct StatusPill: View {
                 .tracking(0.3)
         }
         .foregroundStyle(filled ? .white : tint)
-        .padding(.horizontal, 7)
-        .padding(.vertical, 3)
-        .background(filled ? AnyShapeStyle(tint) : AnyShapeStyle(tint.opacity(0.13)),
-                    in: Capsule())
+        .padding(.horizontal, 8)
+        .padding(.vertical, 3.5)
+        // A filled pill still needs a solid ground under white text; an unfilled
+        // one is a chip of glass stained in its own status colour.
+        .background(filled ? AnyShapeStyle(tint) : AnyShapeStyle(Color.clear), in: Capsule())
+        .glassSurface(.chip, in: Capsule(), tint: tint)
     }
 }
 
@@ -203,7 +203,7 @@ struct CopyableField: View {
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 7)
-            .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 7))
+            .glassSurface(.chip, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         }
     }
 
@@ -254,7 +254,7 @@ struct EmptyStateView: View {
                 .frame(maxWidth: 380)
             if let actionTitle, let action {
                 Button(actionTitle, action: action)
-                    .buttonStyle(.borderedProminent)
+                    .derbyProminentButton()
                     .padding(.top, 2)
             }
         }
@@ -266,15 +266,15 @@ struct EmptyStateView: View {
 /// A labelled proportion bar, used for routing weights and usage breakdowns.
 struct WeightBar: View {
     var value: Double          // 0...1
-    var tint: Color = .accentColor
+    var tint: Color = .derbyAccent
     var height: CGFloat = 6
 
     var body: some View {
         GeometryReader { geo in
             ZStack(alignment: .leading) {
-                Capsule().fill(Color.primary.opacity(0.08))
+                Capsule().fill(Color.primary.opacity(0.10))
                 Capsule()
-                    .fill(tint)
+                    .fill(tint.gradient)
                     .frame(width: max(0, min(1, value)) * geo.size.width)
             }
         }
@@ -303,18 +303,23 @@ struct Page<Content: View, Toolbar: View>: View {
             }
             .padding(.horizontal, 24)
             .padding(.top, 20)
-            .padding(.bottom, 14)
-
-            Divider()
+            .padding(.bottom, 16)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            // The header is chrome, so it is stained hardest and carries the
+            // seam that used to be a `Divider()`.
+            .glassSurface(.chrome, in: Rectangle())
 
             ScrollView {
                 content
                     .padding(24)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
+            .clearScrollBackground()
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color(nsColor: .windowBackgroundColor))
+        // Deliberately no fill: the page is a hole through to the window
+        // backdrop, which is what the cards on top of it refract.
+        .glassPane()
     }
 }
 
@@ -331,6 +336,18 @@ struct AdaptiveGrid<Content: View>: View {
     @ViewBuilder var content: Content
 
     var body: some View {
+        // On macOS 26 a container lets neighbouring glass pieces sense each
+        // other: tiles that come within `spacing` fuse at the edges and pull
+        // apart again as the grid reflows. That merging is the "liquid" half of
+        // Liquid Glass, and it only happens inside a container.
+        if #available(macOS 26.0, *) {
+            GlassEffectContainer(spacing: spacing) { grid }
+        } else {
+            grid
+        }
+    }
+
+    private var grid: some View {
         LazyVGrid(columns: [GridItem(.adaptive(minimum: minWidth), spacing: spacing)], spacing: spacing) {
             content
         }
@@ -342,8 +359,8 @@ extension View {
     func rowStyle() -> some View {
         padding(.vertical, 8)
             .padding(.horizontal, 12)
-            .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
-            .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Color.primary.opacity(0.06)))
+            .glassSurface(.panel, in: RoundedRectangle(cornerRadius: 14, style: .continuous),
+                          interactive: true)
     }
 }
 

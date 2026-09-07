@@ -28,7 +28,7 @@ struct ProviderDetailView: View {
             }
         }
         .onAppear(perform: load)
-        .background(Color(nsColor: .windowBackgroundColor))
+        .glassPane(stain: 0.04)
     }
 
     private func load() {
@@ -119,7 +119,7 @@ struct ProviderDetailView: View {
                         if isTesting { ProgressView().controlSize(.small).frame(width: 90) }
                         else { Text("Test Connection").frame(width: 90) }
                     }
-                    .buttonStyle(.borderedProminent)
+                    .derbyProminentButton()
                     .disabled(isTesting)
 
                     if current.kind.supportsModelDiscovery {
@@ -343,7 +343,7 @@ struct ProviderDetailView: View {
                             .textSelection(.enabled)
                             .padding(7)
                             .frame(maxWidth: .infinity, alignment: .leading)
-                            .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 6))
+                            .glassSurface(.inset, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
                         Button {
                             model.copyToPasteboard(command, label: "Command")
                         } label: { Image(systemName: "doc.on.doc") }
@@ -501,7 +501,8 @@ struct ProviderDetailView: View {
                     TextEditor(text: binding(\.notes))
                         .font(.callout)
                         .frame(height: 54)
-                        .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Color.primary.opacity(0.12)))
+                        .scrollContentBackground(.hidden)
+                        .glassSurface(.inset, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
                         .onChange(of: current.notes) { _, _ in save() }
                 }
             }

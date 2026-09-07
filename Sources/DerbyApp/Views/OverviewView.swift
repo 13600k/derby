@@ -94,7 +94,7 @@ struct OverviewView: View {
                             Label("Start Gateway", systemImage: "play.fill")
                                 .frame(width: 150, alignment: .leading)
                         }
-                        .buttonStyle(.borderedProminent)
+                        .derbyProminentButton()
                     }
                 }
             }
@@ -174,7 +174,7 @@ struct OverviewView: View {
                                 Text(lm.name)
                                     .font(.system(size: 13, weight: .medium, design: .monospaced))
                                 StatusPill(text: lm.definition.policy.strategy.displayName.uppercased(),
-                                           tint: .accentColor)
+                                           tint: .derbyAccent)
                                 Spacer()
                                 Text("\(usableCount(lm)) of \(lm.targets.count) target\(lm.targets.count == 1 ? "" : "s")")
                                     .font(.caption).foregroundStyle(.secondary)

@@ -52,7 +52,7 @@ struct OnboardingView: View {
         HStack(spacing: 14) {
             Image(systemName: steps[step].symbol)
                 .font(.system(size: 26, weight: .light))
-                .foregroundStyle(Color.accentColor)
+                .foregroundStyle(Color.derbyAccent)
                 .frame(width: 40)
             VStack(alignment: .leading, spacing: 3) {
                 Text(steps[step].title).font(.title2.weight(.semibold))
@@ -62,7 +62,7 @@ struct OnboardingView: View {
             HStack(spacing: 5) {
                 ForEach(0..<steps.count, id: \.self) { index in
                     Capsule()
-                        .fill(index <= step ? Color.accentColor : Color.primary.opacity(0.15))
+                        .fill(index <= step ? Color.derbyAccent : Color.primary.opacity(0.15))
                         .frame(width: index == step ? 18 : 7, height: 5)
                 }
             }
@@ -102,7 +102,7 @@ struct OnboardingView: View {
         HStack(alignment: .top, spacing: 12) {
             Image(systemName: symbol)
                 .font(.system(size: 15))
-                .foregroundStyle(Color.accentColor)
+                .foregroundStyle(Color.derbyAccent)
                 .frame(width: 22)
             VStack(alignment: .leading, spacing: 2) {
                 Text(title).font(.headline)
@@ -128,7 +128,7 @@ struct OnboardingView: View {
                         Image(systemName: "checkmark.circle.fill").foregroundStyle(.green).font(.title2)
                     } else {
                         Button("Start Gateway") { Task { await model.startGateway() } }
-                            .buttonStyle(.borderedProminent)
+                            .derbyProminentButton()
                     }
                 }
             }
@@ -231,7 +231,7 @@ struct OnboardingView: View {
                             Text(lm.name)
                                 .font(.system(size: 12, weight: .medium, design: .monospaced))
                                 .frame(width: 74, alignment: .leading)
-                            StatusPill(text: lm.policy.strategy.displayName.uppercased(), tint: .accentColor)
+                            StatusPill(text: lm.policy.strategy.displayName.uppercased(), tint: .derbyAccent)
                             Text(lm.summary).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                             Spacer()
                             Text("\(lm.targets.count) target\(lm.targets.count == 1 ? "" : "s")")
@@ -280,7 +280,7 @@ struct OnboardingView: View {
                         .textSelection(.enabled)
                         .padding(10)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 7))
+                        .glassSurface(.inset, in: RoundedRectangle(cornerRadius: 13, style: .continuous))
                     Button("Copy command") { model.copyToPasteboard(curlExample, label: "Command") }
                         .buttonStyle(.link)
                 }
@@ -315,7 +315,7 @@ struct OnboardingView: View {
             Button(step == steps.count - 1 ? "Finish" : "Next") {
                 if step == steps.count - 1 { finish() } else { step += 1 }
             }
-            .buttonStyle(.borderedProminent)
+            .derbyProminentButton()
             .keyboardShortcut(.defaultAction)
         }
         .padding(16)

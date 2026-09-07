@@ -23,12 +23,13 @@ struct ProvidersView: View {
                                message: "Pick a provider to configure its credentials, models and limits — or add a new account, endpoint or local server.",
                                actionTitle: "Add Provider") { showAdd = true }
                 .frame(maxWidth: .infinity)
-                .background(Color(nsColor: .windowBackgroundColor))
+                .glassPane(stain: 0.04)
             }
         }
         .sheet(isPresented: $showAdd) {
             AddProviderSheet { newID in selectedID = newID }
                 .environmentObject(model)
+                .derbyGlassSheet()
         }
         .task {
             if selectedID == nil { selectedID = model.config.providers.first?.id }
@@ -74,8 +75,9 @@ struct ProvidersView: View {
                 }
             }
             .listStyle(.sidebar)
+            .clearScrollBackground()
         }
-        .background(Color(nsColor: .windowBackgroundColor))
+        .glassSurface(.chrome, in: Rectangle())
     }
 }
 
@@ -86,7 +88,7 @@ struct ProviderRow: View {
     var body: some View {
         HStack(spacing: 9) {
             Image(systemName: account.kind.category.symbol)
-                .foregroundStyle(account.enabled ? Color.accentColor : .secondary)
+                .foregroundStyle(account.enabled ? Color.derbyAccent : .secondary)
                 .frame(width: 16)
             VStack(alignment: .leading, spacing: 1) {
                 Text(account.name)
