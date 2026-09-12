@@ -32,7 +32,12 @@ public actor DerbyEngine {
     public nonisolated let healthRegistry: HealthRegistry
     public nonisolated let credentials = CredentialCache()
     public nonisolated let transport: any HTTPTransport
+    /// What each local server has loaded, refreshed while the gateway runs.
+    public nonisolated let residency = ResidencyRegistry()
+    /// Who wrote each answer, shared by the gateway and the executor.
+    public nonisolated let handoffLedger = HandoffLedger()
     private let adapters: AdapterRegistry
+    private var residencyTask: Task<Void, Never>?
 
     private let state: ControlPlaneState
     private var server = HTTPServer()
@@ -83,7 +88,8 @@ public actor DerbyEngine {
         await healthRegistry.update(settings: config.health)
         await healthRegistry.update(accountLimits: accountLimits(config))
         executor = Executor(registry: adapters, transport: transport, secrets: secrets,
-                            credentials: credentials, health: healthRegistry, telemetry: telemetry)
+                            credentials: credentials, health: healthRegistry, telemetry: telemetry,
+                                ledger: handoffLedger)
         await telemetry.pruneNow()
         // Write the seeded configuration out immediately, so a first-run install
         // has a config file on disk even if the user never changes anything. A
@@ -172,8 +178,60 @@ public actor DerbyEngine {
     }
 
     public func snapshot() async -> RoutingSnapshot {
-        let h = await healthRegistry.snapshot()
-        return await state.snapshot(health: h)
+        let live = await healthRegistry.snapshotWithLoad()
+        var snap = await state.snapshot(health: live.health)
+        snap.accountLoad = live.accountLoad
+        snap.loadVersion = live.loadVersion
+        snap.residency = await residency.snapshot()
+        return snap
+    }
+
+    // MARK: - Loaded models
+
+    /// Asks each enabled local server, every few seconds, which models it has in
+    /// memory. Runs only while the gateway does.
+    private func startResidencyPolling() {
+        residencyTask?.cancel()
+        let state = self.state, adapters = self.adapters, transport = self.transport
+        let secrets = self.secrets, credentials = self.credentials, registry = residency
+        residencyTask = Task.detached(priority: .utility) {
+            while !Task.isCancelled {
+                let config = await state.currentConfig()
+                await DerbyEngine.pollResidency(config: config, adapters: adapters, transport: transport,
+                                                secrets: secrets, credentials: credentials, into: registry)
+                try? await Task.sleep(nanoseconds: UInt64(ModelResidency.pollInterval * 1_000_000_000))
+            }
+        }
+    }
+
+    static func pollResidency(config: DerbyConfig, adapters: AdapterRegistry, transport: any HTTPTransport,
+                              secrets: any SecretStore, credentials: CredentialCache,
+                              into registry: ResidencyRegistry) async {
+        await withTaskGroup(of: Void.self) { group in
+            for account in config.providers where account.enabled && account.kind.isLocal {
+                group.addTask {
+                    let adapter = adapters.adapter(for: account.kind)
+                    let ctx = ProviderContext(account: account, transport: transport, secrets: secrets,
+                                              credentials: credentials, attemptTimeout: 2)
+                    // Two questions, both optional: which models are in memory,
+                    // and what the server is working on. A server that answers
+                    // neither is one Derby stops claiming to know anything about.
+                    let loaded = try? await withDeadline(3, message: "loaded-model probe timed out") {
+                        try await adapter.loadedModels(ctx)
+                    }
+                    let busy = try? await withDeadline(3, message: "occupancy probe timed out") {
+                        try await adapter.occupancy(ctx)
+                    }
+                    switch (loaded ?? nil, busy ?? nil) {
+                    case (nil, nil):
+                        await registry.forget(accountID: account.id)
+                    case (let models, let occupancy):
+                        await registry.update(accountID: account.id, loadedModels: models,
+                                              occupancy: occupancy)
+                    }
+                }
+            }
+        }
     }
 
     /// The local key, generating and storing one on first use. Only call this
@@ -204,13 +262,15 @@ public actor DerbyEngine {
         if config.gateway.requireAPIKey && cachedLocalKey == nil { await ensureLocalAPIKey() }
         if executor == nil {
             executor = Executor(registry: adapters, transport: transport, secrets: secrets,
-                                credentials: credentials, health: healthRegistry, telemetry: telemetry)
+                                credentials: credentials, health: healthRegistry, telemetry: telemetry,
+                                ledger: handoffLedger)
         }
         let handler = GatewayHandler(state: state, health: healthRegistry, telemetry: telemetry,
                                      executor: executor, secrets: secrets,
                                      gatewaySettings: config.gateway,
                                      localAPIKey: cachedLocalKey,
-                                     promptLogging: config.logging.promptLogging)
+                                     promptLogging: config.logging.promptLogging,
+                                     residency: residency)
         let paused = { [weak self] () async -> Bool in
             guard let self else { return false }
             return await self.routingPaused
@@ -230,6 +290,7 @@ public actor DerbyEngine {
             }
             let port = await server.boundPort
             status = .running(port: port, since: Date())
+            startResidencyPolling()
             await telemetry.log(LogEntry(level: .info, category: "gateway",
                                          message: "Gateway listening on http://\(config.gateway.bindAddress):\(port)/v1"))
         } catch {
@@ -241,6 +302,8 @@ public actor DerbyEngine {
     }
 
     public func stopGateway() async {
+        residencyTask?.cancel()
+        residencyTask = nil
         await server.stop()
         status = .stopped
         await telemetry.log(LogEntry(level: .info, category: "gateway", message: "Gateway stopped."))
@@ -411,7 +474,8 @@ public actor DerbyEngine {
                                promptExcerpt: config.logging.promptLogging.storesContent ? prompt : nil)
         if executor == nil {
             executor = Executor(registry: adapters, transport: transport, secrets: secrets,
-                                credentials: credentials, health: healthRegistry, telemetry: telemetry)
+                                credentials: credentials, health: healthRegistry, telemetry: telemetry,
+                                ledger: handoffLedger)
         }
         guard let executor else { return .failure(DerbyError(kind: .unknown, message: "Engine not ready.")) }
 

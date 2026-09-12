@@ -24,6 +24,9 @@ public struct TargetScorer: Sendable {
         public var providerPreference = 0.0
         public var localPreference = 0.0
         public var contextHeadroom = 0.0
+        public var load = 0.0
+        public var warmth = 0.0
+        public var continuity = 0.0
 
         public func weighted(by w: ScoreWeights) -> (total: Double, components: [String: Double]) {
             let n = w.normalized
@@ -37,6 +40,9 @@ public struct TargetScorer: Sendable {
                 ("providerPreference", providerPreference * n.providerPreference),
                 ("localPreference", localPreference * n.localPreference),
                 ("contextHeadroom", contextHeadroom * n.contextHeadroom),
+                ("load", load * n.load),
+                ("warmth", warmth * n.warmth),
+                ("continuity", continuity * n.continuity),
             ]
             var components: [String: Double] = [:]
             var total = 0.0
@@ -52,8 +58,15 @@ public struct TargetScorer: Sendable {
                            health: TargetHealth,
                            metric: LatencyMetric,
                            candidateCount: Int,
-                           promptTokens: Int) -> Dimensions {
+                           promptTokens: Int,
+                           loadUtilization: Double = 0,
+                           warmth: ModelWarmth = .unknown,
+                           continuity: LineageAffinity? = nil) -> Dimensions {
         var d = Dimensions()
+        d.load = max(0, 1 - min(1, loadUtilization))
+        d.warmth = warmth.score
+        // With no earlier answer to continue from, every target is equally continuous.
+        d.continuity = continuity.map(Self.continuityScore) ?? 1
         d.quality = min(1, max(0, target.quality / 100))
 
         if let l = health.latency(for: metric), l > 0 {
@@ -91,5 +104,16 @@ public struct TargetScorer: Sendable {
             d.contextHeadroom = unknownPrior
         }
         return d
+    }
+
+    /// How much a target keeps the conversation within one model lineage.
+    public static func continuityScore(_ affinity: LineageAffinity) -> Double {
+        switch affinity {
+        case .identical: return 1.0
+        case .sameFamily: return 0.85
+        case .sameVendor: return 0.6
+        case .unknown: return 0.5
+        case .foreign: return 0.3
+        }
     }
 }

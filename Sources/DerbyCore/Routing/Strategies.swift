@@ -10,16 +10,34 @@ public struct RoutingContext: Sendable {
     public var roundRobinCursor: Int
     /// When set, random choices become reproducible (used by the simulator).
     public var randomSeed: UInt64?
+    /// Share of each target's account capacity already committed, by target id.
+    public var loadUtilization: [UUID: Double]
+    /// Whether each target's model is already loaded, by target id.
+    public var warmth: [UUID: ModelWarmth]
+    /// What each target's server last said it was working on, by target id.
+    public var occupancy: [UUID: ServerOccupancy]
+    /// Lineage of the model that wrote the conversation's latest answer.
+    public var conversationLineage: ModelLineage?
 
     public init(policy: RoutingPolicy, health: [TargetKey: TargetHealth], promptTokens: Int,
                 scorer: TargetScorer = TargetScorer(), roundRobinCursor: Int = 0,
-                randomSeed: UInt64? = nil) {
+                randomSeed: UInt64? = nil, loadUtilization: [UUID: Double] = [:],
+                warmth: [UUID: ModelWarmth] = [:], occupancy: [UUID: ServerOccupancy] = [:],
+                conversationLineage: ModelLineage? = nil) {
         self.policy = policy; self.health = health; self.promptTokens = promptTokens
         self.scorer = scorer; self.roundRobinCursor = roundRobinCursor; self.randomSeed = randomSeed
+        self.loadUtilization = loadUtilization; self.warmth = warmth; self.occupancy = occupancy
+        self.conversationLineage = conversationLineage
     }
 
     public func health(for t: ResolvedTarget) -> TargetHealth {
         health[t.key] ?? TargetHealth(key: t.key)
+    }
+    public func load(for t: ResolvedTarget) -> Double { loadUtilization[t.id] ?? 0 }
+    public func warmth(for t: ResolvedTarget) -> ModelWarmth { warmth[t.id] ?? .unknown }
+    public func occupancy(for t: ResolvedTarget) -> ServerOccupancy? { occupancy[t.id] }
+    public func continuity(for t: ResolvedTarget) -> LineageAffinity? {
+        conversationLineage.map { $0.affinity(with: t.lineage) }
     }
 }
 
@@ -143,7 +161,10 @@ public struct WeightedScoreStrategy: RoutingStrategy {
             let d = context.scorer.dimensions(for: t, health: context.health(for: t),
                                               metric: context.policy.latencyMetric,
                                               candidateCount: targets.count,
-                                              promptTokens: context.promptTokens)
+                                              promptTokens: context.promptTokens,
+                                              loadUtilization: context.load(for: t),
+                                              warmth: context.warmth(for: t),
+                                              continuity: context.continuity(for: t))
             let (total, components) = d.weighted(by: weights)
             return RankedTarget(target: t, score: total, components: components)
         }
@@ -177,6 +198,9 @@ public struct WeightedScoreStrategy: RoutingStrategy {
         case "providerPreference": return "provider preference"
         case "localPreference": return "local preference"
         case "contextHeadroom": return "context headroom"
+        case "load": return "spare capacity"
+        case "warmth": return "a model already in memory"
+        case "continuity": return "conversation continuity"
         default: return key
         }
     }
@@ -303,6 +327,46 @@ public struct CloudFirstStrategy: RoutingStrategy {
     }
 }
 
+// MARK: - Load
+
+/// Ranks by spare capacity on each target's account right now, counting
+/// requests already reserved for it as well as those running.
+///
+/// Capacity is the account's own concurrency limit, so a local server allowed
+/// two requests and a hosted API allowed forty are compared by how full they
+/// are, not by raw counts. Ties go to a model that is already loaded, then to
+/// the configured order.
+public struct LeastLoadedStrategy: RoutingStrategy {
+    public let kind: RoutingStrategyKind = .leastLoaded
+    public init() {}
+
+    public func rank(_ targets: [ResolvedTarget], context: RoutingContext) -> [RankedTarget] {
+        targets.map { t -> RankedTarget in
+            let utilization = context.load(for: t)
+            let score = max(0, 1 - min(1, utilization))
+            // The server's own account of itself beats Derby's arithmetic.
+            let note: String
+            if let reported = context.occupancy(for: t) {
+                note = reported.summary
+            } else {
+                let committed = Int((utilization * Double(t.concurrencyCapacity)).rounded())
+                note = "\(committed) of \(t.concurrencyCapacity) slots in use"
+            }
+            return RankedTarget(target: t, score: score, components: ["load": score], note: note)
+        }.sorted { a, b in
+            if abs(a.score - b.score) > 1e-9 { return a.score > b.score }
+            let warmA = context.warmth(for: a.target).score, warmB = context.warmth(for: b.target).score
+            if warmA != warmB { return warmA > warmB }
+            return a.target.order < b.target.order
+        }
+    }
+
+    public func explain(_ ranked: [RankedTarget], context: RoutingContext) -> String {
+        guard let top = ranked.first else { return "No eligible targets remained after filtering." }
+        return "\(top.target.label) has the most spare capacity (\(top.note ?? "idle"))."
+    }
+}
+
 // MARK: - Registry
 
 public enum StrategyRegistry {
@@ -319,6 +383,7 @@ public enum StrategyRegistry {
         case .failoverChain: return FailoverChainStrategy()
         case .localFirst: return LocalFirstStrategy()
         case .cloudFirst: return CloudFirstStrategy()
+        case .leastLoaded: return LeastLoadedStrategy()
         }
     }
 }

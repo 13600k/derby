@@ -133,6 +133,9 @@ public struct AnthropicAdapter: ProviderAdapter {
                 /// Anthropic indexes content blocks; Derby indexes tool calls.
                 var toolIndexForBlock: [Int: Int] = [:]
                 var nextToolIndex = 0
+                /// Thinking text and signature per block, sealed on block stop.
+                var thinkingForBlock: [Int: String] = [:]
+                var signatureForBlock: [Int: String] = [:]
                 do {
                     for try await event in start.events {
                         guard let json = event.json else { continue }
@@ -146,15 +149,24 @@ public struct AnthropicAdapter: ProviderAdapter {
                         case "content_block_start":
                             let block = json["content_block"] ?? .null
                             let blockIndex = json["index"]?.intValue ?? 0
-                            if block["type"]?.stringValue == "tool_use" {
+                            switch block["type"]?.stringValue {
+                            case "tool_use":
                                 let idx = nextToolIndex
                                 nextToolIndex += 1
                                 toolIndexForBlock[blockIndex] = idx
                                 continuation.yield(.toolCallStart(index: idx,
-                                                                  id: block["id"]?.stringValue ?? "call_\(idx)",
+                                                                  id: block["id"]?.stringValue ?? "",
                                                                   name: block["name"]?.stringValue ?? ""))
-                            } else if let t = block["text"]?.stringValue, !t.isEmpty {
-                                continuation.yield(.textDelta(t))
+                            case "thinking":
+                                thinkingForBlock[blockIndex] = block["thinking"]?.stringValue ?? ""
+                                if let sig = block["signature"]?.stringValue, !sig.isEmpty { signatureForBlock[blockIndex] = sig }
+                            case "redacted_thinking":
+                                if let data = block["data"]?.stringValue, !data.isEmpty {
+                                    continuation.yield(.reasoningArtifact(
+                                        ReasoningArtifact(format: .anthropicRedactedThinking, payload: data)))
+                                }
+                            default:
+                                if let t = block["text"]?.stringValue, !t.isEmpty { continuation.yield(.textDelta(t)) }
                             }
                         case "content_block_delta":
                             let blockIndex = json["index"]?.intValue ?? 0
@@ -163,13 +175,25 @@ public struct AnthropicAdapter: ProviderAdapter {
                             case "text_delta":
                                 if let t = delta["text"]?.stringValue, !t.isEmpty { continuation.yield(.textDelta(t)) }
                             case "thinking_delta":
-                                if let t = delta["thinking"]?.stringValue, !t.isEmpty { continuation.yield(.reasoningDelta(t)) }
+                                if let t = delta["thinking"]?.stringValue, !t.isEmpty {
+                                    thinkingForBlock[blockIndex, default: ""] += t
+                                    continuation.yield(.reasoningDelta(t))
+                                }
+                            case "signature_delta":
+                                if let sig = delta["signature"]?.stringValue, !sig.isEmpty { signatureForBlock[blockIndex] = sig }
                             case "input_json_delta":
                                 if let p = delta["partial_json"]?.stringValue, !p.isEmpty {
                                     continuation.yield(.toolCallArgumentsDelta(index: toolIndexForBlock[blockIndex] ?? 0, delta: p))
                                 }
                             default:
                                 break
+                            }
+                        case "content_block_stop":
+                            let blockIndex = json["index"]?.intValue ?? 0
+                            if let sig = signatureForBlock.removeValue(forKey: blockIndex) {
+                                continuation.yield(.reasoningArtifact(ReasoningArtifact(
+                                    format: .anthropicThinking, payload: sig,
+                                    text: thinkingForBlock.removeValue(forKey: blockIndex))))
                             }
                         case "message_delta":
                             if let sr = json["delta"]?["stop_reason"]?.stringValue {
@@ -222,11 +246,17 @@ public struct AnthropicAdapter: ProviderAdapter {
                     systemBlocks.append(.object(["type": .string("text"), "text": .string(text)]))
                 }
             case .tool:
-                // Tool results are user-turn content blocks in Anthropic's shape.
+                // Tool results are user-turn content blocks in Anthropic's shape,
+                // and may carry images a tool returned.
+                let images = m.content.filter(\.isImage)
+                let resultContent: JSONValue = images.isEmpty
+                    ? .string(m.joinedText)
+                    : .array((m.joinedText.isEmpty ? [] : [.object(["type": .string("text"), "text": .string(m.joinedText)])])
+                             + images.map(encodeContent))
                 let block = JSONValue.object([
                     "type": .string("tool_result"),
                     "tool_use_id": .string(m.toolCallID ?? ""),
-                    "content": .string(m.joinedText),
+                    "content": resultContent,
                 ])
                 if var last = messages.last?.objectValue, last["role"]?.stringValue == "user",
                    var content = last["content"]?.arrayValue {
@@ -238,6 +268,21 @@ public struct AnthropicAdapter: ProviderAdapter {
                 }
             case .assistant:
                 var blocks: [JSONValue] = []
+                // Signed thinking goes back first and unmodified, exactly as the
+                // model produced it. The handoff planner leaves it here only for
+                // a Claude target within the turn that produced it.
+                for artifact in m.reasoningArtifacts {
+                    switch artifact.format {
+                    case .anthropicThinking:
+                        blocks.append(.object(["type": .string("thinking"),
+                                               "thinking": .string(artifact.text ?? ""),
+                                               "signature": .string(artifact.payload)]))
+                    case .anthropicRedactedThinking:
+                        blocks.append(.object(["type": .string("redacted_thinking"), "data": .string(artifact.payload)]))
+                    default:
+                        break
+                    }
+                }
                 let text = m.joinedText
                 if !text.isEmpty { blocks.append(.object(["type": .string("text"), "text": .string(text)])) }
                 for tc in m.toolCalls {
@@ -297,15 +342,37 @@ public struct AnthropicAdapter: ProviderAdapter {
         }
 
         if let reasoning = r.reasoning, reasoning.effort != nil || reasoning.maxTokens != nil {
-            // Extended thinking needs a token budget strictly below max_tokens.
-            let budget = reasoning.maxTokens ?? (reasoning.effort ?? .medium).thinkingBudget
-            let safeBudget = max(1024, min(budget, maxTokens - 1))
-            if safeBudget < maxTokens {
-                body["thinking"] = .object(["type": .string("enabled"),
-                                            "budget_tokens": .number(Double(safeBudget))])
-                // Anthropic rejects temperature/top_p while thinking is enabled.
+            // Thinking, in either form, cannot be combined with forced tool use.
+            let forcesTool: Bool = {
+                switch r.toolChoice { case .required?, .function?: return true; default: return false }
+            }()
+            switch Self.thinkingMode(for: model) {
+            case .adaptive:
+                // Claude 4.6 and later think adaptively and take depth as effort;
+                // 4.7 and later reject a token budget outright. Effort still
+                // applies when a forced tool keeps thinking off.
+                body["output_config"] = .object(["effort": .string(
+                    Self.adaptiveEffort(reasoning.effort ?? .high, model: model, capabilities: ctx.modelCapabilities))])
+                guard !forcesTool else { break }
+                var thinking: [String: JSONValue] = ["type": .string("adaptive")]
+                if reasoning.include { thinking["display"] = .string("summarized") }
+                body["thinking"] = .object(thinking)
                 body.removeValue(forKey: "temperature")
                 body.removeValue(forKey: "top_p")
+            case .manual:
+                // A tool loop resumed without the thinking block that started it
+                // cannot turn manual thinking on.
+                guard !forcesTool, !Self.resumesUnsignedToolLoop(r.messages) else { break }
+                // Extended thinking needs a token budget strictly below max_tokens.
+                let budget = reasoning.maxTokens ?? (reasoning.effort ?? .medium).thinkingBudget
+                let safeBudget = max(1024, min(budget, maxTokens - 1))
+                if safeBudget < maxTokens {
+                    body["thinking"] = .object(["type": .string("enabled"),
+                                                "budget_tokens": .number(Double(safeBudget))])
+                    // Anthropic rejects temperature/top_p while thinking is enabled.
+                    body.removeValue(forKey: "temperature")
+                    body.removeValue(forKey: "top_p")
+                }
             }
         }
 
@@ -314,6 +381,48 @@ public struct AnthropicAdapter: ProviderAdapter {
         var result = JSONValue.object(body)
         if let ext = r.providerExtensions["anthropic"] { result = result.merging(ext) }
         return result
+    }
+
+    enum ThinkingMode { case adaptive, manual }
+
+    /// Claude 4.6 onward (and every Fable and Mythos model) uses adaptive
+    /// thinking; earlier models only a manual budget. An id Derby cannot place
+    /// keeps the manual form it always used.
+    static func thinkingMode(for model: String) -> ThinkingMode {
+        let lineage = ModelLineage.parse(model)
+        guard lineage.family == "claude" else { return .manual }
+        if let tier = lineage.tier, tier.contains("fable") || tier.contains("mythos") { return .adaptive }
+        guard let version = lineage.numericVersion else { return .manual }
+        return version >= 4.6 ? .adaptive : .manual
+    }
+
+    /// Derby's effort scale mapped onto the levels a Claude model accepts.
+    static func adaptiveEffort(_ effort: ReasoningEffort, model: String, capabilities: ModelCapabilities?) -> String {
+        let accepted: Set<String> = ["low", "medium", "high", "xhigh", "max"]
+        if capabilities?.supportedReasoningEfforts != nil, let clamped = capabilities?.clampEffort(effort),
+           accepted.contains(clamped) {
+            return clamped
+        }
+        let lineage = ModelLineage.parse(model)
+        let newest = (lineage.tier.map { $0.contains("fable") || $0.contains("mythos") } ?? false)
+            || (lineage.numericVersion ?? 0) >= 4.7
+        switch effort {
+        case .minimal, .low: return "low"
+        case .medium: return "medium"
+        case .high: return "high"
+        case .xhigh: return newest ? "xhigh" : "high"
+        case .max, .ultra: return "max"
+        }
+    }
+
+    /// The request answers tool calls from an assistant turn that carries no
+    /// signed thinking — made with thinking off, or by another model.
+    static func resumesUnsignedToolLoop(_ messages: [CanonicalMessage]) -> Bool {
+        guard messages.last?.role == .tool,
+              let assistant = messages.last(where: { $0.role == .assistant }) else { return false }
+        return !assistant.reasoningArtifacts.contains {
+            $0.format == .anthropicThinking || $0.format == .anthropicRedactedThinking
+        }
     }
 
     private func encodeContent(_ c: CanonicalContent) -> JSONValue {
@@ -345,21 +454,31 @@ public struct AnthropicAdapter: ProviderAdapter {
         var content: [CanonicalContent] = []
         var toolCalls: [CanonicalToolCall] = []
         var reasoning = ""
+        var artifacts: [ReasoningArtifact] = []
         for block in json["content"]?.arrayValue ?? [] {
             switch block["type"]?.stringValue {
             case "text":
                 if let t = block["text"]?.stringValue { content.append(.text(t)) }
             case "thinking":
                 if let t = block["thinking"]?.stringValue { reasoning += t }
+                if let sig = block["signature"]?.stringValue, !sig.isEmpty {
+                    artifacts.append(ReasoningArtifact(format: .anthropicThinking, payload: sig,
+                                                       text: block["thinking"]?.stringValue))
+                }
+            case "redacted_thinking":
+                if let data = block["data"]?.stringValue, !data.isEmpty {
+                    artifacts.append(ReasoningArtifact(format: .anthropicRedactedThinking, payload: data))
+                }
             case "tool_use":
-                toolCalls.append(CanonicalToolCall(id: block["id"]?.stringValue ?? "call_\(toolCalls.count)",
+                toolCalls.append(CanonicalToolCall(id: block["id"]?.stringValue ?? "",
                                                    name: block["name"]?.stringValue ?? "",
                                                    argumentsJSON: (block["input"] ?? .object([:])).compactJSONString))
             default: break
             }
         }
         let message = CanonicalMessage(role: .assistant, content: content, toolCalls: toolCalls,
-                                       reasoning: reasoning.isEmpty ? nil : reasoning)
+                                       reasoning: reasoning.isEmpty ? nil : reasoning,
+                                       reasoningArtifacts: artifacts)
         return CanonicalResponse(id: json["id"]?.stringValue ?? IDGenerator.requestID(),
                                  model: json["model"]?.stringValue ?? fallbackModel,
                                  message: message,

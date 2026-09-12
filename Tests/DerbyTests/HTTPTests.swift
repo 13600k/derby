@@ -1,4 +1,5 @@
 import Foundation
+import Network
 @testable import DerbyCore
 
 func registerHTTPTests() {
@@ -144,6 +145,70 @@ func registerHTTPTests() {
                 try expectEqual((ok as? HTTPURLResponse)?.statusCode, 200)
             }
         }
+
+        // A client that gives up must not leave a model generating for nobody.
+
+        test("a client that disconnects cancels the answer it was waiting for") {
+            let probe = Probe()
+            try await withServer({ _ in
+                await probe.mark("started")
+                do {
+                    try await Task.sleep(nanoseconds: 10_000_000_000)
+                    await probe.mark("finished")
+                } catch {
+                    await probe.mark("cancelled")
+                }
+                return .json(200, .object([:]))
+            }) { port in
+                let client = RawHTTPClient(port: port)
+                client.send("POST /v1/chat/completions HTTP/1.1\r\nhost: localhost\r\ncontent-length: 2\r\n\r\n{}")
+                try await eventually("the handler starts") { await probe.has("started") }
+                client.close()
+                try await eventually("the handler is cancelled") { await probe.has("cancelled") }
+            }
+        }
+
+        test("a client that disconnects before the first streamed byte stops the stream") {
+            let probe = Probe()
+            try await withServer({ _ in
+                .sse { writer in
+                    await probe.mark("started")
+                    do {
+                        try await Task.sleep(nanoseconds: 10_000_000_000)
+                        try? await writer.writeSSE(data: "{}")
+                    } catch {
+                        await probe.mark("cancelled")
+                    }
+                    await writer.finish()
+                }
+            }) { port in
+                let client = RawHTTPClient(port: port)
+                client.send("POST /v1/chat/completions HTTP/1.1\r\nhost: localhost\r\ncontent-length: 2\r\n\r\n{}")
+                try await eventually("the stream starts") { await probe.has("started") }
+                client.close()
+                try await eventually("the stream is cancelled") { await probe.has("cancelled") }
+            }
+        }
+
+        test("a request that arrives while another is being answered waits its turn") {
+            let probe = Probe()
+            try await withServer({ request in
+                guard request.head.path == "/slow" else { return .json(200, .object(["answer": .string("second-answer")])) }
+                await probe.mark("slow")
+                try? await Task.sleep(nanoseconds: 200_000_000)
+                return .json(200, .object(["answer": .string("first-answer")]))
+            }) { port in
+                let client = RawHTTPClient(port: port)
+                client.send("GET /slow HTTP/1.1\r\nhost: localhost\r\n\r\n")
+                try await eventually("the slow answer is underway") { await probe.has("slow") }
+                client.send("GET /fast HTTP/1.1\r\nhost: localhost\r\n\r\n")
+                let text = await client.read(within: 5) { $0.contains("first-answer") && $0.contains("second-answer") }
+                client.close()
+                let first = try expectNotNil(text.range(of: "first-answer"), "got: \(text)")
+                let second = try expectNotNil(text.range(of: "second-answer"), "got: \(text)")
+                try expect(first.lowerBound < second.lowerBound, "answers keep request order")
+            }
+        }
     }
 
     suite("HTTP / redaction") {
@@ -186,4 +251,52 @@ actor Captured {
 actor Counter {
     var value = 0
     func increment() { value += 1 }
+}
+
+/// Records that named moments happened, for tests that wait on them.
+actor Probe {
+    private var marks: Set<String> = []
+    func mark(_ name: String) { marks.insert(name) }
+    func has(_ name: String) -> Bool { marks.contains(name) }
+}
+
+/// A bare TCP client, so a test decides exactly when the connection goes away.
+final class RawHTTPClient: @unchecked Sendable {
+    private let connection: NWConnection
+    private let queue = DispatchQueue(label: "com.derby.tests.raw-client")
+
+    init(port: Int) {
+        connection = NWConnection(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: UInt16(port))!, using: .tcp)
+        connection.start(queue: queue)
+    }
+
+    func send(_ text: String) {
+        connection.send(content: Data(text.utf8), completion: .contentProcessed { _ in })
+    }
+
+    /// Reads until `done` accepts what has arrived, the server closes, or
+    /// `seconds` pass — whichever comes first.
+    func read(within seconds: Double, until done: @escaping @Sendable (String) -> Bool) async -> String {
+        let deadline = DispatchTime.now() + seconds
+        var received = Data()
+        while !done(String(decoding: received, as: UTF8.self)) {
+            let chunk: Data? = await withCheckedContinuation { cont in
+                let resumed = AtomicFlag()
+                // The deadline resolves the same continuation rather than racing
+                // a sleep against it.
+                queue.asyncAfter(deadline: deadline) {
+                    if resumed.trySet() { cont.resume(returning: nil) }
+                }
+                connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { data, _, _, _ in
+                    guard resumed.trySet() else { return }
+                    cont.resume(returning: data?.isEmpty == false ? data : nil)
+                }
+            }
+            guard let chunk else { break }
+            received.append(chunk)
+        }
+        return String(decoding: received, as: UTF8.self)
+    }
+
+    func close() { connection.cancel() }
 }

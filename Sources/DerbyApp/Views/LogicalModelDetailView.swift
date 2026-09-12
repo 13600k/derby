@@ -65,6 +65,7 @@ struct LogicalModelDetailView: View {
                 targetsCard(lm)
                 if lm.policy.strategy.usesScoreWeights { weightsCard(lm) }
                 compactionCard(lm)
+                handoffCard(lm)
                 reliabilityCard(lm)
                 dispositionCard(lm)
                 defaultsCard(lm)
@@ -158,6 +159,35 @@ struct LogicalModelDetailView: View {
                           systemImage: "info.circle")
                         .font(.caption).foregroundStyle(.secondary)
                 }
+            }
+        }
+    }
+
+    /// What the next model receives when the one answering changes.
+    ///
+    /// Structure is always adapted — that only prevents rejections, so there is
+    /// nothing to choose. Reasoning is the choice, and it only ever goes to the
+    /// same lineage.
+    private func handoffCard(_ lm: LogicalModel) -> some View {
+        Card(title: "When the conversation changes model",
+             subtitle: "What the next model receives from the one before it",
+             systemImage: "arrow.left.arrow.right") {
+            VStack(alignment: .leading, spacing: 12) {
+                Toggle("Carry reasoning to a model of the same lineage", isOn: Binding(
+                    get: { (draft?.handoff ?? current?.handoff ?? .default).replayReasoning },
+                    set: { on in
+                        var policy = draft?.handoff ?? .default
+                        policy.replayReasoning = on
+                        draft?.handoff = policy
+                        save()
+                    }))
+                Text("When a tool loop continues on the same weights — the same model at another quantization, or on another server — or on the same provider's API, it picks up the previous step's reasoning where it stopped. Reasoning is never sent to a different model family, which would read it as something the assistant said.")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Label("Structure is always adapted to the model answering — tool call ids, system messages, turn order, tool results — and every response that changed model reports what it carried in x_derby.handoff and request history.",
+                      systemImage: "info.circle")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }
@@ -367,6 +397,18 @@ struct LogicalModelDetailView: View {
                         .onChange(of: lm.policy.respectCircuitBreakers) { _, _ in save() }
                     Toggle("Skip rate-limited targets", isOn: binding(\.policy.respectQuotas))
                         .onChange(of: lm.policy.respectQuotas) { _, _ in save() }
+                }
+                VStack(alignment: .leading, spacing: 3) {
+                    Toggle("Prefer a copy of the model that is already loaded", isOn: Binding(
+                        get: { (draft ?? lm).policy.effectivePreferWarmModels },
+                        set: { on in
+                            draft?.policy.preferWarmModels = on
+                            save()
+                        }))
+                    Text(lm.policy.strategy.respectsConfiguredOrder && lm.policy.preferWarmModels == nil
+                         ? "Off by default for this strategy, which follows the order you set."
+                         : "When two targets serve the same model, the one a local server already holds in memory goes first, so the answer does not wait on a cold load.")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
                 HStack(spacing: 16) {
                     NumberField(label: "Max candidates per request",

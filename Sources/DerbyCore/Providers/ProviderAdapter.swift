@@ -127,6 +127,14 @@ public protocol ProviderAdapter: Sendable {
     /// A cheap liveness/credential check used by the UI and the health subsystem.
     func healthCheck(_ ctx: ProviderContext) async -> ConnectionTestResult
 
+    /// Models the server currently holds in memory, for servers that say.
+    /// Nil when this server does not report it.
+    func loadedModels(_ ctx: ProviderContext) async throws -> Set<String>?
+
+    /// What the server says it is working on right now — busy slots, queued
+    /// requests, KV cache use. Nil when this server does not report it.
+    func occupancy(_ ctx: ProviderContext) async throws -> ServerOccupancy?
+
     /// Normalize a provider failure into Derby's taxonomy.
     func classifyError(status: Int, headers: [String: String], body: Data, model: String) -> DerbyError
 
@@ -154,6 +162,10 @@ extension ProviderAdapter {
     public func rateLimitSnapshot(from headers: [String: String]) -> RateLimitSnapshot? {
         RateLimitSnapshot.parseStandardHeaders(headers)
     }
+
+    public func loadedModels(_ ctx: ProviderContext) async throws -> Set<String>? { nil }
+
+    public func occupancy(_ ctx: ProviderContext) async throws -> ServerOccupancy? { nil }
 
     /// Default health check: list models, which exercises both connectivity and
     /// credentials without spending tokens.

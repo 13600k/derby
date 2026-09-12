@@ -36,6 +36,8 @@ public struct AttemptRecord: Sendable, Codable, Identifiable, Hashable {
     public var routingScore: Double?
     /// Set when the conversation had to be shortened to fit this target.
     public var compaction: CompactionRecord?
+    /// How the conversation was carried to this target.
+    public var handoff: HandoffRecord?
 
     public init(id: String, index: Int, providerID: UUID, providerName: String, providerKind: String,
                 modelID: String, targetLabel: String, status: AttemptStatus, startedAt: Date,
@@ -43,7 +45,8 @@ public struct AttemptRecord: Sendable, Codable, Identifiable, Hashable {
                 failureKind: FailureKind? = nil, errorMessage: String? = nil, retryCount: Int = 0,
                 usage: CanonicalUsage = .zero, costUSD: Double = 0,
                 circuitState: CircuitState = .closed, routingScore: Double? = nil,
-                compaction: CompactionRecord? = nil) {
+                compaction: CompactionRecord? = nil, handoff: HandoffRecord? = nil) {
+        self.handoff = handoff
         self.id = id; self.index = index; self.providerID = providerID
         self.providerName = providerName; self.providerKind = providerKind
         self.modelID = modelID; self.targetLabel = targetLabel; self.status = status
@@ -62,6 +65,7 @@ public struct AttemptRecord: Sendable, Codable, Identifiable, Hashable {
         if let http = httpStatus { s += " (HTTP \(http))" }
         if let t = timeToFirstTokenSeconds { s += "\n   TTFT: \(t.msString)" }
         if let c = compaction { s += "\n   \(c.summary)" }
+        if let h = handoff, h.isNotable { s += "\n   Handoff: \(h.summary)" }
         s += "\n   Total: \(durationSeconds.msString)"
         return s
     }
@@ -105,6 +109,9 @@ public struct RequestRecord: Sendable, Codable, Identifiable, Hashable {
     /// it. Nil whenever the client's messages were passed through untouched,
     /// which is the default and the overwhelmingly common case.
     public var compaction: CompactionRecord?
+    /// How the conversation was carried to the model that answered. Nil when
+    /// no attempt ran.
+    public var handoff: HandoffRecord?
 
     public init(id: String = IDGenerator.requestID(), createdAt: Date = Date(),
                 logicalModel: String = "", requestedModel: String = "", clientName: String = "unknown",
@@ -148,6 +155,11 @@ public struct RequestRecord: Sendable, Codable, Identifiable, Hashable {
         if let c = compaction {
             lines.append("Context Compaction:")
             lines.append(c.summary)
+            lines.append("")
+        }
+        if let h = handoff, h.isNotable {
+            lines.append("Conversation Handoff:")
+            lines.append(h.summary)
             lines.append("")
         }
         lines.append("Routing Reason:")

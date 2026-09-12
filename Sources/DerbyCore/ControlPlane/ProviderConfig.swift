@@ -163,6 +163,25 @@ public enum ProviderKind: String, Codable, Sendable, CaseIterable, Hashable {
         if self == .openAICompatible { return .custom }
         return .api
     }
+
+    /// Assistant-message fields this server reads prior reasoning back from.
+    /// Empty when it reads none — sending an unknown field to a strict endpoint
+    /// fails the whole request, so only servers known to accept one get it.
+    public var reasoningReplayFields: [String] {
+        switch self {
+        case .ollama: return ["reasoning"]
+        case .vllm, .sglang: return ["reasoning", "reasoning_content"]
+        case .llamaCpp, .lmStudio, .deepseek: return ["reasoning_content"]
+        default: return []
+        }
+    }
+
+    /// Whether the endpoint understands OpenAI's `developer` role. Protocols
+    /// that hoist instructions do so themselves; other OpenAI-compatible servers
+    /// only know `system`.
+    public var acceptsDeveloperRole: Bool {
+        adapterFamily != .openai || self == .openai || self == .azureOpenAI || self == .openrouter
+    }
 }
 
 /// How a provider kind treats an API key.
@@ -201,6 +220,27 @@ public enum AdapterFamily: String, Codable, Sendable, CaseIterable {
     case chatgptCodex = "chatgpt_codex", bedrock
     /// Spawns a local CLI rather than calling an HTTP endpoint.
     case claudeCLI = "claude_cli"
+
+    /// Opaque reasoning this protocol can hand back to its provider.
+    public var reasoningArtifactFormats: Set<ReasoningArtifact.Format> {
+        switch self {
+        case .anthropic, .anthropicOAuth, .bedrock: return [.anthropicThinking, .anthropicRedactedThinking]
+        case .google: return [.geminiThoughtSignature]
+        case .chatgptCodex: return [.openAIEncryptedReasoning]
+        case .openai, .claudeCLI: return []
+        }
+    }
+
+    /// Whether a tool result may contain images on this protocol.
+    public var toolResultsAcceptImages: Bool {
+        self == .anthropic || self == .anthropicOAuth || self == .bedrock
+    }
+
+    /// Anthropic and Bedrock accept tool call ids matching `^[a-zA-Z0-9_-]{1,64}$`
+    /// only; an id minted by another provider can fall outside it.
+    public var restrictsToolCallIDAlphabet: Bool {
+        self == .anthropic || self == .anthropicOAuth || self == .bedrock
+    }
 }
 
 public enum CLICredentialSource: String, Codable, Sendable, CaseIterable {

@@ -85,6 +85,75 @@ public struct CanonicalToolCall: Codable, Sendable, Hashable, Identifiable {
     public var argumentsValue: JSONValue { JSONValue.parse(argumentsJSON) ?? .object([:]) }
 }
 
+/// Reasoning a provider handed back in a form only it can read: a signature
+/// over Claude's thinking, an encrypted OpenAI reasoning item, a Gemini thought
+/// signature.
+///
+/// Chat Completions has nowhere to carry these, so a client talking to Derby
+/// never sends them back. `HandoffLedger` keeps them instead and restores them
+/// when the same lineage continues the conversation — without them a tool loop
+/// on those APIs loses the reasoning that chose the tool, and Gemini 3 refuses
+/// the call outright.
+public struct ReasoningArtifact: Codable, Sendable, Hashable {
+    public enum Format: String, Codable, Sendable, Hashable, CaseIterable {
+        /// A `thinking` block: summarized (or empty) text plus its signature.
+        case anthropicThinking = "anthropic_thinking"
+        /// A `redacted_thinking` block, all of it encrypted.
+        case anthropicRedactedThinking = "anthropic_redacted_thinking"
+        /// A Responses API `reasoning` item with `encrypted_content`.
+        case openAIEncryptedReasoning = "openai_encrypted_reasoning"
+        /// A `thoughtSignature` attached to a Gemini content part.
+        case geminiThoughtSignature = "gemini_thought_signature"
+    }
+
+    /// Google's documented stand-in for a function call Gemini did not write.
+    public static let geminiUnsignedCallSentinel = "skip_thought_signature_validator"
+
+    public var format: Format
+    /// The opaque value: signature, redacted data, encrypted content.
+    public var payload: String
+    /// Readable reasoning the payload covers, when the provider showed any.
+    public var text: String?
+    /// The provider's own id for the item (`rs_…`).
+    public var itemID: String?
+    /// For Gemini, the function call whose part carried the signature.
+    public var toolCallID: String?
+    /// Reasoning summary parts, for formats that have them.
+    public var summaries: [String]?
+    /// Model and account that issued it. Encrypted reasoning is only readable
+    /// by the account that received it.
+    public var originModel: String?
+    public var originAccount: UUID?
+
+    public init(format: Format, payload: String, text: String? = nil, itemID: String? = nil,
+                toolCallID: String? = nil, summaries: [String]? = nil,
+                originModel: String? = nil, originAccount: UUID? = nil) {
+        self.format = format; self.payload = payload; self.text = text; self.itemID = itemID
+        self.toolCallID = toolCallID; self.summaries = summaries
+        self.originModel = originModel; self.originAccount = originAccount
+    }
+
+    /// Rough memory footprint, for the ledger's budget.
+    public var byteCount: Int {
+        payload.utf8.count + (text?.utf8.count ?? 0)
+            + (summaries?.reduce(0) { $0 + $1.utf8.count } ?? 0) + 64
+    }
+}
+
+/// The model that wrote an assistant message, when Derby knows.
+public struct MessageOrigin: Codable, Sendable, Hashable {
+    public var modelID: String
+    /// `ProviderKind.rawValue` of the account that served it.
+    public var providerKind: String
+    public var accountID: UUID?
+    public var lineage: ModelLineage
+
+    public init(modelID: String, providerKind: String, accountID: UUID? = nil, lineage: ModelLineage? = nil) {
+        self.modelID = modelID; self.providerKind = providerKind; self.accountID = accountID
+        self.lineage = lineage ?? ModelLineage.parse(modelID)
+    }
+}
+
 public struct CanonicalMessage: Codable, Sendable, Hashable {
     public var role: CanonicalRole
     public var content: [CanonicalContent]
@@ -94,15 +163,46 @@ public struct CanonicalMessage: Codable, Sendable, Hashable {
     public var toolCallID: String?
     /// Assistant reasoning/thinking text, when a provider exposes it.
     public var reasoning: String?
+    /// Opaque reasoning only the issuing provider can read back.
+    public var reasoningArtifacts: [ReasoningArtifact]
+    /// Which model wrote this message. Set on history by `HandoffLedger` and
+    /// read by the handoff planner; never sent to a provider.
+    public var origin: MessageOrigin?
 
     public init(role: CanonicalRole,
                 content: [CanonicalContent] = [],
                 name: String? = nil,
                 toolCalls: [CanonicalToolCall] = [],
                 toolCallID: String? = nil,
-                reasoning: String? = nil) {
+                reasoning: String? = nil,
+                reasoningArtifacts: [ReasoningArtifact] = [],
+                origin: MessageOrigin? = nil) {
         self.role = role; self.content = content; self.name = name
         self.toolCalls = toolCalls; self.toolCallID = toolCallID; self.reasoning = reasoning
+        self.reasoningArtifacts = reasoningArtifacts; self.origin = origin
+    }
+
+    // Field by field, so a message encoded before a field existed still decodes.
+    private enum CodingKeys: String, CodingKey {
+        case role, content, name, toolCalls, toolCallID, reasoning, reasoningArtifacts, origin
+    }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        role = try c.decodeIfPresent(CanonicalRole.self, forKey: .role) ?? .user
+        content = try c.decodeIfPresent([CanonicalContent].self, forKey: .content) ?? []
+        name = try c.decodeIfPresent(String.self, forKey: .name)
+        toolCalls = try c.decodeIfPresent([CanonicalToolCall].self, forKey: .toolCalls) ?? []
+        toolCallID = try c.decodeIfPresent(String.self, forKey: .toolCallID)
+        reasoning = try c.decodeIfPresent(String.self, forKey: .reasoning)
+        reasoningArtifacts = try c.decodeIfPresent([ReasoningArtifact].self, forKey: .reasoningArtifacts) ?? []
+        origin = try c.decodeIfPresent(MessageOrigin.self, forKey: .origin)
+    }
+
+    /// True when there is nothing a provider could render: no text, no media,
+    /// no tool calls.
+    public var isEmptyAssistantTurn: Bool {
+        role == .assistant && toolCalls.isEmpty
+            && content.allSatisfy { $0.textValue?.isEmpty ?? false }
     }
 
     public static func user(_ text: String) -> CanonicalMessage { .init(role: .user, content: [.text(text)]) }

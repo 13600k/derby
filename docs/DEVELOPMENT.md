@@ -49,7 +49,7 @@ Assertions: `expect`, `expectEqual`, `expectClose`, `expectNotNil`, `expectNil`,
 
 ## Test coverage
 
-195 tests, no network access required. Provider behaviour is exercised through `MockTransport`
+453 tests, no network access required. Provider behaviour is exercised through `MockTransport`
 (scripted HTTP with real provider payloads) and `MockAdapter` (scripted successes, failures,
 delays and hangs). The HTTP and end-to-end suites boot the **real** `Network.framework`
 listener on an ephemeral port and drive it with `URLSession`.
@@ -59,13 +59,28 @@ listener on an ephemeral port and drive it with `URLSession`.
 | Canonical | request normalization (chat, Responses, embeddings), multimodal, tools, stream accumulation, cost |
 | Capabilities | flags, requirements, overrides, catalog lookups and safe degradation |
 | Routing | resolution, every filter stage, candidate caps, plan shape, explanations |
-| Strategies | all nine strategies, weight normalization, distribution, per-model independence |
+| Strategies | all ten strategies, weight normalization, distribution, per-model independence |
 | Execution | retry vs failover, dispositions, deadlines, streaming semantics, hedging, concurrency, usage estimation |
 | Reliability | rolling stats, circuit lifecycle, admission control, rate-limit header parsing |
 | Providers | OpenAI/Anthropic/Google body shaping and parsing, error classification, Azure, SigV4, event-stream framing |
-| HTTP | SSE parsing at byte granularity, real server: keep-alive, concurrency, chunked SSE, oversized bodies |
+| HTTP | SSE parsing at byte granularity, real server: keep-alive, concurrency, chunked SSE, oversized bodies, client disconnects, pipelining |
+| Handoff | model lineage, think-tag splitting, conversation repair, per-target planning, the answer ledger, each adapter's reasoning artifacts, GPT → Qwen and FP8 → Q4_K_M through the executor |
+| Load | least loaded, reservations, warm copies, continuity, loaded-model discovery, server occupancy (vLLM/SGLang metrics, llama.cpp slots), saved-settings compatibility, a burst through the real gateway |
 | Persistence | full config round-trip, corruption recovery, migration, export/import, Keychain, SQLite |
 | End to end | HTTP → routing → mock provider → OpenAI response, streaming, failover, circuits, auth, restart |
+
+### Checking against real providers
+
+```bash
+DERBY_LIVE=1 swift run DerbyTests Live
+```
+
+An opt-in suite that talks to whatever this machine has configured. It reads the installed
+configuration, works from a **copy**, and runs its own gateway on an ephemeral port, so a
+running Derby and its config are untouched; groups whose provider is missing are skipped, not
+failed. A spy wraps the real transport, so the hand-off checks assert on what actually goes
+over the wire to each model rather than on Derby's own report of it. Everything else must keep
+passing with no network at all, which is why it is off by default.
 
 ## Adding things
 
@@ -107,6 +122,16 @@ public struct MyStrategy: RoutingStrategy {
 Add the enum case (with `displayName` and `summary`, which the UI renders automatically) and
 one line in `StrategyRegistry`. The executor and every adapter are untouched. `explain` is
 not optional in spirit — it is what the user reads in request history.
+
+### A model family's hand-off rules
+
+Teach `ModelLineage.parse` the family's naming (its prefix table), then declare what its chat
+template does in `LineageTraits.for(_:)`: whether it writes `<think>` inline or starts inside
+one, which earlier turns it reads reasoning back for, the switch that turns thinking on, and
+any structural demand — tool call id format, where system messages may go, strict role
+alternation. `HandoffPlanner` reads those traits; routing, execution and the adapters are
+untouched. A trait is a claim about a template, so take it from the template itself or the
+vendor's documentation, and pin it with a `Handoff / planning` test.
 
 ### A config schema change
 

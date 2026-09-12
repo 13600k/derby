@@ -91,6 +91,8 @@ public struct TargetHealth: Sendable, Codable {
     public var circuitOpenedAt: Date?
     public var circuitReopensAt: Date?
     public var inFlight: Int
+    /// Requests routed here that have not been dispatched yet.
+    public var reserved: Int
     public var rateLimit: RateLimitSnapshot?
     public var requestsToday: Int
     public var costTodayUSD: Double
@@ -101,7 +103,7 @@ public struct TargetHealth: Sendable, Codable {
         state = .unknown; circuit = .closed
         successes = 0; failures = 0; consecutiveFailures = 0
         errorRate = 0; rate429 = 0; rate5xx = 0
-        inFlight = 0; requestsToday = 0; costTodayUSD = 0; costMonthUSD = 0
+        inFlight = 0; reserved = 0; requestsToday = 0; costTodayUSD = 0; costMonthUSD = 0
     }
 
     public var totalSamples: Int { successes + failures }
@@ -162,6 +164,36 @@ public actor HealthRegistry {
     private var accountInFlight: [UUID: Int] = [:]
     private var accountLimits: [UUID: Int] = [:]
     private var version: UInt64 = 0
+
+    /// A slot claimed at routing time, before the request is dispatched.
+    ///
+    /// Requests that arrive together all read the same in-flight counts, so a
+    /// load-aware ranking would send the whole burst to one target. Claiming the
+    /// chosen target the moment it is chosen — and making the claim fail if the
+    /// counts moved since they were read — spreads the burst instead.
+    public struct LoadReservation: Sendable, Hashable {
+        public let id: UUID
+        public let key: TargetKey
+        public let accountID: UUID
+    }
+
+    /// Committed work on one account.
+    public struct AccountLoad: Sendable, Hashable {
+        public var inFlight: Int = 0
+        public var reserved: Int = 0
+        public init(inFlight: Int = 0, reserved: Int = 0) { self.inFlight = inFlight; self.reserved = reserved }
+    }
+
+    private struct Hold {
+        var reservation: LoadReservation
+        var createdAt: Double
+    }
+    private var holds: [UUID: Hold] = [:]
+    /// Moves whenever in-flight or reserved counts change.
+    private var loadVersion: UInt64 = 0
+    /// A reservation whose request never started — it failed before dispatch —
+    /// stops counting after this long.
+    static let reservationLifetime: Double = 15
 
     public init(settings: HealthSettings = .default) {
         self.settings = settings
@@ -303,14 +335,19 @@ public actor HealthRegistry {
         return .allowed
     }
 
-    /// Reserves a slot. Balanced by `release`.
-    public func acquire(_ key: TargetKey, accountID: UUID) {
+    /// Reserves a slot. Balanced by `release`. A reservation made for this
+    /// target at routing time becomes this in-flight request.
+    public func acquire(_ key: TargetKey, accountID: UUID, converting reservation: LoadReservation? = nil) {
+        // A reservation becoming its own request leaves the account's total
+        // unchanged, so it keeps the load version and fails nobody's claim.
+        let converted = reservation.map { $0.key == key && holds.removeValue(forKey: $0.id) != nil } ?? false
         var s = states[key] ?? TargetState()
         s.inFlight += 1
         if s.circuit == .halfOpen { s.halfOpenProbes += 1 }
         states[key] = s
         accountInFlight[accountID, default: 0] += 1
         version &+= 1
+        if !converted { loadVersion &+= 1 }
     }
 
     public func release(_ key: TargetKey, accountID: UUID) {
@@ -321,6 +358,54 @@ public actor HealthRegistry {
         }
         if let v = accountInFlight[accountID] { accountInFlight[accountID] = max(0, v - 1) }
         version &+= 1
+        loadVersion &+= 1
+    }
+
+    // MARK: - Load reservations
+
+    /// Claims `key` for a request about to be dispatched.
+    ///
+    /// With `ifLoadVersion`, the claim succeeds only if no load changed since
+    /// that version was read — otherwise the caller's ranking is stale and it
+    /// should route again. Without it, the claim always succeeds.
+    public func reserve(_ key: TargetKey, accountID: UUID, ifLoadVersion expected: UInt64? = nil) -> LoadReservation? {
+        purgeExpiredHolds()
+        if let expected, expected != loadVersion { return nil }
+        let reservation = LoadReservation(id: UUID(), key: key, accountID: accountID)
+        holds[reservation.id] = Hold(reservation: reservation, createdAt: Clock.monotonic)
+        loadVersion &+= 1
+        version &+= 1
+        return reservation
+    }
+
+    /// Gives back a reservation that was never dispatched. Safe to call for one
+    /// that was already converted.
+    public func release(_ reservation: LoadReservation) {
+        guard holds.removeValue(forKey: reservation.id) != nil else { return }
+        loadVersion &+= 1
+        version &+= 1
+    }
+
+    /// Health plus the load it was read alongside, in one hop so the two agree.
+    public func snapshotWithLoad() -> (health: [TargetKey: TargetHealth], accountLoad: [UUID: AccountLoad],
+                                       loadVersion: UInt64) {
+        (snapshot(), accountLoad(), loadVersion)
+    }
+
+    public func accountLoad() -> [UUID: AccountLoad] {
+        purgeExpiredHolds()
+        var out: [UUID: AccountLoad] = [:]
+        for (account, count) in accountInFlight where count > 0 { out[account, default: AccountLoad()].inFlight = count }
+        for hold in holds.values { out[hold.reservation.accountID, default: AccountLoad()].reserved += 1 }
+        return out
+    }
+
+    private func purgeExpiredHolds() {
+        let cutoff = Clock.monotonic - Self.reservationLifetime
+        let expired = holds.filter { $0.value.createdAt < cutoff }.map(\.key)
+        guard !expired.isEmpty else { return }
+        for id in expired { holds.removeValue(forKey: id) }
+        loadVersion &+= 1
     }
 
     // MARK: - Manual control
@@ -392,6 +477,7 @@ public actor HealthRegistry {
             h.circuitReopensAt = Date().addingTimeInterval(max(0, mono - Clock.monotonic))
         }
         h.inFlight = s.inFlight
+        h.reserved = holds.values.filter { $0.reservation.key == key }.count
         h.rateLimit = s.rateLimit
         var q = s.quota
         q.rollIfNeeded()

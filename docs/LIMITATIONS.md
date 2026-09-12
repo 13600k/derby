@@ -59,6 +59,51 @@ for your provider's billing page.
 Daily and monthly budget caps are enforced per target from Derby's own counters, which reset
 when Derby is not running.
 
+## Handing conversations between models
+
+- **Recent answers are remembered in memory only.** A Chat Completions client drops reasoning
+  and never says which model wrote a turn; Derby restores both from its own recent answers —
+  the last 6 hours, up to 4,096 of them. After a restart, or for turns another gateway
+  produced, that history is unattributed: its reasoning cannot be restored and signed
+  reasoning is not replayed. The conversation itself is unaffected.
+- **Reasoning never crosses model families**, by design. A tool loop that moves from one
+  family to another continues without the first model's reasoning, and the response reports
+  it as withheld.
+- **Lineage comes from the model id.** A fine-tune or alias whose id does not name its family
+  is `unknown`: its reasoning is withheld, and it is never treated as a copy of another model.
+- **Verified live** (2026-09-11) against a vLLM server running Qwen3.8-27B-FP8, a local Ollama
+  and a ChatGPT subscription: reasoning carried between turns of one model and between two
+  accounts serving the same weights; reasoning withheld across releases (qwen3.8 → qwen3.6) and
+  across families (GPT → Qwen) with the conversation itself intact; Codex encrypted reasoning
+  captured and handed back ahead of the call it led to, for a client that never saw it. Re-run
+  it with `DERBY_LIVE=1 swift run DerbyTests Live`.
+- **Still unverified live:** Anthropic and Bedrock signed-thinking replay, Gemini 3 thought
+  signatures and their stand-in, Mistral's nine-character tool call ids, and the loaded-model
+  endpoints of LM Studio, llama.cpp and SGLang. Those are built from the providers'
+  documentation and tested against stubbed payloads only.
+- **A provider only hands back what it issued.** A model that answers a turn without reasoning
+  leaves nothing to carry, and `x_derby.handoff` then reports nothing withheld — because
+  nothing was. Observed live: the same model reasons on a question that needs it and skips it
+  on one that does not.
+
+## Load awareness
+
+- **Load is what Derby sent, unless the server says otherwise.** In-flight counts cover only
+  requests made through this Derby. vLLM, SGLang and llama.cpp also publish their own queue
+  depth and cache pressure, which Derby reads and believes when it is the worse number; for
+  Ollama, LM Studio, LocalAI and hosted APIs no such report exists, so another client's traffic
+  on those is invisible.
+- **Loaded-model reports** come from Ollama, LM Studio, vLLM, SGLang and llama.cpp. LocalAI
+  reports nothing, and a custom OpenAI-compatible endpoint is treated as hosted — always
+  ready — even when it runs on this machine.
+- **A server added as a *custom* endpoint opts out of all three server-specific behaviours**:
+  loaded-model polling, reasoning replay fields and thinking switches. Derby will not guess
+  what is behind a custom URL. Add a local server by its own kind (vLLM, Ollama, LM Studio,
+  llama.cpp, SGLang) to get them.
+- **A client that half-closes its socket after sending a request** is treated as gone, and the
+  request is cancelled. Ordinary HTTP clients never do this; nginx treats it the same way by
+  default.
+
 ## Not implemented
 
 - **Audio and image *output*.** Audio input is modelled and passed through where a provider

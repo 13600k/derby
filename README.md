@@ -179,12 +179,19 @@ Every logical model picks one, independently:
 | **Priority** | Exactly the order you arranged |
 | **Failover chain** | Strict sequence; never runs targets in parallel |
 | **Weighted random** | Splits traffic by weight; the rest becomes the failover order |
-| **Weighted score** | Ranks on quality, latency, cost, health, spare quota, priority, provider preference, locality and context headroom — with weights you set |
+| **Weighted score** | Ranks on quality, latency, cost, health, spare quota, priority, provider preference, locality, context headroom, spare capacity, whether the model is already loaded, and conversation continuity — with weights you set |
 | **Lowest latency** | Rolling TTFT / p50 / p95 / total, your choice of metric |
 | **Lowest cost** | Cheapest eligible target; free and local count as zero |
 | **Round robin** | Even rotation across equivalent targets |
 | **Local first** | Local models when healthy, cloud as fallback |
 | **Cloud first** | Cloud models first, local as the emergency fallback |
+| **Least loaded** | Most spare concurrency right now, counting requests already on their way; ties go to a model already in memory |
+
+Between copies of the *same* model — the same weights on two servers, or two quantizations of
+them — Derby tries the one already loaded first, so a request does not wait on a cold load
+another copy could have skipped. It never swaps in a *different* model for being loaded: which
+model answers stays the strategy's decision. On by default, except under Priority and Failover
+chain, where your order is the instruction.
 
 Policies are **data**, not code paths — they live in `config.json` and are edited in the UI.
 
@@ -245,6 +252,41 @@ private servers.
   to fit the smaller target instead — dropping the oldest turns, or replacing them with a
   summary written by a model you nominate. Never silently: the response carries
   `x_derby.compaction` and an `x-derby-compacted` header.
+- **Bursts spread.** Requests that arrive together would all read the same idle counts and
+  pile onto one target. A load-aware ranking claims its target as it picks it, and a claim
+  made on counts that have since moved is refused and routed again.
+- **Abandoned requests stop.** When a client disconnects, Derby cancels the provider request
+  instead of letting a model keep generating for nobody.
+- **Servers that report their own load are believed.** vLLM, SGLang and llama.cpp publish how
+  many requests they are running, how many are queued and how full the KV cache is — including
+  work Derby never sent. Derby ranks on it, and passes over a server with no free slot while
+  another target can answer.
+
+---
+
+## Moving a conversation between models
+
+Consecutive turns, or a failover, can hand a conversation to a different model from the one
+that wrote it. Derby makes sure the answer differs because the model does, not because
+something was lost on the way:
+
+- **Reasoning stays within a model family.** Qwen at FP8 on vLLM and Qwen at Q4_K_M on
+  Ollama are the same weights, so the second picks up the first one's reasoning in the middle
+  of a tool loop. GPT's reasoning is never handed to Qwen: a model reading another family's
+  thinking as its own does worse than one reading none.
+- **Signed reasoning goes back only where it can be verified** — Claude's thinking to Claude,
+  ChatGPT's encrypted reasoning to the account that issued it, Gemini's thought signatures to
+  Gemini.
+- **Structure follows the receiving model.** Tool call ids in a format it accepts, every call
+  paired with its result, system prompts where its template reads them, a tool's images in a
+  message it can see.
+- **What a client drops, Derby restores.** Chat Completions clients discard reasoning and
+  never say which model wrote a turn; Derby remembers its own recent answers and puts both
+  back.
+
+Whenever the model changed, or anything was withheld or rewritten, the response says so in
+`x_derby.handoff`. The details are in
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#handing-a-conversation-between-models).
 
 ---
 
@@ -253,6 +295,7 @@ private servers.
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — layers, data flow, and the rules that keep them apart
 - [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) — building, testing, adding providers and strategies
 - [`docs/PROVIDERS.md`](docs/PROVIDERS.md) — provider-by-provider integration notes
+- [`docs/CLIENTS.md`](docs/CLIENTS.md) — what a client can read about the model that answered, and what it did not see
 - [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) — what is not done, and what is unverified
 - [`CLAUDE.md`](CLAUDE.md) — orientation for AI coding agents working in this repo
 
@@ -262,7 +305,7 @@ private servers.
 
 ```bash
 swift build                    # library + app
-swift run DerbyTests           # 363 tests, no network required
+swift run DerbyTests           # 453 tests, no network required
 ./Scripts/build_app.sh         # → build/Derby.app
 ./Scripts/build_app.sh --install   # also copy to /Applications
 ```

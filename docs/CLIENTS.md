@@ -73,6 +73,41 @@ A request whose conversation does not fit **any** target fails with HTTP 400 and
 from `capability_mismatch`: it means shorten the conversation or use a larger model, not
 that the model cannot do what you asked.
 
+### `x_derby.handoff` — what the answering model was and was not given
+
+Also normally absent. It appears when the model that answered is not the one that wrote the
+conversation's latest answer, or when Derby had to withhold or rewrite something so the
+history could reach it intact:
+
+```python
+h = derby.get("handoff")
+if h:
+    h["previous_model"]            # "gpt-5.1" — who wrote the latest answer, when Derby knows
+    h["model"]                     # "qwen3.6:27b" — who answered this time
+    h["affinity"]                  # "identical" | "same_family" | "same_vendor" | "foreign" | "unknown"
+    h["reasoning_carried"]         # earlier steps whose reasoning this model continued from
+    h["reasoning_withheld"]        # earlier steps whose reasoning it was not given
+    h["tool_call_ids_rewritten"]   # ids sent in the format this model's provider accepts
+    h["unattributed_turns"]        # turns Derby could not trace to a model; absent when zero
+    h["adjustments"]               # each structural repair, one sentence apiece
+    h["summary"]                   # the whole thing as one readable sentence
+```
+
+`identical` means the same weights — another quantization, or another server — and reasoning
+travels with the conversation. Reasoning from a different family is always withheld, by
+design: a model that reads another family's reasoning as its own does worse than one that
+reads none. The model still saw everything that was *said*; what it lacked was the earlier
+model's reasoning, which is worth knowing when an agent changes course mid-task.
+
+Rewritten tool call ids exist only in what Derby sends the provider — your copy of the
+conversation keeps its own. On a stream, `handoff` arrives with the `x_derby` on the last
+chunk (`response.completed` in the Responses dialect). Non-streaming responses carry a header
+too:
+
+```
+x-derby-handoff   foreign;gpt-5.1;qwen3.6:27b;carried=0;withheld=2
+```
+
 ## Streaming
 
 The same object arrives on the **first** chunk, before any content, and again on the last:
@@ -107,6 +142,7 @@ x-derby-context-window   200000
 x-derby-max-output-tokens 64000
 x-derby-capabilities     text,vision,tools,parallel-tools,json-schema,reasoning,streaming
 x-derby-compacted        601234;22187;summarize      (only when the conversation was shortened)
+x-derby-handoff          foreign;gpt-5.1;qwen3.6:27b;carried=0;withheld=2   (only when the conversation changed hands or was adjusted)
 ```
 
 A **streaming** response must send its headers before any target has run, so there they are

@@ -176,6 +176,19 @@ public struct ChatGPTCodexAdapter: ProviderAdapter {
                                                                   id: item["call_id"]?.stringValue ?? item["id"]?.stringValue ?? "call_\(idx)",
                                                                   name: item["name"]?.stringValue ?? ""))
                             }
+                        case "response.output_item.done":
+                            // Encrypted reasoning, readable only by this account on a
+                            // later turn. Kept for the ledger; never shown.
+                            let item = json["item"] ?? .null
+                            if item["type"]?.stringValue == "reasoning",
+                               let encrypted = item["encrypted_content"]?.stringValue, !encrypted.isEmpty {
+                                let summaries = (item["summary"]?.arrayValue ?? []).compactMap { $0["text"]?.stringValue }
+                                continuation.yield(.reasoningArtifact(ReasoningArtifact(
+                                    format: .openAIEncryptedReasoning, payload: encrypted,
+                                    text: summaries.isEmpty ? nil : summaries.joined(separator: "\n\n"),
+                                    itemID: item["id"]?.stringValue,
+                                    summaries: summaries.isEmpty ? nil : summaries)))
+                            }
                         case "response.function_call_arguments.delta":
                             let outputIndex = json["output_index"]?.intValue ?? 0
                             if let d = json["delta"]?.stringValue, !d.isEmpty {
@@ -232,6 +245,19 @@ public struct ChatGPTCodexAdapter: ProviderAdapter {
                 input.append(.object(["type": .string("message"), "role": .string("user"),
                                       "content": .array(parts.isEmpty ? [.object(["type": .string("input_text"), "text": .string("")])] : parts)]))
             case .assistant:
+                // The reasoning that led to this turn's output goes back ahead of
+                // it, as the Codex CLI itself sends it.
+                for artifact in m.reasoningArtifacts where artifact.format == .openAIEncryptedReasoning {
+                    var item: [String: JSONValue] = [
+                        "type": .string("reasoning"),
+                        "summary": .array((artifact.summaries ?? []).map {
+                            .object(["type": .string("summary_text"), "text": .string($0)])
+                        }),
+                        "encrypted_content": .string(artifact.payload),
+                    ]
+                    if let id = artifact.itemID { item["id"] = .string(id) }
+                    input.append(.object(item))
+                }
                 let t = m.joinedText
                 if !t.isEmpty {
                     input.append(.object(["type": .string("message"), "role": .string("assistant"),
@@ -260,6 +286,9 @@ public struct ChatGPTCodexAdapter: ProviderAdapter {
             "input": .array(input),
             "stream": .bool(true),
             "store": .bool(false),
+            // Nothing is stored server-side, so the only way a later turn can
+            // continue this one's reasoning is to be handed it back encrypted.
+            "include": .array([.string("reasoning.encrypted_content")]),
         ]
         // The Codex backend rejects `max_output_tokens` outright
         // ("Unsupported parameter"), unlike the public Responses API. This is an

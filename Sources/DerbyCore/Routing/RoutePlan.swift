@@ -30,6 +30,11 @@ public struct RoutePlan: Sendable {
     /// The model that writes the summary, already resolved. Nil means the target
     /// answering the request does it itself.
     public var compactor: ResolvedTarget?
+    /// How the conversation is carried to whichever target answers.
+    public var handoff: HandoffPolicy
+    /// True when the ranking read live load, so the gateway must reserve the
+    /// chosen target before a concurrent request reads the same counts.
+    public var isLoadSensitive: Bool
 
     public var isEmpty: Bool { attempts.isEmpty }
 
@@ -38,7 +43,11 @@ public struct RoutePlan: Sendable {
                 retry: RetryConfig, failover: FailoverConfig, hedging: HedgeConfig,
                 defaults: RequestDefaults, budget: BudgetRules,
                 compaction: CompactionPolicy = .disabled,
-                compactor: ResolvedTarget? = nil) {
+                compactor: ResolvedTarget? = nil,
+                handoff: HandoffPolicy = .default,
+                isLoadSensitive: Bool = false) {
+        self.handoff = handoff
+        self.isLoadSensitive = isLoadSensitive
         self.logicalModelName = logicalModelName
         self.attempts = attempts
         self.overallDeadlineSeconds = overallDeadlineSeconds

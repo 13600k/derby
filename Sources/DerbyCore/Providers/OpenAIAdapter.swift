@@ -22,6 +22,33 @@ public struct OpenAIQuirks: Sendable {
     /// does not branch on provider identity.
     public enum DiscoveryStyle: Sendable { case openAIModels, ollamaNative }
     public var discoveryStyle: DiscoveryStyle = .openAIModels
+    /// How the server reports which models are loaded in memory.
+    public enum ResidencyStyle: Sendable {
+        case unreported
+        /// Ollama's `/api/ps`.
+        case ollamaRunning
+        /// LM Studio's `/api/v1/models`, whose entries list `loaded_instances`.
+        case lmStudioInstances
+        /// vLLM, SGLang and llama.cpp serve what they list, loaded.
+        case servedModelsAreLoaded
+    }
+    public var residencyStyle: ResidencyStyle = .unreported
+    /// How the server reports what it is working on right now.
+    public enum OccupancyStyle: Sendable {
+        case unreported
+        /// vLLM's Prometheus gauges: requests running and waiting, KV cache use.
+        case vllmMetrics
+        /// SGLang's, under its own metric names.
+        case sglangMetrics
+        /// llama.cpp's `/slots`, one entry per decoding slot.
+        case llamaCppSlots
+    }
+    public var occupancyStyle: OccupancyStyle = .unreported
+    /// Assistant-message fields that carry earlier reasoning back.
+    public var reasoningReplayFields: [String] = []
+    /// Accepts `chat_template_kwargs`, the switch self-hosted servers use to
+    /// turn a hybrid model's thinking on or off.
+    public var supportsChatTemplateKwargs = false
     public var listModelsPath = "models"
     public var chatPath = "chat/completions"
     public var embeddingsPath = "embeddings"
@@ -61,11 +88,23 @@ public struct OpenAIQuirks: Sendable {
             // /v1/models reports only an id; the native API reports context
             // length, modalities, parameter size and quantization.
             q.discoveryStyle = .ollamaNative
+            q.residencyStyle = .ollamaRunning
+            // Maps onto Ollama's own `think` levels.
+            q.supportsReasoningEffort = true
         case .lmStudio, .llamaCpp, .localai, .sglang, .vllm:
             q.supportsStreamOptions = (kind == .vllm || kind == .sglang || kind == .lmStudio)
             q.supportsParallelToolCalls = false
             q.authStyle = .none
             q.strictSchema = (kind == .llamaCpp || kind == .localai)
+            switch kind {
+            case .lmStudio: q.residencyStyle = .lmStudioInstances
+            case .vllm, .sglang, .llamaCpp:
+                q.residencyStyle = .servedModelsAreLoaded
+                q.supportsChatTemplateKwargs = true
+                q.occupancyStyle = kind == .vllm ? .vllmMetrics
+                    : (kind == .sglang ? .sglangMetrics : .llamaCppSlots)
+            default: break
+            }
         case .openAICompatible:
             // Conservative defaults: unknown servers get the smallest viable body.
             q.supportsStreamOptions = false
@@ -74,6 +113,7 @@ public struct OpenAIQuirks: Sendable {
         default:
             break
         }
+        q.reasoningReplayFields = kind.reasoningReplayFields
         // An account with a key always sends it, even for kinds that default to none.
         if case .none = q.authStyle, !account.auth.secretRefs.isEmpty { q.authStyle = .bearer }
         if case .apiKey = account.auth, case .none = q.authStyle { q.authStyle = .bearer }
@@ -166,6 +206,107 @@ public struct OpenAIAdapter: ProviderAdapter {
         let items = json["data"]?.arrayValue ?? json.arrayValue ?? []
         return items.compactMap { parseListedModel($0, kind: ctx.account.kind) }
             .sorted { $0.id < $1.id }
+    }
+
+    // MARK: - Loaded models
+
+    public func loadedModels(_ ctx: ProviderContext) async throws -> Set<String>? {
+        let q = quirks(ctx)
+        guard q.residencyStyle != .unreported else { return nil }
+        let auth = try await authenticate(ctx)
+        let native = OllamaDiscovery.nativeBase(from: auth.baseURLOverride ?? ctx.account.baseURL)
+        let requestURL: URL?
+        switch q.residencyStyle {
+        case .ollamaRunning: requestURL = URL(string: native + "/api/ps")
+        case .lmStudioInstances: requestURL = URL(string: native + "/api/v1/models")
+        case .servedModelsAreLoaded: requestURL = try url(ctx, path: q.listModelsPath, auth: auth)
+        case .unreported: return nil
+        }
+        guard let requestURL else { return nil }
+        let response = try await ctx.transport.send(OutboundRequest(
+            url: requestURL, method: "GET", headers: headers(ctx, auth: auth),
+            timeout: ctx.attemptTimeout, allowInsecureTLS: ctx.account.allowInsecureTLS))
+        guard (200..<300).contains(response.status), let json = response.bodyJSON else { return nil }
+
+        switch q.residencyStyle {
+        case .ollamaRunning:
+            return Set((json["models"]?.arrayValue ?? []).compactMap {
+                $0["model"]?.stringValue ?? $0["name"]?.stringValue
+            })
+        case .lmStudioInstances:
+            let items = json["models"]?.arrayValue ?? json["data"]?.arrayValue ?? json.arrayValue ?? []
+            return Set(items.filter { !($0["loaded_instances"]?.arrayValue ?? []).isEmpty }
+                .compactMap { $0["key"]?.stringValue ?? $0["id"]?.stringValue })
+        case .servedModelsAreLoaded:
+            // llama.cpp in router mode lists models it has not loaded, with a status.
+            return Set((json["data"]?.arrayValue ?? []).filter { item in
+                guard let status = item["status"]?["value"]?.stringValue ?? item["status"]?.stringValue else { return true }
+                return status == "loaded"
+            }.compactMap { $0["id"]?.stringValue })
+        case .unreported:
+            return nil
+        }
+    }
+
+    // MARK: - Occupancy
+
+    /// Asks the server what it is doing. Best effort throughout: a server that
+    /// does not publish this, or publishes it somewhere Derby cannot reach,
+    /// simply says nothing and routing falls back to Derby's own counts.
+    public func occupancy(_ ctx: ProviderContext) async throws -> ServerOccupancy? {
+        let q = quirks(ctx)
+        guard q.occupancyStyle != .unreported else { return nil }
+        let auth = try await authenticate(ctx)
+        let native = OllamaDiscovery.nativeBase(from: auth.baseURLOverride ?? ctx.account.baseURL)
+        let path: String
+        switch q.occupancyStyle {
+        case .vllmMetrics, .sglangMetrics: path = "/metrics"
+        case .llamaCppSlots: path = "/slots"
+        case .unreported: return nil
+        }
+        guard let requestURL = URL(string: native + path) else { return nil }
+        let response = try await ctx.transport.send(OutboundRequest(
+            url: requestURL, method: "GET", headers: headers(ctx, auth: auth),
+            timeout: ctx.attemptTimeout, allowInsecureTLS: ctx.account.allowInsecureTLS))
+        guard (200..<300).contains(response.status) else { return nil }
+
+        switch q.occupancyStyle {
+        case .vllmMetrics:
+            let s = PrometheusText.samples(String(decoding: response.body, as: UTF8.self))
+            // The v1 engine publishes kv_cache_usage_perc; earlier ones called
+            // the same gauge gpu_cache_usage_perc.
+            let cache = PrometheusText.peak(s, "vllm:kv_cache_usage_perc")
+                ?? PrometheusText.peak(s, "vllm:gpu_cache_usage_perc")
+            let occupancy = ServerOccupancy(
+                running: PrometheusText.total(s, "vllm:num_requests_running").map { Int($0.rounded()) },
+                queued: PrometheusText.total(s, "vllm:num_requests_waiting").map { Int($0.rounded()) },
+                kvCacheUsage: cache.map(Self.asFraction))
+            return occupancy.isEmpty ? nil : occupancy
+        case .sglangMetrics:
+            let s = PrometheusText.samples(String(decoding: response.body, as: UTF8.self))
+            let occupancy = ServerOccupancy(
+                running: PrometheusText.total(s, "sglang:num_running_reqs").map { Int($0.rounded()) },
+                queued: PrometheusText.total(s, "sglang:num_queue_reqs").map { Int($0.rounded()) },
+                kvCacheUsage: (PrometheusText.peak(s, "sglang:token_usage")
+                               ?? PrometheusText.peak(s, "sglang:kv_cache_usage")).map(Self.asFraction))
+            return occupancy.isEmpty ? nil : occupancy
+        case .llamaCppSlots:
+            // `/slots` is one entry per decoding slot; older builds report
+            // `state` (0 idle), newer ones `is_processing`.
+            guard let slots = response.bodyJSON?.arrayValue, !slots.isEmpty else { return nil }
+            let busy = slots.filter { slot in
+                if let processing = slot["is_processing"]?.boolValue { return processing }
+                return (slot["state"]?.intValue ?? 0) != 0
+            }.count
+            return ServerOccupancy(running: busy, totalSlots: slots.count)
+        case .unreported:
+            return nil
+        }
+    }
+
+    /// Some builds publish a ratio, others the same thing as a percentage.
+    private static func asFraction(_ value: Double) -> Double {
+        value > 1.5 ? value / 100 : value
     }
 
     /// Reads whatever an OpenAI-style `/models` entry chooses to publish.
@@ -422,8 +563,14 @@ public struct OpenAIAdapter: ProviderAdapter {
         }
         var body: [String: JSONValue] = [
             "model": .string(model),
-            "messages": .array(r.messages.map { encodeMessage($0) }),
+            "messages": .array(r.messages.map { encodeMessage($0, replayFields: q.reasoningReplayFields) }),
         ]
+        // A hybrid model's thinking is a template switch on self-hosted servers,
+        // so a reasoning request that does not flip it is silently ignored.
+        if q.supportsChatTemplateKwargs, let effort = r.reasoning?.effort,
+           let flag = LineageTraits.for(ModelLineage.parse(model)).thinkingTemplateSwitch {
+            body["chat_template_kwargs"] = .object([flag: .bool(effort != .minimal)])
+        }
         if stream {
             body["stream"] = .bool(true)
             if q.supportsStreamOptions {
@@ -502,7 +649,7 @@ public struct OpenAIAdapter: ProviderAdapter {
         return result
     }
 
-    private func encodeMessage(_ m: CanonicalMessage) -> JSONValue {
+    private func encodeMessage(_ m: CanonicalMessage, replayFields: [String] = []) -> JSONValue {
         var out: [String: JSONValue] = ["role": .string(m.role == .developer ? "developer" : m.role.rawValue)]
         if let n = m.name { out["name"] = .string(n) }
 
@@ -513,6 +660,11 @@ public struct OpenAIAdapter: ProviderAdapter {
         case .assistant:
             let text = m.joinedText
             out["content"] = text.isEmpty ? .null : .string(text)
+            // Present only when the handoff planner kept it: the same lineage,
+            // within the window its template reads back.
+            if let reasoning = m.reasoning, !reasoning.isEmpty {
+                for field in replayFields { out[field] = .string(reasoning) }
+            }
             if !m.toolCalls.isEmpty {
                 out["tool_calls"] = .array(m.toolCalls.map { tc in
                     .object(["id": .string(tc.id), "type": .string("function"),
@@ -574,7 +726,8 @@ public struct OpenAIAdapter: ProviderAdapter {
         var toolCalls: [CanonicalToolCall] = []
         for call in msg["tool_calls"]?.arrayValue ?? [] {
             toolCalls.append(CanonicalToolCall(
-                id: call["id"]?.stringValue ?? "call_\(toolCalls.count)",
+                // No id means none was assigned; the executor gives it a unique one.
+                id: call["id"]?.stringValue ?? "",
                 name: call["function"]?["name"]?.stringValue ?? "",
                 argumentsJSON: call["function"]?["arguments"]?.stringValue ?? "{}"))
         }

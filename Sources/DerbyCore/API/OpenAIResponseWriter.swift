@@ -44,7 +44,27 @@ public enum OpenAIResponseWriter {
         // A shortened conversation is never reported as a normal one: the
         // client sent messages the answering model did not see.
         if let c = record.compaction { meta["compaction"] = compactionJSON(c) }
+        // Reported whenever the conversation changed model or had to change
+        // to reach it, so a client can tell what the answering model received.
+        if let h = record.handoff, h.isNotable { meta["handoff"] = handoffJSON(h) }
         return .object(meta)
+    }
+
+    /// How the conversation was carried to the model that answered.
+    public static func handoffJSON(_ h: HandoffRecord) -> JSONValue {
+        var o: [String: JSONValue] = [
+            "model": .string(h.targetModel),
+            "lineage": .string(h.targetLineage),
+            "affinity": .string(h.affinity.rawValue),
+            "reasoning_carried": .number(Double(h.reasoningCarried + h.signedReasoningCarried)),
+            "reasoning_withheld": .number(Double(h.reasoningWithheld + h.signedReasoningWithheld)),
+            "tool_call_ids_rewritten": .number(Double(h.toolCallIDsRewritten)),
+            "adjustments": .array(h.adjustments.map { .string($0) }),
+            "summary": .string(h.summary),
+        ]
+        if let previous = h.previousModel { o["previous_model"] = .string(previous) }
+        if h.unattributedTurns > 0 { o["unattributed_turns"] = .number(Double(h.unattributedTurns)) }
+        return .object(o)
     }
 
     /// What Derby removed from the conversation, and why.
@@ -270,6 +290,20 @@ public enum OpenAIResponseWriter {
                                        status: String = "completed") -> JSONValue {
         var output: [JSONValue] = []
         let text = response.message.joinedText
+        // A Responses client keeps reasoning items and sends them back, which
+        // is the one dialect that can carry a model's reasoning to its next turn.
+        let encrypted = response.message.reasoningArtifacts.first { $0.format == .openAIEncryptedReasoning }
+        if response.message.reasoning?.isEmpty == false || encrypted != nil {
+            var item: [String: JSONValue] = [
+                "type": .string("reasoning"),
+                "id": .string(encrypted?.itemID ?? "rs_\(IDGenerator.short())"),
+                "summary": .array((response.message.reasoning.map { [$0] } ?? []).map {
+                    .object(["type": .string("summary_text"), "text": .string($0)])
+                }),
+            ]
+            if let encrypted { item["encrypted_content"] = .string(encrypted.payload) }
+            output.append(.object(item))
+        }
         if !text.isEmpty {
             output.append(.object([
                 "type": .string("message"),
@@ -459,6 +493,19 @@ public enum OpenAIResponseWriter {
         o["circuit"] = .string(h.circuit.rawValue)
         o["p50_ms"] = h.p50Seconds.map { .number(Double($0.msRounded)) } ?? .null
         if let activeID { o["active"] = .bool(t.id == activeID) }
+        let warmth = snapshot.warmth(for: t)
+        if warmth != .alwaysAvailable { o["warmth"] = .string(warmth.rawValue) }
+        // What the server said about itself, for anyone watching capacity.
+        if let busy = snapshot.occupancy(for: t) {
+            var reported: [String: JSONValue] = ["summary": .string(busy.summary),
+                                                 "saturated": .bool(busy.isSaturated)]
+            if let running = busy.running { reported["running"] = .number(Double(running)) }
+            if let queued = busy.queued { reported["queued"] = .number(Double(queued)) }
+            if let slots = busy.totalSlots { reported["total_slots"] = .number(Double(slots)) }
+            if let kv = busy.kvCacheUsage { reported["kv_cache_usage"] = .number(kv) }
+            if let utilization = busy.utilization { reported["utilization"] = .number(utilization) }
+            o["occupancy"] = .object(reported)
+        }
         return .object(o)
     }
 

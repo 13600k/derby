@@ -6,15 +6,19 @@ public struct RequestMeta: Sendable {
     public var dialect: APIDialect
     public var promptLogging: PromptLoggingMode
     public var promptExcerpt: String?
+    /// The slot claimed for the first planned target when routing read live
+    /// load. The executor turns it into the in-flight request, or gives it back.
+    public var loadReservation: HealthRegistry.LoadReservation?
 
     public init(requestID: String = IDGenerator.requestID(), clientName: String = "unknown",
                 dialect: APIDialect = .chatCompletions, promptLogging: PromptLoggingMode = .metadataOnly,
-                promptExcerpt: String? = nil) {
+                promptExcerpt: String? = nil, loadReservation: HealthRegistry.LoadReservation? = nil) {
         self.requestID = requestID
         self.clientName = clientName
         self.dialect = dialect
         self.promptLogging = promptLogging
         self.promptExcerpt = promptExcerpt
+        self.loadReservation = loadReservation
     }
 }
 

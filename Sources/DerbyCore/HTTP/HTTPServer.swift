@@ -182,6 +182,14 @@ private actor Connection {
     private var buffer = Data()
     private var closed = false
     private let queue = DispatchQueue(label: "com.derby.http.conn")
+    /// The one receive outstanding on the socket, shared by request parsing and
+    /// the disconnect watch so the two never race for the same bytes.
+    private var pendingReceive: Task<Data?, Never>?
+    /// The handler or stream producer a disconnect should cancel right now. A
+    /// watch is numbered so one left over from an earlier request on this
+    /// connection can never act for — or swallow the signal meant for — this one.
+    private var activeWatch: UInt64?
+    private var watchCount: UInt64 = 0
 
     init(nw: NWConnection, handler: @escaping HTTPHandler, maxBodyBytes: Int) {
         self.nw = nw
@@ -218,7 +226,8 @@ private actor Connection {
             guard let body = await readBody(length: length) else { break }
 
             let req = HTTPServerRequest(head: head, body: body, remoteDescription: remote, receivedAt: Date())
-            let response = await handler(req)
+            let handler = self.handler
+            let response = await whileWatchingPeer { await handler(req) }
             let keepAlive = head.wantsKeepAlive && !closed
 
             switch response {
@@ -300,7 +309,65 @@ private actor Connection {
         return HTTPRequestHead(method: method, rawTarget: target, headers: headers, version: version)
     }
 
+    /// Runs `work` while watching the socket, and cancels it if the client goes
+    /// away first.
+    ///
+    /// Without this a client that gives up — closes the tab, times out, kills
+    /// the process — is only noticed at the next write: after a non-streaming
+    /// answer has been generated in full, or at a stream's next chunk. Until
+    /// then a local model keeps generating for nobody, holding its slot.
+    /// Cancelling the handler's task propagates through the executor to the
+    /// provider request, which is what stops the generation.
+    ///
+    /// The watch is an unstructured task that is never awaited, so it cannot
+    /// hold the connection open: its outstanding receive completes on the next
+    /// bytes, on EOF, or when the connection is cancelled.
+    private func whileWatchingPeer<T: Sendable>(_ work: @escaping @Sendable () async -> T) async -> T {
+        let task = Task { await work() }
+        watchCount &+= 1
+        let watch = watchCount
+        activeWatch = watch
+        Task { await self.watchForDisconnect(watch, cancelling: task) }
+        let result = await task.value
+        if activeWatch == watch { activeWatch = nil }
+        return result
+    }
+
+    private func watchForDisconnect<T: Sendable>(_ watch: UInt64, cancelling task: Task<T, Never>) async {
+        while activeWatch == watch, !closed {
+            let receive: Task<Data?, Never>
+            if let existing = pendingReceive {
+                receive = existing
+            } else {
+                receive = Task { await self.rawReceive() }
+                pendingReceive = receive
+            }
+            let data = await receive.value
+            // The work finished, or request parsing already took this receive:
+            // either way the bytes belong to the read loop.
+            guard activeWatch == watch, pendingReceive == receive else { return }
+            pendingReceive = nil
+            guard let data, !data.isEmpty else {
+                // EOF or a reset — an empty read ends the read loop too. Nobody
+                // is waiting for this answer any more.
+                task.cancel()
+                return
+            }
+            // A pipelined next request: keep it for the read loop.
+            buffer.append(data)
+        }
+    }
+
     private func receive() async -> Data? {
+        guard !closed else { return nil }
+        if let pending = pendingReceive {
+            pendingReceive = nil
+            return await pending.value
+        }
+        return await rawReceive()
+    }
+
+    private func rawReceive() async -> Data? {
         guard !closed else { return nil }
         return await withCheckedContinuation { (cont: CheckedContinuation<Data?, Never>) in
             let resumed = Resumed()
@@ -352,7 +419,7 @@ private actor Connection {
     }
 
     private func writeStream(status: Int, headers: [String: String], keepAlive: Bool,
-                             producer: @Sendable (any HTTPStreamWriter) async -> Void) async {
+                             producer: @escaping @Sendable (any HTTPStreamWriter) async -> Void) async {
         var h = headers
         h["transfer-encoding"] = "chunked"
         guard await send(headerBlock(status: status, headers: h, keepAlive: keepAlive)) else {
@@ -360,7 +427,7 @@ private actor Connection {
             return
         }
         let writer = ChunkWriter(connection: self)
-        await producer(writer)
+        await whileWatchingPeer { await producer(writer) }
         await writer.finish()
     }
 

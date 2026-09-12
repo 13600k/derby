@@ -126,6 +126,13 @@ public enum OpenAIRequestParser {
                                   argumentsJSON: c["function"]?["arguments"]?.stringValue ?? "{}")
             }
         }
+        if role == .assistant {
+            // Clients that keep reasoning send it back under whichever name
+            // their server used. Losing it here would make it unrecoverable.
+            for key in ["reasoning_content", "reasoning", "thinking"] {
+                if let reasoning = m[key]?.stringValue, !reasoning.isEmpty { msg.reasoning = reasoning; break }
+            }
+        }
         return msg
     }
 
@@ -158,14 +165,20 @@ public enum OpenAIRequestParser {
                                                           argumentsJSON: item["arguments"]?.stringValue ?? "{}")]))
                     case "function_call_output":
                         messages.append(CanonicalMessage(role: .tool,
-                                                         content: [.text(item["output"]?.stringValue ?? "")],
+                                                         content: parseFunctionOutput(item["output"]),
                                                          toolCallID: item["call_id"]?.stringValue))
+                    case "reasoning":
+                        messages.append(parseReasoningItem(item))
                     default:
                         if let t = item["text"]?.stringValue { messages.append(.user(t)) }
                     }
                 }
             }
         }
+        // The Responses dialect sends one model turn as several items — its
+        // reasoning, its text, each function call. They are one turn, and
+        // every other dialect expects them as one.
+        _ = ConversationNormalizer.mergeConsecutiveAssistants(&messages)
         r.messages = messages
         r.stream = json["stream"]?.boolValue ?? false
         r.temperature = json["temperature"]?.doubleValue
@@ -209,6 +222,38 @@ public enum OpenAIRequestParser {
             }
         }
         return r
+    }
+
+    /// A function's output may be plain text or a list of content parts.
+    private static func parseFunctionOutput(_ output: JSONValue?) -> [CanonicalContent] {
+        guard let output else { return [.text("")] }
+        if let text = output.stringValue { return [.text(text)] }
+        let parts: [CanonicalContent] = (output.arrayValue ?? []).compactMap { part in
+            switch part["type"]?.stringValue {
+            case "input_image":
+                guard let url = part["image_url"]?.stringValue ?? part["image_url"]?["url"]?.stringValue else { return nil }
+                return .image(.fromImageURLString(url, detail: part["detail"]?.stringValue))
+            default:
+                return part["text"]?.stringValue.map { .text($0) }
+            }
+        }
+        return parts.isEmpty ? [.text(output.compactJSONString)] : parts
+    }
+
+    /// A `reasoning` item: summary or full text, and sometimes the encrypted
+    /// original, which only the account that issued it can read.
+    private static func parseReasoningItem(_ item: JSONValue) -> CanonicalMessage {
+        let summaries = (item["summary"]?.arrayValue ?? []).compactMap { $0["text"]?.stringValue }
+        let full = (item["content"]?.arrayValue ?? []).compactMap { $0["text"]?.stringValue }.joined(separator: "\n")
+        let text = full.isEmpty ? summaries.joined(separator: "\n\n") : full
+        var message = CanonicalMessage(role: .assistant, reasoning: text.isEmpty ? nil : text)
+        if let encrypted = item["encrypted_content"]?.stringValue, !encrypted.isEmpty {
+            message.reasoningArtifacts = [ReasoningArtifact(format: .openAIEncryptedReasoning, payload: encrypted,
+                                                            text: text.isEmpty ? nil : text,
+                                                            itemID: item["id"]?.stringValue,
+                                                            summaries: summaries.isEmpty ? nil : summaries)]
+        }
+        return message
     }
 
     private static func parseResponsesMessage(_ item: JSONValue) throws -> CanonicalMessage {

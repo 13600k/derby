@@ -104,6 +104,9 @@ public enum CanonicalStreamEvent: Sendable {
     case toolCallArgumentsDelta(index: Int, delta: String)
     case usage(CanonicalUsage)
     case finish(CanonicalFinishReason)
+    /// Opaque reasoning the provider issued. Never shown to the client; kept so
+    /// the same lineage can continue from it.
+    case reasoningArtifact(ReasoningArtifact)
 
     public var isContentBearing: Bool {
         switch self {
@@ -125,6 +128,7 @@ public struct StreamAccumulator: Sendable {
     public private(set) var reasoning: String = ""
     public private(set) var usage: CanonicalUsage = .zero
     public private(set) var finishReason: CanonicalFinishReason = .stop
+    public private(set) var artifacts: [ReasoningArtifact] = []
     private var toolCalls: [Int: CanonicalToolCall] = [:]
 
     public init() {}
@@ -140,11 +144,13 @@ public struct StreamAccumulator: Sendable {
             if !name.isEmpty { existing.name = name }
             toolCalls[idx] = existing
         case .toolCallArgumentsDelta(let idx, let d):
-            var existing = toolCalls[idx] ?? CanonicalToolCall(id: "call_\(idx)", name: "", argumentsJSON: "")
+            // An empty id is filled in by the executor, which makes it unique.
+            var existing = toolCalls[idx] ?? CanonicalToolCall(id: "", name: "", argumentsJSON: "")
             existing.argumentsJSON += d
             toolCalls[idx] = existing
         case .usage(let u): usage = u
         case .finish(let r): finishReason = r
+        case .reasoningArtifact(let a): artifacts.append(a)
         }
     }
 
@@ -157,7 +163,8 @@ public struct StreamAccumulator: Sendable {
         if !text.isEmpty { content.append(.text(text)) }
         let msg = CanonicalMessage(role: .assistant, content: content,
                                    toolCalls: orderedToolCalls,
-                                   reasoning: reasoning.isEmpty ? nil : reasoning)
+                                   reasoning: reasoning.isEmpty ? nil : reasoning,
+                                   reasoningArtifacts: artifacts)
         return CanonicalResponse(id: id.isEmpty ? IDGenerator.requestID() : id,
                                  model: model.isEmpty ? fallbackModel : model,
                                  message: msg,

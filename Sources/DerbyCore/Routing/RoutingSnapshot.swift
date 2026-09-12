@@ -21,6 +21,13 @@ public struct ResolvedTarget: Sendable, Identifiable {
     public var label: String { "\(account.name) · \(model.label)" }
     public var isLocal: Bool { account.kind.isLocal }
     public var isSubscription: Bool { account.kind.isSubscription }
+    /// Which weights this target serves, whoever serves them.
+    public var lineage: ModelLineage { ModelLineage.parse(model.modelID, familyHint: model.profile?.family) }
+    /// The account's concurrency ceiling, or a nominal one when it is unlimited.
+    public var concurrencyCapacity: Int {
+        let limit = account.rateLimits.maxConcurrentRequests
+        return limit > 0 ? limit : 8
+    }
 }
 
 public struct ResolvedLogicalModel: Sendable {
@@ -40,13 +47,22 @@ public struct RoutingSnapshot: Sendable {
     public var health: [TargetKey: TargetHealth]
     public var healthSettings: HealthSettings
     public var loggingSettings: LoggingSettings
+    /// What each local server last reported as loaded.
+    public var residency: [UUID: AccountResidency]
+    /// In-flight and reserved requests per account, read with `health`.
+    public var accountLoad: [UUID: HealthRegistry.AccountLoad] = [:]
+    /// `HealthRegistry`'s load version when `health` was read, so a
+    /// reservation can tell whether anything moved since.
+    public var loadVersion: UInt64
 
     public init(version: UInt64 = 0, builtAt: Date = Date(),
                 logicalModels: [String: ResolvedLogicalModel] = [:],
                 accounts: [UUID: ProviderAccount] = [:],
                 health: [TargetKey: TargetHealth] = [:],
                 healthSettings: HealthSettings = .default,
-                loggingSettings: LoggingSettings = .default) {
+                loggingSettings: LoggingSettings = .default,
+                residency: [UUID: AccountResidency] = [:],
+                loadVersion: UInt64 = 0) {
         self.version = version
         self.builtAt = builtAt
         self.logicalModels = logicalModels
@@ -54,6 +70,40 @@ public struct RoutingSnapshot: Sendable {
         self.health = health
         self.healthSettings = healthSettings
         self.loggingSettings = loggingSettings
+        self.residency = residency
+        self.loadVersion = loadVersion
+    }
+
+    /// Whether `target` can answer without loading its model first.
+    public func warmth(for target: ResolvedTarget, now: Date = Date()) -> ModelWarmth {
+        guard target.isLocal else { return .alwaysAvailable }
+        if let report = residency[target.account.id], let loaded = report.loadedModels,
+           now.timeIntervalSince(report.observedAt) <= ModelResidency.freshness {
+            return loaded.contains(ModelResidency.normalize(target.modelID)) ? .loaded : .cold
+        }
+        if let last = health(for: target.key).lastSuccessAt,
+           now.timeIntervalSince(last) <= ModelResidency.recentUseWindow {
+            return .recentlyUsed
+        }
+        return .unknown
+    }
+
+    /// What the server behind `target` last said it was doing, while that is
+    /// still recent enough to act on.
+    public func occupancy(for target: ResolvedTarget, now: Date = Date()) -> ServerOccupancy? {
+        guard let report = residency[target.account.id], let occupancy = report.occupancy,
+              now.timeIntervalSince(report.observedAt) <= ModelResidency.freshness else { return nil }
+        return occupancy
+    }
+
+    /// Share of the target's capacity already committed: requests Derby has in
+    /// flight or about to start, or what the server itself reports — whichever
+    /// is higher. Derby sees only its own traffic; a server sees everyone's.
+    public func loadUtilization(for target: ResolvedTarget) -> Double {
+        let load = accountLoad[target.account.id] ?? HealthRegistry.AccountLoad()
+        let mine = Double(load.inFlight + load.reserved) / Double(target.concurrencyCapacity)
+        guard let reported = occupancy(for: target)?.utilization else { return mine }
+        return max(mine, reported)
     }
 
     public func logicalModel(named name: String) -> ResolvedLogicalModel? {

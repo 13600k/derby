@@ -8,14 +8,19 @@ public struct RoutingRequest: Sendable {
     public var promptTokens: Int
     public var maxOutputTokens: Int?
     public var isStreaming: Bool
+    /// Lineage of the model that wrote the latest answer in the conversation,
+    /// when Derby knows it.
+    public var conversationLineage: ModelLineage?
 
     public init(logicalModelName: String, requirements: CapabilityRequirements,
-                promptTokens: Int, maxOutputTokens: Int? = nil, isStreaming: Bool = false) {
+                promptTokens: Int, maxOutputTokens: Int? = nil, isStreaming: Bool = false,
+                conversationLineage: ModelLineage? = nil) {
         self.logicalModelName = logicalModelName
         self.requirements = requirements
         self.promptTokens = promptTokens
         self.maxOutputTokens = maxOutputTokens
         self.isStreaming = isStreaming
+        self.conversationLineage = conversationLineage
     }
 
     public init(_ request: CanonicalRequest) {
@@ -23,7 +28,8 @@ public struct RoutingRequest: Sendable {
                   requirements: request.capabilityRequirements,
                   promptTokens: request.estimatedPromptTokens,
                   maxOutputTokens: request.maxOutputTokens,
-                  isStreaming: request.stream)
+                  isStreaming: request.stream,
+                  conversationLineage: HandoffLedger.conversationLineage(of: request))
     }
 
     public init(_ request: CanonicalEmbeddingRequest) {
@@ -188,6 +194,25 @@ public struct Router: Sendable {
             }
         }
 
+        // 4b. A server that says it has no free slot is passed over while
+        // something else can answer now. This is the same idea as a rate limit,
+        // learned from the server rather than configured — so it is never a
+        // knob. It is not an error either: the request would only queue, so a
+        // full server stays eligible when it is the only one left.
+        if lm.policy.respectQuotas {
+            let full = eligible.filter { snapshot.occupancy(for: $0)?.isSaturated == true }
+            if !full.isEmpty, full.count < eligible.count {
+                for t in full {
+                    let state = snapshot.occupancy(for: t)?.summary ?? "no free capacity"
+                    exclusions.append(ExclusionRecord(targetLabel: t.label, providerName: t.providerName,
+                                                      modelID: t.modelID, stage: .quota,
+                                                      reason: "server reports \(state)"))
+                }
+                let fullIDs = Set(full.map(\.id))
+                eligible.removeAll { fullIDs.contains($0.id) }
+            }
+        }
+
         // 5. Budget filter.
         if let cap = lm.budget.maxCostPerRequestUSD {
             let estimatedOutput = request.maxOutputTokens ?? 1024
@@ -241,14 +266,38 @@ public struct Router: Sendable {
         }
 
         // 6. Rank with this logical model's own strategy.
+        var loadUtilization: [UUID: Double] = [:]
+        var warmth: [UUID: ModelWarmth] = [:]
+        var occupancy: [UUID: ServerOccupancy] = [:]
+        for t in eligible {
+            loadUtilization[t.id] = snapshot.loadUtilization(for: t)
+            warmth[t.id] = snapshot.warmth(for: t)
+            occupancy[t.id] = snapshot.occupancy(for: t)
+        }
         let strategy = StrategyRegistry.strategy(for: lm.policy.strategy)
         let context = RoutingContext(policy: lm.policy,
                                      health: snapshot.health,
                                      promptTokens: request.promptTokens,
                                      scorer: scorer,
                                      roundRobinCursor: roundRobinCursor,
-                                     randomSeed: lm.policy.deterministic ? (randomSeed ?? 1) : randomSeed)
+                                     randomSeed: lm.policy.deterministic ? (randomSeed ?? 1) : randomSeed,
+                                     loadUtilization: loadUtilization,
+                                     warmth: warmth,
+                                     occupancy: occupancy,
+                                     conversationLineage: request.conversationLineage)
         var ranked = strategy.rank(eligible, context: context)
+
+        // 6b. Between copies of the same model, one already in memory answers
+        // without a cold load. The strategy has already decided which *model*;
+        // this only decides which copy of it goes first.
+        var warmExplanation: String?
+        if lm.policy.effectivePreferWarmModels {
+            let preferred = Router.preferWarmCopies(ranked, warmth: warmth)
+            ranked = preferred.ranked
+            if let move = preferred.firstMove {
+                warmExplanation = "\(move.winner) went ahead of \(move.loser): same model, already loaded."
+            }
+        }
 
         // 7. Apply the candidate cap.
         let limit = max(1, min(lm.policy.maxCandidates,
@@ -296,13 +345,18 @@ public struct Router: Sendable {
                              defaults: lm.defaults,
                              budget: lm.budget,
                              compaction: compaction,
-                             compactor: compactor)
+                             compactor: compactor,
+                             handoff: lm.handoff ?? .default,
+                             isLoadSensitive: lm.policy.readsLoad)
 
         let evaluations = ranked.enumerated().map { i, r in
             var note = r.note
             if needsCompaction.contains(r.target.id) {
                 let shortened = "conversation will be shortened to fit \((r.target.capabilities.effectiveInputLimit ?? 0).formattedTokens)"
                 note = note.map { "\($0) · \(shortened)" } ?? shortened
+            }
+            if let state = warmth[r.target.id], state == .loaded || state == .cold {
+                note = note.map { "\($0) · \(state.displayName)" } ?? state.displayName
             }
             return CandidateEvaluation(targetLabel: r.target.label,
                                        providerName: r.target.providerName,
@@ -318,8 +372,38 @@ public struct Router: Sendable {
                                plan: plan,
                                evaluations: evaluations,
                                exclusions: exclusions,
-                               explanation: strategy.explain(ranked, context: context),
+                               explanation: [strategy.explain(ranked, context: context), warmExplanation]
+                                   .compactMap { $0 }.joined(separator: " "),
                                snapshotVersion: snapshot.version)
+    }
+
+    /// Reorders copies of the same model so loaded ones come first, keeping
+    /// every other target exactly where the strategy put it.
+    static func preferWarmCopies(_ ranked: [RankedTarget], warmth: [UUID: ModelWarmth])
+        -> (ranked: [RankedTarget], firstMove: (winner: String, loser: String)?) {
+        var out = ranked
+        var groups: [String: [Int]] = [:]
+        for (index, candidate) in ranked.enumerated() {
+            let lineage = candidate.target.lineage
+            guard lineage.isKnown else { continue }
+            groups[lineage.identity, default: []].append(index)
+        }
+        var firstMove: (winner: String, loser: String)?
+        for positions in groups.values.sorted(by: { $0[0] < $1[0] }) where positions.count > 1 {
+            let members = positions.map { ranked[$0] }
+            let reordered = members.enumerated().sorted { a, b in
+                let warmA = (warmth[a.element.target.id] ?? .unknown).isWarm
+                let warmB = (warmth[b.element.target.id] ?? .unknown).isWarm
+                if warmA != warmB { return warmA }
+                return a.offset < b.offset
+            }.map(\.element)
+            for (slot, position) in positions.enumerated() { out[position] = reordered[slot] }
+            if firstMove == nil, let winner = reordered.first, let loser = members.first,
+               winner.target.id != loser.target.id {
+                firstMove = (winner.target.label, loser.target.label)
+            }
+        }
+        return (out, firstMove)
     }
 
     /// Re-ranks the remaining attempts after a context-overflow failure so the

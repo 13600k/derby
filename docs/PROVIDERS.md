@@ -131,6 +131,14 @@ up after 20 seconds and says exactly that rather than hanging for the request de
   `ultra` alongside the classic four. Derby models the full scale and asks each model for the
   strongest level it actually supports; the OpenAI REST API, which only accepts four, gets
   the nearest level it understands rather than a value it would reject.
+- **Encrypted reasoning is carried between turns.** Requests ask for
+  `include: ["reasoning.encrypted_content"]`, as the Codex CLI does, and the reasoning items
+  that come back are sent again ahead of the calls they led to — to the same account only,
+  since another cannot decrypt them. **Verified live:** a turn that needed thought returned a
+  reasoning item with `encrypted_content`, and the next turn carried it back as
+  `message, reasoning, function_call, function_call_output` even though the client was a Chat
+  Completions client that never saw it. A turn the model answers without reasoning returns no
+  item at all, and there is then nothing to carry.
 - **Verified end to end.** Completions now succeed through this backend, on two separate
   accounts simultaneously. Getting there required dropping `max_output_tokens`, which this
   endpoint rejects as an unsupported parameter, and surfacing the backend's `{"detail": …}`
@@ -202,8 +210,22 @@ parameter. The model id **is** the deployment name.
 ### Anthropic
 `max_tokens` is mandatory — Derby supplies one from the model catalog when the client omits
 it. System messages are hoisted out of the message list; tool results become `tool_result`
-blocks inside a *user* turn. Extended thinking sets a `budget_tokens` strictly below
-`max_tokens`, and drops `temperature`/`top_p`, which the API rejects while thinking is on.
+blocks inside a *user* turn, and can carry images.
+
+Thinking takes one of two forms, and newer models accept only one. Claude 4.6 and later —
+Opus 5, Sonnet 5, Fable and Mythos among them — get adaptive thinking,
+`thinking: {type: "adaptive"}` with `output_config.effort` clamped to the levels each model
+offers; from 4.7 on, a manual budget is rejected with a 400. Earlier models get a
+`budget_tokens` strictly below `max_tokens`. Either form drops `temperature`/`top_p`, which the
+API rejects while thinking is on, and is left off when a request forces a tool call, which
+thinking cannot be combined with (adaptive models keep their effort).
+
+Thinking blocks come back signed — on a stream, a `signature_delta` arrives just before the
+block ends — and `redacted_thinking` blocks carry opaque `data`. Derby keeps both and replays
+them first in the assistant turn: to Claude only, and only within the active tool loop, so a
+replayed prefix is always one the API issued. Manual thinking also stays off for a request
+that resumes a tool loop with no signed block to continue from, because the API requires the
+final assistant turn to begin with one.
 
 ### Google Gemini
 Roles are `user`/`model`; system prompts go in `systemInstruction`. Gemini's schema dialect
@@ -212,17 +234,30 @@ rejects several ordinary JSON Schema keywords (`additionalProperties`, `$schema`
 definition fail. A prompt blocked by safety returns no candidates at all, which is mapped to
 `CONTENT_POLICY`.
 
+Function responses are matched to calls by function *name*, and a turn of parallel calls must
+be answered by one turn holding as many responses, so consecutive tool results are merged.
+Gemini 3 validates **thought signatures**: each function call in the current turn must carry
+the signature Gemini issued with it (on the first call of a parallel set), or the request is
+rejected. Derby captures `thoughtSignature` from responses and streams and returns it; a call
+another model made gets Google's documented stand-in, `skip_thought_signature_validator`.
+
 ### AWS Bedrock
 SigV4 signing implemented with CryptoKit; the unified **Converse** API avoids per-model body
 shapes. Streaming uses Bedrock's binary `vnd.amazon.eventstream` framing, decoded by
 `AWSEventStreamParser` (prelude, string headers, payload; CRCs are skipped). Model discovery
 calls the `bedrock` control-plane host, which is a different service name from
-`bedrock-runtime`. **Unverified** — no AWS account was available.
+`bedrock-runtime`. Claude's thinking travels in `reasoningContent` — `reasoningText` with its
+signature, or `redactedContent` — and is captured and replayed under the same rules as the
+direct API. **Unverified** — no AWS account was available.
 
 ### OpenRouter, Together, Fireworks, Groq, Mistral, DeepSeek, xAI, Qwen
 All OpenAI-compatible. OpenRouter additionally publishes `context_length`,
 `architecture.input_modalities` and `supported_parameters` in `/models`, which discovery uses
 to fill in capabilities.
+
+Mistral models accept tool call ids of exactly nine letters and digits — through OpenRouter
+and Bedrock as well — so a history whose calls another model made has its ids rewritten,
+deterministically, with each result still following its call.
 
 ---
 
@@ -240,6 +275,37 @@ to fill in capabilities.
 Derby probes these on launch and offers one-click import of whatever models are loaded.
 Local targets are flat-rate (zero marginal cost), which is what makes `lowest_cost` and
 `local_first` prefer them.
+
+**What is loaded right now.** While the gateway runs, each enabled local server is asked every
+5 seconds which models it holds in memory: Ollama through `/api/ps`; LM Studio through
+`/api/v1/models`, counting entries with `loaded_instances`; vLLM, SGLang and llama.cpp serve
+only what they have loaded, so their `/v1/models` is the answer (llama.cpp in router mode adds
+a status per model). LocalAI reports nothing, so its targets can only count as recently used.
+A server that stops answering stops being trusted, rather than being remembered as it was.
+
+**Earlier reasoning.** Each server reads a previous turn's reasoning from its own field —
+Ollama `reasoning`; vLLM and SGLang `reasoning` or the older `reasoning_content`; llama.cpp and
+LM Studio `reasoning_content` — and Derby writes it only there, only for the same model family,
+and only for the turns that model's template reads back. Hybrid thinking models on vLLM,
+SGLang and llama.cpp get their template switch from the request's reasoning effort
+(`chat_template_kwargs.enable_thinking` for Qwen3, `thinking` for DeepSeek V3.1), and Ollama
+receives `reasoning_effort`. Output that writes `<think>` inline is split into reasoning and
+answer before the client sees it.
+
+**How busy it is.** The same poll asks what the server is working on, where it will say: vLLM
+and SGLang publish `vllm:num_requests_running` / `waiting` and KV cache use (`kv_cache_usage_perc`
+on v1 engines, `gpu_cache_usage_perc` before that; SGLang's own names under `sglang:`) on
+`/metrics`, and llama.cpp's `/slots` lists one entry per decoding slot. That report counts work
+Derby did not send, which its own in-flight counters cannot see, so routing prefers it whenever
+it is the worse number — and a server with no free slot is passed over while another target can
+answer. Ollama, LM Studio and LocalAI publish no such thing, so their targets are ranked on
+Derby's own counts alone.
+
+**Add a local server by its own kind.** One added as a *custom OpenAI-compatible* endpoint is
+sent standard fields only, and is never polled for what it has loaded, because Derby will not
+guess what is behind a custom URL. Verified live against one vLLM server added both ways: as
+**vLLM** it reported its served model and carried a previous turn's reasoning in `reasoning`;
+as a **custom endpoint** the same conversation arrived complete but with no such field.
 
 ---
 

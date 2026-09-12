@@ -12,6 +12,7 @@ public enum RoutingStrategyKind: String, Codable, Sendable, CaseIterable, Hashab
     case failoverChain = "failover_chain"
     case localFirst = "local_first"
     case cloudFirst = "cloud_first"
+    case leastLoaded = "least_loaded"
 
     public var displayName: String {
         switch self {
@@ -24,6 +25,7 @@ public enum RoutingStrategyKind: String, Codable, Sendable, CaseIterable, Hashab
         case .failoverChain: return "Failover Chain"
         case .localFirst: return "Local First"
         case .cloudFirst: return "Cloud First"
+        case .leastLoaded: return "Least Loaded"
         }
     }
 
@@ -38,8 +40,13 @@ public enum RoutingStrategyKind: String, Codable, Sendable, CaseIterable, Hashab
         case .failoverChain: return "A strict chain: each target is only used when the ones above it fail."
         case .localFirst: return "Use local models when they are healthy; fall back to the cloud."
         case .cloudFirst: return "Use cloud models first; fall back to local models in an emergency."
+        case .leastLoaded: return "Send each request to the target with the most spare capacity right now, counting requests already on their way to it."
         }
     }
+
+    /// Strategies whose order is the user's explicit instruction, which Derby
+    /// does not quietly rearrange.
+    public var respectsConfiguredOrder: Bool { self == .priority || self == .failoverChain }
 
     /// Whether the strategy consumes the per-target `weight` field.
     public var usesWeights: Bool { self == .weightedRandom }
@@ -59,16 +66,48 @@ public struct ScoreWeights: Codable, Sendable, Hashable {
     public var providerPreference: Double
     public var localPreference: Double
     public var contextHeadroom: Double
+    /// Spare concurrency on the target's account right now.
+    public var load: Double
+    /// Whether a local model is already in memory rather than needing a cold load.
+    public var warmth: Double
+    /// Whether the target is the same model lineage that wrote the conversation
+    /// so far, so nothing has to be carried across a family boundary.
+    public var continuity: Double
 
     public init(quality: Double = 0.35, latency: Double = 0.20, cost: Double = 0.10,
                 health: Double = 0.20, quota: Double = 0.10, priority: Double = 0.05,
                 providerPreference: Double = 0, localPreference: Double = 0,
-                contextHeadroom: Double = 0) {
+                contextHeadroom: Double = 0, load: Double = 0, warmth: Double = 0,
+                continuity: Double = 0) {
         self.quality = quality; self.latency = latency; self.cost = cost
         self.health = health; self.quota = quota; self.priority = priority
         self.providerPreference = providerPreference
         self.localPreference = localPreference
         self.contextHeadroom = contextHeadroom
+        self.load = load; self.warmth = warmth; self.continuity = continuity
+    }
+
+    // Field by field: weights saved before a dimension existed decode with that
+    // dimension switched off, rather than failing the whole logical model.
+    private enum CodingKeys: String, CodingKey {
+        case quality, latency, cost, health, quota, priority, providerPreference, localPreference
+        case contextHeadroom, load, warmth, continuity
+    }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let defaults = ScoreWeights()
+        quality = try c.decodeIfPresent(Double.self, forKey: .quality) ?? defaults.quality
+        latency = try c.decodeIfPresent(Double.self, forKey: .latency) ?? defaults.latency
+        cost = try c.decodeIfPresent(Double.self, forKey: .cost) ?? defaults.cost
+        health = try c.decodeIfPresent(Double.self, forKey: .health) ?? defaults.health
+        quota = try c.decodeIfPresent(Double.self, forKey: .quota) ?? defaults.quota
+        priority = try c.decodeIfPresent(Double.self, forKey: .priority) ?? defaults.priority
+        providerPreference = try c.decodeIfPresent(Double.self, forKey: .providerPreference) ?? 0
+        localPreference = try c.decodeIfPresent(Double.self, forKey: .localPreference) ?? 0
+        contextHeadroom = try c.decodeIfPresent(Double.self, forKey: .contextHeadroom) ?? 0
+        load = try c.decodeIfPresent(Double.self, forKey: .load) ?? 0
+        warmth = try c.decodeIfPresent(Double.self, forKey: .warmth) ?? 0
+        continuity = try c.decodeIfPresent(Double.self, forKey: .continuity) ?? 0
     }
 
     public static let balanced = ScoreWeights()
@@ -80,12 +119,13 @@ public struct ScoreWeights: Codable, Sendable, Hashable {
         [("Quality", \.quality), ("Latency", \.latency), ("Cost", \.cost),
          ("Health", \.health), ("Spare quota", \.quota), ("Priority", \.priority),
          ("Provider preference", \.providerPreference), ("Local preference", \.localPreference),
-         ("Context headroom", \.contextHeadroom)]
+         ("Context headroom", \.contextHeadroom), ("Spare capacity", \.load),
+         ("Model already loaded", \.warmth), ("Conversation continuity", \.continuity)]
     }
 
     public var total: Double {
         max(0.0001, quality + latency + cost + health + quota + priority
-            + providerPreference + localPreference + contextHeadroom)
+            + providerPreference + localPreference + contextHeadroom + load + warmth + continuity)
     }
     public var normalized: ScoreWeights {
         let t = total
@@ -93,7 +133,8 @@ public struct ScoreWeights: Codable, Sendable, Hashable {
                             health: health / t, quota: quota / t, priority: priority / t,
                             providerPreference: providerPreference / t,
                             localPreference: localPreference / t,
-                            contextHeadroom: contextHeadroom / t)
+                            contextHeadroom: contextHeadroom / t,
+                            load: load / t, warmth: warmth / t, continuity: continuity / t)
     }
 }
 
@@ -127,6 +168,10 @@ public struct RoutingPolicy: Codable, Sendable, Hashable {
     public var maxCandidates: Int
     /// Deterministic tie-breaking makes the simulator reproducible.
     public var deterministic: Bool
+    /// Among copies of the same model, try one that is already loaded before
+    /// one that would have to load first. Nil means the strategy's default:
+    /// on, except where the user's own ordering is the instruction.
+    public var preferWarmModels: Bool?
 
     public init(strategy: RoutingStrategyKind = .priority,
                 scoreWeights: ScoreWeights = .balanced,
@@ -134,7 +179,8 @@ public struct RoutingPolicy: Codable, Sendable, Hashable {
                 respectCircuitBreakers: Bool = true,
                 respectQuotas: Bool = true,
                 maxCandidates: Int = 8,
-                deterministic: Bool = false) {
+                deterministic: Bool = false,
+                preferWarmModels: Bool? = nil) {
         self.strategy = strategy
         self.scoreWeights = scoreWeights
         self.latencyMetric = latencyMetric
@@ -142,6 +188,17 @@ public struct RoutingPolicy: Codable, Sendable, Hashable {
         self.respectQuotas = respectQuotas
         self.maxCandidates = maxCandidates
         self.deterministic = deterministic
+        self.preferWarmModels = preferWarmModels
+    }
+
+    public var effectivePreferWarmModels: Bool {
+        preferWarmModels ?? !strategy.respectsConfiguredOrder
+    }
+
+    /// Whether ranking reads live load, which makes a reservation necessary.
+    public var readsLoad: Bool {
+        strategy == .leastLoaded || (strategy.usesScoreWeights || strategy == .localFirst
+                                     || strategy == .cloudFirst) && scoreWeights.load > 0
     }
 }
 
@@ -374,6 +431,31 @@ public struct CompactionPolicy: Codable, Sendable, Hashable {
     public static let disabled = CompactionPolicy()
 }
 
+/// How a conversation is carried when the model answering it changes.
+///
+/// Structure is always made to fit the receiving model — that only prevents
+/// rejections. Reasoning is the choice: carried to a model of the same lineage
+/// it lets a tool loop continue from where the last model's thinking stopped,
+/// at the cost of sending that reasoning along. It never goes to a different
+/// model family, which would read it as something the assistant said.
+public struct HandoffPolicy: Codable, Sendable, Hashable {
+    /// Carry an earlier model's reasoning to the next turn when the model
+    /// answering is the same lineage and its API or template reads it.
+    public var replayReasoning: Bool
+
+    public init(replayReasoning: Bool = true) {
+        self.replayReasoning = replayReasoning
+    }
+
+    public static let `default` = HandoffPolicy()
+
+    private enum CodingKeys: String, CodingKey { case replayReasoning }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        replayReasoning = try c.decodeIfPresent(Bool.self, forKey: .replayReasoning) ?? true
+    }
+}
+
 /// A deliberate narrowing of what a logical model offers.
 ///
 /// Model capabilities are facts reported by the provider and are not editable
@@ -480,6 +562,9 @@ public struct LogicalModel: Codable, Sendable, Hashable, Identifiable {
     /// What to do when a conversation outgrows the target chosen to answer it.
     /// Optional so older configurations decode; nil means disabled.
     public var compaction: CompactionPolicy?
+    /// How the conversation is carried between models. Optional so older
+    /// configurations decode; nil means the default.
+    public var handoff: HandoffPolicy?
     public var createdAt: Date
     public var updatedAt: Date
 
@@ -491,6 +576,7 @@ public struct LogicalModel: Codable, Sendable, Hashable, Identifiable {
                 requiredCapabilities: CapabilityFlags = [],
                 constraints: LogicalModelConstraints? = nil,
                 compaction: CompactionPolicy? = nil,
+                handoff: HandoffPolicy? = nil,
                 createdAt: Date = Date(), updatedAt: Date = Date()) {
         self.id = id; self.name = name; self.summary = summary; self.enabled = enabled
         self.targets = targets; self.policy = policy; self.retry = retry
@@ -499,6 +585,7 @@ public struct LogicalModel: Codable, Sendable, Hashable, Identifiable {
         self.requiredCapabilities = requiredCapabilities
         self.constraints = constraints
         self.compaction = compaction
+        self.handoff = handoff
         self.createdAt = createdAt; self.updatedAt = updatedAt
     }
 }

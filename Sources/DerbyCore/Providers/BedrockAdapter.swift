@@ -79,11 +79,21 @@ public struct BedrockAdapter: ProviderAdapter {
         var content: [CanonicalContent] = []
         var toolCalls: [CanonicalToolCall] = []
         var reasoning = ""
+        var artifacts: [ReasoningArtifact] = []
         for block in json["output"]?["message"]?["content"]?.arrayValue ?? [] {
             if let t = block["text"]?.stringValue { content.append(.text(t)) }
-            if let rc = block["reasoningContent"]?["reasoningText"]?["text"]?.stringValue { reasoning += rc }
+            if let rc = block["reasoningContent"], !rc.isNull {
+                let text = rc["reasoningText"]?["text"]?.stringValue
+                if let text { reasoning += text }
+                if let sig = rc["reasoningText"]?["signature"]?.stringValue, !sig.isEmpty {
+                    artifacts.append(ReasoningArtifact(format: .anthropicThinking, payload: sig, text: text))
+                }
+                if let redacted = rc["redactedContent"]?.stringValue, !redacted.isEmpty {
+                    artifacts.append(ReasoningArtifact(format: .anthropicRedactedThinking, payload: redacted))
+                }
+            }
             if let tu = block["toolUse"], !tu.isNull {
-                toolCalls.append(CanonicalToolCall(id: tu["toolUseId"]?.stringValue ?? "call_\(toolCalls.count)",
+                toolCalls.append(CanonicalToolCall(id: tu["toolUseId"]?.stringValue ?? "",
                                                    name: tu["name"]?.stringValue ?? "",
                                                    argumentsJSON: (tu["input"] ?? .object([:])).compactJSONString))
             }
@@ -91,7 +101,8 @@ public struct BedrockAdapter: ProviderAdapter {
         return CanonicalResponse(id: IDGenerator.requestID(), model: model,
                                  message: CanonicalMessage(role: .assistant, content: content,
                                                            toolCalls: toolCalls,
-                                                           reasoning: reasoning.isEmpty ? nil : reasoning),
+                                                           reasoning: reasoning.isEmpty ? nil : reasoning,
+                                                           reasoningArtifacts: artifacts),
                                  finishReason: mapStop(json["stopReason"]?.stringValue),
                                  usage: parseUsage(json["usage"] ?? .null))
     }
@@ -115,6 +126,8 @@ public struct BedrockAdapter: ProviderAdapter {
                 var parser = AWSEventStreamParser()
                 var toolIndexForBlock: [Int: Int] = [:]
                 var nextToolIndex = 0
+                var reasoningForBlock: [Int: String] = [:]
+                var signatureForBlock: [Int: String] = [:]
                 var usage = CanonicalUsage.zero
                 var finish = CanonicalFinishReason.stop
                 continuation.yield(.start(id: IDGenerator.requestID(), model: model))
@@ -130,7 +143,7 @@ public struct BedrockAdapter: ProviderAdapter {
                                     nextToolIndex += 1
                                     toolIndexForBlock[idx] = t
                                     continuation.yield(.toolCallStart(index: t,
-                                                                      id: tu["toolUseId"]?.stringValue ?? "call_\(t)",
+                                                                      id: tu["toolUseId"]?.stringValue ?? "",
                                                                       name: tu["name"]?.stringValue ?? ""))
                                 }
                             case "contentBlockDelta":
@@ -138,10 +151,25 @@ public struct BedrockAdapter: ProviderAdapter {
                                 let delta = json["delta"] ?? .null
                                 if let t = delta["text"]?.stringValue, !t.isEmpty { continuation.yield(.textDelta(t)) }
                                 if let r = delta["reasoningContent"]?["text"]?.stringValue, !r.isEmpty {
+                                    reasoningForBlock[idx, default: ""] += r
                                     continuation.yield(.reasoningDelta(r))
+                                }
+                                if let sig = delta["reasoningContent"]?["signature"]?.stringValue, !sig.isEmpty {
+                                    signatureForBlock[idx] = sig
+                                }
+                                if let redacted = delta["reasoningContent"]?["redactedContent"]?.stringValue, !redacted.isEmpty {
+                                    continuation.yield(.reasoningArtifact(ReasoningArtifact(
+                                        format: .anthropicRedactedThinking, payload: redacted)))
                                 }
                                 if let input = delta["toolUse"]?["input"]?.stringValue, !input.isEmpty {
                                     continuation.yield(.toolCallArgumentsDelta(index: toolIndexForBlock[idx] ?? 0, delta: input))
+                                }
+                            case "contentBlockStop":
+                                let idx = json["contentBlockIndex"]?.intValue ?? 0
+                                if let sig = signatureForBlock.removeValue(forKey: idx) {
+                                    continuation.yield(.reasoningArtifact(ReasoningArtifact(
+                                        format: .anthropicThinking, payload: sig,
+                                        text: reasoningForBlock.removeValue(forKey: idx))))
                                 }
                             case "messageStop":
                                 finish = mapStop(json["stopReason"]?.stringValue)
@@ -194,6 +222,23 @@ public struct BedrockAdapter: ProviderAdapter {
                 ])]))
             case .assistant:
                 var blocks: [JSONValue] = []
+                // Claude's signed reasoning, in Converse's shape; the signature is
+                // the same one Anthropic's own API issues.
+                for artifact in m.reasoningArtifacts {
+                    switch artifact.format {
+                    case .anthropicThinking:
+                        blocks.append(.object(["reasoningContent": .object([
+                            "reasoningText": .object(["text": .string(artifact.text ?? ""),
+                                                      "signature": .string(artifact.payload)]),
+                        ])]))
+                    case .anthropicRedactedThinking:
+                        blocks.append(.object(["reasoningContent": .object([
+                            "redactedContent": .string(artifact.payload),
+                        ])]))
+                    default:
+                        break
+                    }
+                }
                 let t = m.joinedText
                 if !t.isEmpty { blocks.append(.object(["text": .string(t)])) }
                 for tc in m.toolCalls {

@@ -214,17 +214,25 @@ public struct ClaudeCLIAdapter: ProviderAdapter {
         for (index, message) in spoken.enumerated() {
             let isLast = index == spoken.count - 1
             let label: String
+            var body = message.joinedText
             switch message.role {
-            case .assistant: label = "Assistant"
-            case .tool: label = "Tool result"
-            default: label = "User"
+            case .assistant:
+                label = "Assistant"
+                // A turn that only called tools would otherwise read as silence,
+                // and the results that follow would answer nothing.
+                let calls = message.toolCalls.map { "[called \($0.name) with \($0.argumentsJSON)]" }
+                if !calls.isEmpty { body = ([body] + calls).filter { !$0.isEmpty }.joined(separator: " ") }
+            case .tool:
+                label = "Tool result" + (message.name.map { " from \($0)" } ?? "")
+            default:
+                label = "User"
             }
             if isLast, message.role == .user {
                 lines.append("")
                 lines.append("Respond to this latest message:")
-                lines.append(message.joinedText)
+                lines.append(body)
             } else {
-                lines.append("\(label): \(message.joinedText)")
+                lines.append("\(label): \(body)")
             }
         }
         return lines.joined(separator: "\n")

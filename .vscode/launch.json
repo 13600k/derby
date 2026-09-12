@@ -1,0 +1,44 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:derby}",
+            "name": "Debug DerbyApp",
+            "target": "DerbyApp",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug DerbyApp"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:derby}",
+            "name": "Release DerbyApp",
+            "target": "DerbyApp",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release DerbyApp"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:derby}",
+            "name": "Debug DerbyTests",
+            "target": "DerbyTests",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug DerbyTests"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:derby}",
+            "name": "Release DerbyTests",
+            "target": "DerbyTests",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release DerbyTests"
+        }
+    ]
+}

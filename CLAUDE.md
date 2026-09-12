@@ -21,8 +21,9 @@ Pure SwiftPM, **no third-party dependencies**. Only the Command Line Tools are r
 ```bash
 swift build                        # debug build of DerbyCore + DerbyApp
 swift build -c release             # release build
-swift run DerbyTests               # all 363 tests (~4s, no network)
+swift run DerbyTests               # all 453 tests (~5s, no network)
 swift run DerbyTests Routing       # filter by suite or test name
+DERBY_LIVE=1 swift run DerbyTests Live   # opt-in: this machine's real providers
 
 ./Scripts/build_app.sh             # assemble + ad-hoc sign build/Derby.app
 ./Scripts/build_app.sh --run       # ...and launch it
@@ -49,6 +50,7 @@ HTTP (Network.framework listener)
   → Routing/        capability + health + budget filters, then a strategy ranks
                     survivors into a RoutePlan (with per-attempt timeouts)
   → Execution/      run the plan: retry, failover, hedging, deadline, cancellation
+  → Handoff/        repair the conversation and shape it for the model each attempt reaches
   → Providers/      one adapter per protocol family speaks the wire format
   → Telemetry/      record attempts, usage, cost, routing explanation
 ```
@@ -117,7 +119,7 @@ no context window, which silently disabled `minContextTokens` filtering and
 Routing normally handles context by *selection*: a target whose window cannot hold
 `prompt + reserved answer` is excluded, and if none fits the request fails with
 `CONTEXT_OVERFLOW` (kept distinct from `CAPABILITY_MISMATCH`, because the remedy differs).
-Derby does not rewrite the conversation.
+Derby does not shorten the conversation.
 
 A logical model may opt out of that edge with a `CompactionPolicy` — off by default. It makes
 a merely-too-small target eligible again (a target missing a *capability* is still excluded)
@@ -134,6 +136,45 @@ Failover is only transparent *before* the first byte reaches the client. Once co
 been streamed, the executor must not silently switch providers — see `StreamingSemantics`.
 Adapters translate their native SSE dialect into `CanonicalStreamEvent`; the API layer
 translates that back into the dialect the client asked in.
+
+### Conversation hand-off
+
+A conversation changes models routinely — between turns under a spreading strategy, within
+one on failover. `Handoff/` exists so the answer differs because the model does, never
+because something was lost in translation (`docs/ARCHITECTURE.md` has the full design). The
+load-bearing rules:
+
+- **Reasoning goes only to the same lineage** — `LineageAffinity.sharesReasoningFormat`
+  (identical or same family), in a field the server reads, for the turns the receiving
+  template reads back. Never across families.
+- **Signed reasoning** (`ReasoningArtifact`: Anthropic signatures, OpenAI encrypted content,
+  Gemini thought signatures) returns only to a model that can verify it, and only within the
+  active tool loop. Fable 5.1 binds thinking to the prefix it was issued with (enforced for
+  newer accounts), so a block replayed out of context can fail the whole request.
+- **Template behaviour is data.** It lives in `LineageTraits`; provider facts stay in
+  `ProviderKind`/`AdapterFamily` properties. Nothing in `Handoff/` branches on a provider.
+- **The ledger is a cache.** `HandoffLedger` is in memory and bounded; a miss may cost restored
+  reasoning, never correctness.
+- **Never silent.** Anything withheld, rewritten or repaired is counted in `HandoffRecord` and
+  surfaced as `x_derby.handoff`, the `x-derby-handoff` header, the routing explanation and
+  request history.
+
+### Load, loaded models and disconnects
+
+- The router stays pure. Load reaches it through the snapshot (`accountLoad`, `loadVersion`,
+  `residency`); the **gateway** claims the chosen target with
+  `HealthRegistry.reserve(_:accountID:ifLoadVersion:)` and routes again when the counts moved.
+  The executor converts the reservation at `acquire` and releases whatever is left on exit.
+- Warm-copy preference reorders only copies with the same `ModelLineage.identity`. It must
+  never promote a different model.
+- **A server's own account of its load beats Derby's.** `ProviderAdapter.occupancy` reads what
+  vLLM, SGLang and llama.cpp publish (an `OccupancyStyle` per kind, never a branch), and
+  `loadUtilization` takes whichever is worse. A server reporting no free slot is skipped while
+  another target can answer, and kept when it is the only one — queueing beats failing. It is a
+  learned rate limit, so it rides on `respectQuotas` and never becomes a new setting.
+- `HTTPServer` watches the socket while a handler runs and cancels it on EOF. **Only one
+  receive may be outstanding on an `NWConnection`**: the watch and request parsing share
+  `pendingReceive`, and each watch is numbered so a stale one cannot act for a later request.
 
 ## Provider integration notes
 

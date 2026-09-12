@@ -97,6 +97,8 @@ final class MockAdapter: ProviderAdapter, @unchecked Sendable {
         /// Fail the first `count` calls, then succeed.
         case failThenSucceed(count: Int, error: DerbyError, text: String)
         case hang(seconds: Double)
+        /// Answer with a complete message: reasoning, tool calls, artifacts.
+        case respond(CanonicalMessage)
     }
 
     private let lock = NSLock()
@@ -165,6 +167,10 @@ final class MockAdapter: ProviderAdapter, @unchecked Sendable {
             throw DerbyError(kind: .unknown, message: "hang should have been cancelled")
         case .failThenSucceed:
             throw DerbyError(kind: .unknown, message: "unreachable")
+        case .respond(let message):
+            return CanonicalResponse(id: IDGenerator.requestID(), model: model, message: message,
+                                     finishReason: message.toolCalls.isEmpty ? .stop : .toolCalls,
+                                     usage: CanonicalUsage(inputTokens: 10, outputTokens: 5))
         }
     }
 
@@ -197,6 +203,18 @@ final class MockAdapter: ProviderAdapter, @unchecked Sendable {
                     c.finish(throwing: e)
                 case .failThenSucceed:
                     c.finish(throwing: DerbyError(kind: .unknown, message: "unreachable"))
+                case .respond(let message):
+                    c.yield(.start(id: IDGenerator.requestID(), model: model))
+                    if let reasoning = message.reasoning { c.yield(.reasoningDelta(reasoning)) }
+                    if !message.joinedText.isEmpty { c.yield(.textDelta(message.joinedText)) }
+                    for (i, call) in message.toolCalls.enumerated() {
+                        c.yield(.toolCallStart(index: i, id: call.id, name: call.name))
+                        c.yield(.toolCallArgumentsDelta(index: i, delta: call.argumentsJSON))
+                    }
+                    for artifact in message.reasoningArtifacts { c.yield(.reasoningArtifact(artifact)) }
+                    c.yield(.usage(CanonicalUsage(inputTokens: 10, outputTokens: 5)))
+                    c.yield(.finish(message.toolCalls.isEmpty ? .stop : .toolCalls))
+                    c.finish()
                 }
             }
         }
@@ -331,6 +349,20 @@ extension Array {
     subscript(safe index: Int) -> Element? {
         indices.contains(index) ? self[index] : nil
     }
+}
+
+/// Polls `condition` until it holds, failing after `seconds`. It checks a value
+/// between short sleeps; it never races a sleep against a continuation.
+func eventually(_ what: String, within seconds: Double = 3,
+                file: String = #fileID, line: Int = #line,
+                _ condition: @escaping () async -> Bool) async throws {
+    let deadline = Date().addingTimeInterval(seconds)
+    while Date() < deadline {
+        if await condition() { return }
+        try await Task.sleep(nanoseconds: 10_000_000)
+    }
+    if await condition() { return }
+    throw TestFailure(message: "timed out waiting until \(what)", file: file, line: line)
 }
 
 /// Collects records and logs the executor emits.

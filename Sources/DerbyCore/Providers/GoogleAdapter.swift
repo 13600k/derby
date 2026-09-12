@@ -119,14 +119,22 @@ public struct GoogleAdapter: ProviderAdapter {
                                 if part["thought"]?.boolValue == true { continuation.yield(.reasoningDelta(t)) }
                                 else { continuation.yield(.textDelta(t)) }
                             }
+                            let signature = part["thoughtSignature"]?.stringValue
                             if let fc = part["functionCall"], !fc.isNull {
                                 let idx = toolIndex
                                 toolIndex += 1
-                                continuation.yield(.toolCallStart(index: idx,
-                                                                  id: fc["id"]?.stringValue ?? "call_\(idx)",
+                                let id = fc["id"]?.stringValue ?? ""
+                                continuation.yield(.toolCallStart(index: idx, id: id,
                                                                   name: fc["name"]?.stringValue ?? ""))
                                 continuation.yield(.toolCallArgumentsDelta(index: idx,
                                                                            delta: (fc["args"] ?? .object([:])).compactJSONString))
+                                if let signature, !signature.isEmpty {
+                                    continuation.yield(.reasoningArtifact(ReasoningArtifact(
+                                        format: .geminiThoughtSignature, payload: signature, toolCallID: id)))
+                                }
+                            } else if let signature, !signature.isEmpty {
+                                continuation.yield(.reasoningArtifact(ReasoningArtifact(
+                                    format: .geminiThoughtSignature, payload: signature)))
                             }
                         }
                         if let fr = candidate["finishReason"]?.stringValue { finish = mapFinish(fr, hasTools: toolIndex > 0) }
@@ -184,20 +192,43 @@ public struct GoogleAdapter: ProviderAdapter {
                 let t = m.joinedText
                 if !t.isEmpty { systemParts.append(.object(["text": .string(t)])) }
             case .tool:
+                // Gemini matches a response to its call by function name — the
+                // call id is not a name, and sending one fails the match.
                 let part = JSONValue.object([
                     "functionResponse": .object([
-                        "name": .string(m.name ?? m.toolCallID ?? "tool"),
+                        "name": .string(m.name ?? "tool"),
                         "response": .object(["result": JSONValue.parse(m.joinedText) ?? .string(m.joinedText)]),
                     ]),
                 ])
-                contents.append(.object(["role": .string("user"), "parts": .array([part])]))
+                // Parallel calls are answered in one turn: Gemini rejects a
+                // model turn whose call count differs from the responses after it.
+                if var last = contents.last?.objectValue, last["role"]?.stringValue == "user",
+                   var parts = last["parts"]?.arrayValue, !parts.isEmpty,
+                   parts.allSatisfy({ $0["functionResponse"] != nil }) {
+                    parts.append(part)
+                    last["parts"] = .array(parts)
+                    contents[contents.count - 1] = .object(last)
+                } else {
+                    contents.append(.object(["role": .string("user"), "parts": .array([part])]))
+                }
             case .assistant:
                 var parts: [JSONValue] = []
+                let signatures = m.reasoningArtifacts.filter { $0.format == .geminiThoughtSignature }
                 let t = m.joinedText
-                if !t.isEmpty { parts.append(.object(["text": .string(t)])) }
+                if !t.isEmpty {
+                    var part: [String: JSONValue] = ["text": .string(t)]
+                    if let sig = signatures.first(where: { $0.toolCallID == nil }) {
+                        part["thoughtSignature"] = .string(sig.payload)
+                    }
+                    parts.append(.object(part))
+                }
                 for tc in m.toolCalls {
-                    parts.append(.object(["functionCall": .object(["name": .string(tc.name),
-                                                                   "args": tc.argumentsValue])]))
+                    var part: [String: JSONValue] = ["functionCall": .object(["name": .string(tc.name),
+                                                                              "args": tc.argumentsValue])]
+                    if let sig = signatures.first(where: { $0.toolCallID == tc.id }) {
+                        part["thoughtSignature"] = .string(sig.payload)
+                    }
+                    parts.append(.object(part))
                 }
                 if parts.isEmpty { parts.append(.object(["text": .string("")])) }
                 contents.append(.object(["role": .string("model"), "parts": .array(parts)]))
@@ -324,18 +355,27 @@ public struct GoogleAdapter: ProviderAdapter {
         var content: [CanonicalContent] = []
         var toolCalls: [CanonicalToolCall] = []
         var reasoning = ""
+        var artifacts: [ReasoningArtifact] = []
         for part in candidate["content"]?["parts"]?.arrayValue ?? [] {
             if let t = part["text"]?.stringValue {
                 if part["thought"]?.boolValue == true { reasoning += t } else { content.append(.text(t)) }
             }
+            let signature = part["thoughtSignature"]?.stringValue
             if let fc = part["functionCall"], !fc.isNull {
-                toolCalls.append(CanonicalToolCall(id: fc["id"]?.stringValue ?? "call_\(toolCalls.count)",
+                let id = fc["id"]?.stringValue ?? ""
+                toolCalls.append(CanonicalToolCall(id: id,
                                                    name: fc["name"]?.stringValue ?? "",
                                                    argumentsJSON: (fc["args"] ?? .object([:])).compactJSONString))
+                if let signature, !signature.isEmpty {
+                    artifacts.append(ReasoningArtifact(format: .geminiThoughtSignature, payload: signature, toolCallID: id))
+                }
+            } else if let signature, !signature.isEmpty {
+                artifacts.append(ReasoningArtifact(format: .geminiThoughtSignature, payload: signature))
             }
         }
         let msg = CanonicalMessage(role: .assistant, content: content, toolCalls: toolCalls,
-                                   reasoning: reasoning.isEmpty ? nil : reasoning)
+                                   reasoning: reasoning.isEmpty ? nil : reasoning,
+                                   reasoningArtifacts: artifacts)
         return CanonicalResponse(id: json["responseId"]?.stringValue ?? IDGenerator.requestID(),
                                  model: json["modelVersion"]?.stringValue ?? fallbackModel,
                                  message: msg,

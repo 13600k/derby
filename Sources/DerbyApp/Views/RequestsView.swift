@@ -228,8 +228,33 @@ struct RequestInspector: View {
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
+
+                // The conversation moved between models, or had to change to
+                // reach this one: what the answering model did and did not get.
+                if let h = record.handoff, h.isNotable {
+                    Divider()
+                    Label {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(handoffTitle(h)).font(.callout.weight(.semibold))
+                            Text(h.summary)
+                                .font(.caption).foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                        }
+                    } icon: {
+                        Image(systemName: "arrow.left.arrow.right")
+                            .foregroundStyle(h.reasoningWithheld + h.signedReasoningWithheld > 0 ? .orange : .secondary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
             }
         }
+    }
+
+    private func handoffTitle(_ h: HandoffRecord) -> String {
+        guard let previous = h.previousModel, previous != h.targetModel else {
+            return "Conversation carried to \(h.targetModel)"
+        }
+        return "Conversation handed from \(previous) to \(h.targetModel) (\(h.affinity.displayName))"
     }
 
     private var candidatesCard: some View {

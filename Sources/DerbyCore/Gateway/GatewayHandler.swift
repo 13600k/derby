@@ -15,11 +15,14 @@ public struct GatewayHandler: Sendable {
     let localAPIKey: String?
     let promptLogging: PromptLoggingMode
     let startedAt: Date
+    let residency: ResidencyRegistry
 
     public init(state: ControlPlaneState, health: HealthRegistry, telemetry: TelemetryStore,
                 executor: Executor, secrets: any SecretStore, router: Router = Router(),
                 gatewaySettings: GatewaySettings, localAPIKey: String?,
-                promptLogging: PromptLoggingMode, startedAt: Date = Date()) {
+                promptLogging: PromptLoggingMode, startedAt: Date = Date(),
+                residency: ResidencyRegistry = ResidencyRegistry()) {
+        self.residency = residency
         self.state = state
         self.health = health
         self.telemetry = telemetry
@@ -140,8 +143,36 @@ public struct GatewayHandler: Sendable {
     // MARK: - Snapshot helper
 
     private func snapshot() async -> RoutingSnapshot {
-        let h = await health.snapshot()
-        return await state.snapshot(health: h)
+        let live = await health.snapshotWithLoad()
+        var snap = await state.snapshot(health: live.health)
+        snap.accountLoad = live.accountLoad
+        snap.loadVersion = live.loadVersion
+        snap.residency = await residency.snapshot()
+        return snap
+    }
+
+    /// Claims the first planned target when the ranking read live load.
+    ///
+    /// The claim succeeds only if no load moved since the snapshot the ranking
+    /// read; otherwise a concurrent request got there first, so route again on
+    /// fresh counts. After a few tries the claim is taken regardless — a burst
+    /// that keeps changing the counts is already being spread.
+    private func claimLoad(_ decision: inout RoutingDecision, routing: RoutingRequest,
+                           snapshot: RoutingSnapshot, cursor: Int) async -> HealthRegistry.LoadReservation? {
+        guard decision.plan.isLoadSensitive else { return nil }
+        var version = snapshot.loadVersion
+        for attempt in 0..<4 {
+            guard let first = decision.plan.attempts.first?.target else { return nil }
+            if let claimed = await health.reserve(first.key, accountID: first.account.id,
+                                                  ifLoadVersion: attempt < 3 ? version : nil) {
+                return claimed
+            }
+            let fresh = await self.snapshot()
+            guard let rerouted = try? router.route(routing, snapshot: fresh, roundRobinCursor: cursor) else { return nil }
+            decision = rerouted
+            version = fresh.loadVersion
+        }
+        return nil
     }
 
     // MARK: - Endpoints
@@ -315,13 +346,18 @@ public struct GatewayHandler: Sendable {
         return await run(canonical, request: request, requestID: requestID, headers: headers, dialect: .responses)
     }
 
-    private func run(_ canonical: CanonicalRequest, request: HTTPServerRequest, requestID: String,
+    private func run(_ parsed: CanonicalRequest, request: HTTPServerRequest, requestID: String,
                      headers: [String: String], dialect: APIDialect) async -> HTTPServerResponse {
+        // Which model wrote each earlier answer, and the reasoning the client's
+        // dialect could not carry back. Routing reads the first; the handoff
+        // planner reads both.
+        let canonical = await executor.ledger.annotate(parsed)
         let snap = await snapshot()
         let cursor = await state.nextCursor(for: canonical.requestedModel)
-        let decision: RoutingDecision
+        let routing = RoutingRequest(canonical)
+        var decision: RoutingDecision
         do {
-            decision = try router.route(RoutingRequest(canonical), snapshot: snap, roundRobinCursor: cursor)
+            decision = try router.route(routing, snapshot: snap, roundRobinCursor: cursor)
         } catch {
             let e = error as? DerbyError ?? DerbyError(kind: .unknown, message: error.localizedDescription)
             await telemetry.log(LogEntry(level: .warn, category: "routing",
@@ -337,9 +373,11 @@ public struct GatewayHandler: Sendable {
             return .json(e.clientHTTPStatus, OpenAIResponseWriter.errorObject(e, requestID: requestID), headers: headers)
         }
 
+        let reservation = await claimLoad(&decision, routing: routing, snapshot: snap, cursor: cursor)
         let meta = RequestMeta(requestID: requestID, clientName: request.clientName, dialect: dialect,
                                promptLogging: promptLogging,
-                               promptExcerpt: promptExcerpt(canonical))
+                               promptExcerpt: promptExcerpt(canonical),
+                               loadReservation: reservation)
 
         if canonical.stream {
             return streamingResponse(canonical, decision: decision, meta: meta, headers: headers, dialect: dialect)
@@ -359,6 +397,9 @@ public struct GatewayHandler: Sendable {
             if let c = outcome.record.compaction {
                 h["x-derby-compacted"] = "\(c.originalTokens);\(c.compactedTokens);\(c.strategy.rawValue)"
             }
+            if let handoff = outcome.record.handoff, handoff.isNotable {
+                h["x-derby-handoff"] = headerSafe(Self.handoffHeader(handoff))
+            }
             return .json(200, payload, headers: h)
         } catch {
             let e = error as? DerbyError ?? DerbyError(kind: .unknown, message: error.localizedDescription)
@@ -366,6 +407,14 @@ public struct GatewayHandler: Sendable {
             h["x-derby-request-id"] = requestID
             return .json(e.clientHTTPStatus, OpenAIResponseWriter.errorObject(e, requestID: requestID), headers: h)
         }
+    }
+
+    /// `affinity;previous model;model;carried=N;withheld=N`, for clients that
+    /// read headers but not bodies.
+    static func handoffHeader(_ h: HandoffRecord) -> String {
+        [h.affinity.rawValue, h.previousModel ?? "-", h.targetModel,
+         "carried=\(h.reasoningCarried + h.signedReasoningCarried)",
+         "withheld=\(h.reasoningWithheld + h.signedReasoningWithheld)"].joined(separator: ";")
     }
 
     private func promptExcerpt(_ r: CanonicalRequest) -> String? {
@@ -504,6 +553,9 @@ public struct GatewayHandler: Sendable {
                             pendingUsage = u
                         case .finish(let reason):
                             if dialect != .responses { try await send(emitter.finishChunk(reason)) }
+                        case .reasoningArtifact:
+                            // Sealed reasoning is for the next model, not the client.
+                            break
                         }
 
                     case .finished(let record):
@@ -570,9 +622,12 @@ public struct GatewayHandler: Sendable {
         let snap = await snapshot()
         let cursor = await state.nextCursor(for: canonical.requestedModel)
         do {
-            let decision = try router.route(RoutingRequest(canonical), snapshot: snap, roundRobinCursor: cursor)
+            let routing = RoutingRequest(canonical)
+            var decision = try router.route(routing, snapshot: snap, roundRobinCursor: cursor)
+            let reservation = await claimLoad(&decision, routing: routing, snapshot: snap, cursor: cursor)
             let meta = RequestMeta(requestID: requestID, clientName: request.clientName,
-                                   dialect: .embeddings, promptLogging: promptLogging)
+                                   dialect: .embeddings, promptLogging: promptLogging,
+                                   loadReservation: reservation)
             let outcome = try await executor.embed(canonical, decision: decision, meta: meta)
             let data: [JSONValue] = outcome.response.vectors.enumerated().map { i, v in
                 .object(["object": .string("embedding"), "index": .number(Double(i)),
