@@ -11,16 +11,20 @@ public struct RoutingRequest: Sendable {
     /// Lineage of the model that wrote the latest answer in the conversation,
     /// when Derby knows it.
     public var conversationLineage: ModelLineage?
+    /// The account that wrote the latest answer, when Derby knows it: where the
+    /// conversation's encrypted reasoning and cached prompt are.
+    public var conversationAccount: UUID?
 
     public init(logicalModelName: String, requirements: CapabilityRequirements,
                 promptTokens: Int, maxOutputTokens: Int? = nil, isStreaming: Bool = false,
-                conversationLineage: ModelLineage? = nil) {
+                conversationLineage: ModelLineage? = nil, conversationAccount: UUID? = nil) {
         self.logicalModelName = logicalModelName
         self.requirements = requirements
         self.promptTokens = promptTokens
         self.maxOutputTokens = maxOutputTokens
         self.isStreaming = isStreaming
         self.conversationLineage = conversationLineage
+        self.conversationAccount = conversationAccount
     }
 
     public init(_ request: CanonicalRequest) {
@@ -29,7 +33,8 @@ public struct RoutingRequest: Sendable {
                   promptTokens: request.estimatedPromptTokens,
                   maxOutputTokens: request.maxOutputTokens,
                   isStreaming: request.stream,
-                  conversationLineage: HandoffLedger.conversationLineage(of: request))
+                  conversationLineage: HandoffLedger.conversationLineage(of: request),
+                  conversationAccount: HandoffLedger.conversationAccount(of: request))
     }
 
     public init(_ request: CanonicalEmbeddingRequest) {
@@ -299,6 +304,19 @@ public struct Router: Sendable {
             }
         }
 
+        // 6c. A conversation stays on the account holding its reasoning and
+        // cached prompt. Also between copies only, and only among targets that
+        // survived the filters above, so an account that cannot answer still
+        // hands the conversation over.
+        var continuityExplanation: String?
+        if lm.policy.effectiveKeepConversationsOnAccount, let account = request.conversationAccount {
+            let kept = Router.preferConversationAccount(ranked, account: account)
+            ranked = kept.ranked
+            if let move = kept.firstMove {
+                continuityExplanation = "\(move.winner) went ahead of \(move.loser): same model, and this conversation's reasoning and cached prompt are on its account."
+            }
+        }
+
         // 7. Apply the candidate cap.
         let limit = max(1, min(lm.policy.maxCandidates,
                                lm.failover.enabled ? lm.failover.maxAttempts : 1))
@@ -372,7 +390,8 @@ public struct Router: Sendable {
                                plan: plan,
                                evaluations: evaluations,
                                exclusions: exclusions,
-                               explanation: [strategy.explain(ranked, context: context), warmExplanation]
+                               explanation: [strategy.explain(ranked, context: context), warmExplanation,
+                                             continuityExplanation]
                                    .compactMap { $0 }.joined(separator: " "),
                                snapshotVersion: snapshot.version)
     }

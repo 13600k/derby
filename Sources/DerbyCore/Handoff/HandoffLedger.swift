@@ -20,8 +20,12 @@ extension MessageOrigin {
 /// The ledger closes that gap without keeping a session: when an answer goes
 /// out it is fingerprinted — the user message it answered, its text, its tool
 /// calls — and when a client sends that answer back as history, the fingerprint
-/// finds it again. Nothing is persisted; it lives in memory, bounded by count,
-/// bytes and age, and a miss simply means an earlier turn is unattributed.
+/// finds it again. It is bounded by count, bytes and age, and a miss simply
+/// means an earlier turn is unattributed.
+///
+/// With a store attached, what replaying an answer needs — its opaque
+/// reasoning, who wrote it, the conversation it belongs to — also survives a
+/// restart. Plain-text reasoning, which local models write, stays in memory.
 public actor HandoffLedger {
     public struct Limits: Sendable {
         public var maxEntries: Int
@@ -32,13 +36,25 @@ public actor HandoffLedger {
         }
     }
 
+    /// An entry as a store keeps it.
+    public struct Stored: Codable, Sendable {
+        public var key: String
+        public var origin: MessageOrigin
+        public var artifacts: [ReasoningArtifact]
+        public var toolCallIDs: [String]
+        public var conversation: String?
+        public var lastUsedAt: Date
+    }
+
     private struct Entry {
         var origin: MessageOrigin
         var reasoning: String?
         var artifacts: [ReasoningArtifact]
-        var recordedAt: Date
+        var lastUsedAt: Date
         var bytes: Int
         var toolCallIDs: [String]
+        /// `CanonicalRequest.conversationKey` of the request this answered.
+        var conversation: String?
     }
 
     private let limits: Limits
@@ -47,6 +63,7 @@ public actor HandoffLedger {
     private var order: [String] = []
     private var byToolCall: [String: String] = [:]
     private var totalBytes = 0
+    private var store: (any HandoffLedgerStore)?
 
     public init(limits: Limits = Limits()) {
         self.limits = limits
@@ -56,6 +73,21 @@ public actor HandoffLedger {
 
     public func removeAll() {
         entries.removeAll(); order.removeAll(); byToolCall.removeAll(); totalBytes = 0
+        store?.removeAll()
+    }
+
+    // MARK: - Persistence
+
+    /// Keeps the ledger in `store` from now on, starting from what it holds.
+    public func attach(store: any HandoffLedgerStore, now: Date = Date()) {
+        self.store = store
+        for stored in store.load().sorted(by: { $0.lastUsedAt < $1.lastUsedAt }) where entries[stored.key] == nil {
+            insert(Entry(origin: stored.origin, reasoning: nil, artifacts: stored.artifacts,
+                         lastUsedAt: stored.lastUsedAt, bytes: Self.bytes(reasoning: nil, artifacts: stored.artifacts),
+                         toolCallIDs: stored.toolCallIDs, conversation: stored.conversation),
+                   key: stored.key)
+        }
+        evict(now: now)
     }
 
     // MARK: - Recording
@@ -66,14 +98,14 @@ public actor HandoffLedger {
         let key = Self.fingerprint(precedingUserText: Self.lastUserText(in: request.messages[...]),
                                    message: message)
         let reasoning = message.reasoning?.isEmpty == false ? message.reasoning : nil
-        let bytes = (reasoning?.utf8.count ?? 0) + message.reasoningArtifacts.reduce(0) { $0 + $1.byteCount } + 256
-        remove(key)
+        remove(key, persisting: false)
         let entry = Entry(origin: origin, reasoning: reasoning, artifacts: message.reasoningArtifacts,
-                          recordedAt: date, bytes: bytes, toolCallIDs: message.toolCalls.map(\.id))
-        entries[key] = entry
-        order.append(key)
-        totalBytes += bytes
-        for id in entry.toolCallIDs where !id.isEmpty { byToolCall[id] = key }
+                          lastUsedAt: date,
+                          bytes: Self.bytes(reasoning: reasoning, artifacts: message.reasoningArtifacts),
+                          toolCallIDs: message.toolCalls.map(\.id), conversation: request.conversationKey)
+        insert(entry, key: key)
+        store?.save(Stored(key: key, origin: origin, artifacts: entry.artifacts, toolCallIDs: entry.toolCallIDs,
+                           conversation: entry.conversation, lastUsedAt: date))
         evict(now: date)
     }
 
@@ -88,6 +120,8 @@ public actor HandoffLedger {
         guard !entries.isEmpty else { return request }
         var result = request
         var lastUserText = ""
+        var used: [String] = []
+        var conversation: String?
         for i in result.messages.indices {
             let message = result.messages[i]
             if message.role == .user { lastUserText = message.joinedText; continue }
@@ -96,8 +130,15 @@ public actor HandoffLedger {
             var key = message.toolCalls.compactMap { byToolCall[$0.id] }.first
             if key == nil { key = Self.fingerprint(precedingUserText: lastUserText, message: message) }
             guard let key, let entry = entries[key] else { continue }
-            guard now.timeIntervalSince(entry.recordedAt) <= limits.maxAge else { remove(key); continue }
+            guard now.timeIntervalSince(entry.lastUsedAt) <= limits.maxAge else { remove(key); continue }
+            // The age limit is for conversations nobody continues: one still in
+            // use keeps its reasoning however long it runs.
             touch(key)
+            entries[key]?.lastUsedAt = now
+            used.append(key)
+            // The latest recorded answer says which conversation this is, even
+            // after the client has rewritten how the history begins.
+            if let written = entry.conversation { conversation = written }
 
             if result.messages[i].origin == nil { result.messages[i].origin = entry.origin }
             if result.messages[i].reasoning?.isEmpty ?? true, let reasoning = entry.reasoning {
@@ -118,6 +159,8 @@ public actor HandoffLedger {
                 }
             }
         }
+        store?.touch(used, at: now)
+        if let conversation { result.continuesConversation = conversation }
         return result
     }
 
@@ -125,6 +168,12 @@ public actor HandoffLedger {
     /// continuity preference.
     public static func conversationLineage(of request: CanonicalRequest) -> ModelLineage? {
         request.messages.last { $0.role == .assistant && $0.origin != nil }?.origin?.lineage
+    }
+
+    /// The account that wrote the most recent attributed answer: where the
+    /// conversation's reasoning and cached prompt are.
+    public static func conversationAccount(of request: CanonicalRequest) -> UUID? {
+        request.messages.last { $0.role == .assistant && $0.origin != nil }?.origin?.accountID
     }
 
     // MARK: - Fingerprints
@@ -148,22 +197,34 @@ public actor HandoffLedger {
 
     // MARK: - Bookkeeping
 
+    private func insert(_ entry: Entry, key: String) {
+        entries[key] = entry
+        order.append(key)
+        totalBytes += entry.bytes
+        for id in entry.toolCallIDs where !id.isEmpty { byToolCall[id] = key }
+    }
+
+    private static func bytes(reasoning: String?, artifacts: [ReasoningArtifact]) -> Int {
+        (reasoning?.utf8.count ?? 0) + artifacts.reduce(0) { $0 + $1.byteCount } + 256
+    }
+
     private func touch(_ key: String) {
         if let index = order.firstIndex(of: key) { order.remove(at: index) }
         order.append(key)
     }
 
-    private func remove(_ key: String) {
+    private func remove(_ key: String, persisting: Bool = true) {
         guard let entry = entries.removeValue(forKey: key) else { return }
         totalBytes -= entry.bytes
         if let index = order.firstIndex(of: key) { order.remove(at: index) }
         for id in entry.toolCallIDs where byToolCall[id] == key { byToolCall.removeValue(forKey: id) }
+        if persisting { store?.remove([key]) }
     }
 
     private func evict(now: Date) {
         while let oldest = order.first,
               entries.count > limits.maxEntries || totalBytes > limits.maxBytes
-                || (entries[oldest].map { now.timeIntervalSince($0.recordedAt) > limits.maxAge } ?? true) {
+                || (entries[oldest].map { now.timeIntervalSince($0.lastUsedAt) > limits.maxAge } ?? true) {
             remove(oldest)
             if entries[oldest] == nil, order.first == oldest { order.removeFirst() }
         }

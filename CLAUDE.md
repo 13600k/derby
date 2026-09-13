@@ -149,12 +149,22 @@ load-bearing rules:
   template reads back. Never across families.
 - **Signed reasoning** (`ReasoningArtifact`: Anthropic signatures, OpenAI encrypted content,
   Gemini thought signatures) returns only to a model that can verify it, and only within the
-  active tool loop. Fable 5.1 binds thinking to the prefix it was issued with (enforced for
-  newer accounts), so a block replayed out of context can fail the whole request.
+  active tool loop — unless its protocol takes its own back from every turn
+  (`AdapterFamily.replaysReasoningFromEarlierTurns`: the Responses API, whose stateless clients
+  send every earlier reasoning item). Fable 5.1 binds thinking to the prefix it was issued with
+  (enforced for newer accounts), so a block replayed out of context can fail the whole request.
 - **Template behaviour is data.** It lives in `LineageTraits`; provider facts stay in
   `ProviderKind`/`AdapterFamily` properties. Nothing in `Handoff/` branches on a provider.
-- **The ledger is a cache.** `HandoffLedger` is in memory and bounded; a miss may cost restored
-  reasoning, never correctness.
+- **The ledger is a cache.** `HandoffLedger` is bounded; a miss may cost restored reasoning, never
+  correctness. Its age limit counts from an entry's last use, so a conversation still going keeps
+  its reasoning. `SQLiteHandoffLedgerStore` keeps what replay needs — opaque artifacts,
+  attribution, the conversation an answer belongs to — in `derby.sqlite3` across restarts;
+  plain-text reasoning is never written to disk.
+- **A conversation stays one conversation on the provider's side.** It keeps the id of the
+  conversation its recorded answers belong to (`CanonicalRequest.conversationKey`), so a client
+  rewriting how its history begins, as compression does, does not start a new session. Routing
+  keeps it on the account holding its reasoning (`RoutingPolicy.keepConversationsOnAccount`),
+  reordering only copies of one model and never keeping a target that cannot answer.
 - **Never silent.** Anything withheld, rewritten or repaired is counted in `HandoffRecord` and
   surfaced as `x_derby.handoff`, the `x-derby-handoff` header, the routing explanation and
   request history.
@@ -227,6 +237,12 @@ base URL and quirk flags — do not add a new adapter for these.
   They are independent — reasoning-era models are highly capable yet reject `temperature`,
   returning a deprecation error rather than ignoring it. `ModelCapabilities.unsupportedParameters`
   is a *deny-list*, so a model nothing is known about still receives everything.
+- **A conversation must reach a provider as one conversation, byte for byte.** Prompt caches
+  match exact prefixes, so encode what a provider renders with `JSONValue.stableJSONData()` — a
+  Swift dictionary's key order changes between instances, and the same tool schemas came out
+  reordered on nearly every turn — and name the conversation with
+  `CanonicalRequest.conversationID(scope:)`, never a per-request id. With neither, a 55-step
+  tool loop on ChatGPT had 0% of its input cached where the Codex CLI had 94%.
 - **The look lives in `Views/Glass.swift`, and no other file branches on macOS
   version.** Derby's surfaces are tinted glass stained with `Color.derbyAccent`
   (teal, `#008080`). macOS 26 renders them as real Liquid Glass (`glassEffect`,

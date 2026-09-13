@@ -87,7 +87,7 @@ public struct UsageSummary: Sendable {
 /// path off the database: the executor hands finished records over and returns.
 public actor TelemetryStore: TelemetrySink {
     private var db: OpaquePointer?
-    private let path: String
+    public nonisolated let path: String
     private var settings: LoggingSettings
     private var writesSinceVacuum = 0
 

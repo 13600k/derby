@@ -174,11 +174,16 @@ public enum HandoffPlanner {
             }
 
             if !messages[i].reasoningArtifacts.isEmpty {
-                let all = messages[i].reasoningArtifacts
-                let kept = policy.replayReasoning && inActiveLoop
-                    ? all.filter { accepts($0, origin: origin, affinity: affinity, target: target) }
+                // Opaque reasoning belongs to the open tool loop, except where
+                // the target's protocol takes its own back from every turn.
+                let inWindow = messages[i].reasoningArtifacts.filter {
+                    inActiveLoop || (family.replaysReasoningFromEarlierTurns
+                                     && family.reasoningArtifactFormats.contains($0.format))
+                }
+                let kept = policy.replayReasoning
+                    ? inWindow.filter { accepts($0, origin: origin, affinity: affinity, target: target) }
                     : []
-                if inActiveLoop {
+                if !inWindow.isEmpty {
                     record.signedReasoningCarried += kept.isEmpty ? 0 : 1
                     record.signedReasoningWithheld += kept.isEmpty ? 1 : 0
                 }

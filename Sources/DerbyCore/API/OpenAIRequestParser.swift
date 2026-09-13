@@ -10,7 +10,7 @@ public enum OpenAIRequestParser {
         "n", "stream", "stream_options", "stop", "presence_penalty", "frequency_penalty",
         "user", "tools", "tool_choice", "parallel_tool_calls", "response_format", "seed",
         "reasoning_effort", "logprobs", "top_logprobs", "logit_bias", "metadata", "store",
-        "service_tier", "modalities", "prediction", "derby",
+        "service_tier", "modalities", "prediction", "prompt_cache_key", "derby",
     ]
 
     public static func parseChatCompletions(_ json: JSONValue) throws -> CanonicalRequest {
@@ -32,6 +32,7 @@ public enum OpenAIRequestParser {
         r.presencePenalty = json["presence_penalty"]?.doubleValue
         r.user = json["user"]?.stringValue
         r.parallelToolCalls = json["parallel_tool_calls"]?.boolValue
+        r.promptCacheKey = json["prompt_cache_key"]?.stringValue
 
         if let stop = json["stop"] {
             if let s = stop.stringValue { r.stop = [s] }
@@ -186,6 +187,7 @@ public enum OpenAIRequestParser {
         r.maxOutputTokens = json["max_output_tokens"]?.intValue
         r.user = json["user"]?.stringValue
         r.parallelToolCalls = json["parallel_tool_calls"]?.boolValue
+        r.promptCacheKey = json["prompt_cache_key"]?.stringValue
 
         if let tools = json["tools"]?.arrayValue {
             r.tools = tools.compactMap { t in
@@ -237,7 +239,8 @@ public enum OpenAIRequestParser {
                 return part["text"]?.stringValue.map { .text($0) }
             }
         }
-        return parts.isEmpty ? [.text(output.compactJSONString)] : parts
+        // Rendered into the prompt, so it has to come out the same on every turn.
+        return parts.isEmpty ? [.text(output.stableJSONString)] : parts
     }
 
     /// A `reasoning` item: summary or full text, and sometimes the encrypted

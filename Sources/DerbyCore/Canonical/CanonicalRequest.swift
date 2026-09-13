@@ -383,6 +383,12 @@ public struct CanonicalRequest: Codable, Sendable {
     public var providerExtensions: [String: JSONValue]
     /// Anything the client sent that Derby did not model, retained for debugging.
     public var unmappedFields: [String: JSONValue]
+    /// The client's own name for the conversation (`prompt_cache_key`), for
+    /// providers that use one to find where a conversation's prompt is cached.
+    public var promptCacheKey: String?
+    /// The conversation a recorded answer in this request's history was written
+    /// in. Set by `HandoffLedger`; never sent by a client.
+    public var continuesConversation: String?
 
     public init(requestedModel: String,
                 messages: [CanonicalMessage] = [],

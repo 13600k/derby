@@ -81,6 +81,12 @@ when Derby is not running.
   signatures and their stand-in, Mistral's nine-character tool call ids, and the loaded-model
   endpoints of LM Studio, llama.cpp and SGLang. Those are built from the providers'
   documentation and tested against stubbed payloads only.
+- **ChatGPT prompt-cache continuity is verified live** (2026-09-12). With a per-conversation
+  `session_id` and `prompt_cache_key`, sorted-key request bodies and encrypted reasoning replayed
+  from finished turns, a Hermes Agent session of ~320K-token turns went from 0% of its input
+  cached to 99–100% on every turn after the first, and its average time to first token halved
+  (8.6 s → 4.1 s). A three-turn test conversation read 4,608 of ~4,800 prompt tokens from cache
+  on turns two and three, with the first turn's reasoning carried to both.
 - **A provider only hands back what it issued.** A model that answers a turn without reasoning
   leaves nothing to carry, and `x_derby.handoff` then reports nothing withheld — because
   nothing was. Observed live: the same model reasons on a question that needs it and skips it

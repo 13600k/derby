@@ -25,6 +25,8 @@ func registerAllTests() {
     registerRuntimeMetadataTests()
     registerCompactionTests()
     registerHandoffTests()
+    registerPromptCacheTests()
+    registerContinuityTests()
     registerLoadTests()
     registerEndToEndTests()
     // Checks against this machine's real providers. Opt-in, because every other

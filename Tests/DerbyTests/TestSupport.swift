@@ -11,6 +11,8 @@ final class MockTransport: HTTPTransport, @unchecked Sendable {
         var method: String
         var headers: [String: String]
         var body: JSONValue?
+        /// The body exactly as sent, for asserting on bytes rather than meaning.
+        var rawBody: Data?
     }
 
     private let lock = NSLock()
@@ -36,7 +38,8 @@ final class MockTransport: HTTPTransport, @unchecked Sendable {
     private func record(_ request: OutboundRequest) {
         lock.lock()
         _requests.append(Recorded(url: request.url, method: request.method, headers: request.headers,
-                                  body: request.body.flatMap { try? JSONDecoder().decode(JSONValue.self, from: $0) }))
+                                  body: request.body.flatMap { try? JSONDecoder().decode(JSONValue.self, from: $0) },
+                                  rawBody: request.body))
         lock.unlock()
     }
 

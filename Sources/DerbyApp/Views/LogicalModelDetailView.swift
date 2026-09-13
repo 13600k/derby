@@ -410,6 +410,16 @@ struct LogicalModelDetailView: View {
                          : "When two targets serve the same model, the one a local server already holds in memory goes first, so the answer does not wait on a cold load.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
+                VStack(alignment: .leading, spacing: 3) {
+                    Toggle("Keep a conversation on the account that answered it", isOn: Binding(
+                        get: { (draft ?? lm).policy.effectiveKeepConversationsOnAccount },
+                        set: { on in
+                            draft?.policy.keepConversationsOnAccount = on
+                            save()
+                        }))
+                    Text("When two targets serve the same model, a conversation stays on the account that wrote its latest answer, where its reasoning and cached prompt are. New conversations are routed as usual.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
                 HStack(spacing: 16) {
                     NumberField(label: "Max candidates per request",
                                 value: intBinding(\.policy.maxCandidates), range: 1...16, onCommit: save)

@@ -27,7 +27,7 @@ public struct ChatGPTCodexAdapter: ProviderAdapter {
         auth.headers["chatgpt-account-id"] = accountID
         auth.headers["openai-beta"] = "responses=experimental"
         auth.headers["originator"] = "codex_cli_rs"
-        auth.headers["session_id"] = UUID().uuidString
+        // `session_id` names a conversation, so `stream` sets it per request.
         return auth
     }
 
@@ -129,13 +129,20 @@ public struct ChatGPTCodexAdapter: ProviderAdapter {
     public func stream(_ request: CanonicalRequest, model: String, ctx: ProviderContext) async throws
         -> AsyncThrowingStream<CanonicalStreamEvent, Error> {
         let auth = try await authenticate(ctx)
+        // Every turn of a conversation goes out under the same session and cache
+        // key, which is how the backend finds where its prompt is cached. A new
+        // id per request left each turn on a cold cache, re-reading the whole
+        // history.
+        let conversation = request.conversationID(scope: ctx.account.id.uuidString)
         let body = buildBody(request, model: model, home: ctx.account.credentialHomeURL,
-                             capabilities: ctx.modelCapabilities)
+                             capabilities: ctx.modelCapabilities, conversationID: conversation)
         let u = try url(ctx, path: "responses", auth: auth)
         var h = headers(ctx, auth: auth)
         h["accept"] = "text/event-stream"
+        h["session_id"] = conversation
+        // Byte-stable, so a history that did not change reaches the backend unchanged.
         let req = OutboundRequest(url: u, method: "POST", headers: h,
-                                  body: try JSONEncoder().encode(body), timeout: ctx.attemptTimeout,
+                                  body: try body.stableJSONData(), timeout: ctx.attemptTimeout,
                                   allowInsecureTLS: false)
         let start = try await ctx.transport.stream(req)
         guard (200..<300).contains(start.status) else {
@@ -221,8 +228,19 @@ public struct ChatGPTCodexAdapter: ProviderAdapter {
 
     // MARK: - Body
 
+    /// The cache key a request goes out under: the client's own name for the
+    /// conversation when it gives one, otherwise the conversation's id. A client
+    /// key over 64 characters goes out as a short hash of itself, which keeps it
+    /// stable at a length known to be accepted.
+    static func promptCacheKey(for r: CanonicalRequest, conversationID: String?) -> String {
+        if let key = r.promptCacheKey?.trimmingCharacters(in: .whitespacesAndNewlines), !key.isEmpty {
+            return key.count <= 64 ? key : "pck_" + HandoffHash.hex(key, length: 24)
+        }
+        return conversationID ?? r.conversationID(scope: "")
+    }
+
     func buildBody(_ r: CanonicalRequest, model: String, home: URL? = nil,
-                   capabilities: ModelCapabilities? = nil) -> JSONValue {
+                   capabilities: ModelCapabilities? = nil, conversationID: String? = nil) -> JSONValue {
         var instructions: [String] = []
         var input: [JSONValue] = []
 
@@ -289,6 +307,7 @@ public struct ChatGPTCodexAdapter: ProviderAdapter {
             // Nothing is stored server-side, so the only way a later turn can
             // continue this one's reasoning is to be handed it back encrypted.
             "include": .array([.string("reasoning.encrypted_content")]),
+            "prompt_cache_key": .string(Self.promptCacheKey(for: r, conversationID: conversationID)),
         ]
         // The Codex backend rejects `max_output_tokens` outright
         // ("Unsupported parameter"), unlike the public Responses API. This is an

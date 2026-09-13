@@ -233,8 +233,13 @@ In request order:
    sends history back without reasoning and without saying which model wrote each turn. Derby
    remembers its own answers — found again by tool call id, or by a fingerprint of the answer
    and the user message before it — and puts origin, reasoning and signed reasoning back on
-   the matching turns before routing. It is in memory and bounded (4,096 answers, 24 MB,
-   6 hours); losing it costs restored reasoning, never correctness.
+   the matching turns before routing. It is bounded (4,096 answers, 24 MB, 6 hours since an
+   answer was last sent back), and what replay needs — opaque artifacts, attribution and the
+   conversation an answer belongs to — is kept in `derby.sqlite3`, so a restart does not drop
+   it; plain-text reasoning stays in memory. Losing an entry costs restored reasoning, never
+   correctness. The conversation a recognized answer belongs to also names the request
+   (`CanonicalRequest.conversationKey`), so a client that rewrites how its history begins keeps
+   its session with the provider.
 2. **`ConversationNormalizer` repairs structure, whichever model is next.** Inline `<think>`
    text moves out of the answer; one turn sent as several Responses items becomes one turn;
    empty assistant turns go; every tool call is paired with a result — a result that lost its
@@ -250,8 +255,12 @@ In request order:
    - *Signed reasoning* returns only to a model that can verify it — Anthropic thinking
      signatures to Claude, OpenAI encrypted reasoning to the account that issued it, Gemini
      thought signatures to Gemini — and only within the active tool loop, so any replayed
-     prefix is one the provider issued. Gemini 3 requires a signature on each function call of
-     the current turn; calls another model made carry Google's documented stand-in.
+     prefix is one the provider issued. The Responses API is the exception
+     (`AdapterFamily.replaysReasoningFromEarlierTurns`): its encrypted reasoning goes back for
+     every earlier turn, as its stateless clients send it, since withholding a finished turn's
+     items loses that thinking and can move the prompt the cache is keyed on. Gemini 3 requires
+     a signature on each function call of the current turn; calls another model made carry
+     Google's documented stand-in.
    - *Structure* follows the target: developer messages become system messages where the
      server knows only system; system messages move to the front, or into the first user
      message, where the template demands; consecutive user messages are joined for templates

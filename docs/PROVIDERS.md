@@ -120,6 +120,16 @@ up after 20 seconds and says exactly that rather than hanging for the request de
   `authorization: Bearer <token>`, `chatgpt-account-id`, `OpenAI-Beta: responses=experimental`,
   `originator: codex_cli_rs` and a `session_id`. The endpoint is stream-only, so the
   non-streaming path consumes the stream and accumulates.
+- **One conversation, one session.** The `session_id` header and the body's `prompt_cache_key`
+  name the conversation and stay the same on every turn. The name is the client's own
+  `prompt_cache_key` when it sends one, otherwise the conversation Derby recorded its answers
+  under (so a client compressing its history keeps its session), otherwise its opening
+  instructions and first user message. The body is encoded with sorted keys, and routing keeps a
+  conversation on the account holding its encrypted reasoning while that account can answer. Before that, a fresh session per request and tool schemas reordered
+  between turns meant a 55-step tool loop had 0% of its input cached, against 94% for the Codex
+  CLI on the same model. **Verified live:** afterwards a ~320K-token session had 99–100% of each
+  turn's input cached from its second turn on, and its average time to first token fell from
+  8.6 s to 4.1 s.
 - **Models are discovered, not hardcoded.** The backend publishes no model-listing endpoint,
   but the Codex CLI caches the real catalog at `~/.codex/models_cache.json`. Derby reads that
   — slug, display name, ranking and supported reasoning levels — so the list stays current.
@@ -133,8 +143,9 @@ up after 20 seconds and says exactly that rather than hanging for the request de
   the nearest level it understands rather than a value it would reject.
 - **Encrypted reasoning is carried between turns.** Requests ask for
   `include: ["reasoning.encrypted_content"]`, as the Codex CLI does, and the reasoning items
-  that come back are sent again ahead of the calls they led to — to the same account only,
-  since another cannot decrypt them. **Verified live:** a turn that needed thought returned a
+  that come back are sent again ahead of the output they led to, for every earlier turn and not
+  only the open tool loop — to the same account only, since another cannot decrypt them.
+  **Verified live:** a turn that needed thought returned a
   reasoning item with `encrypted_content`, and the next turn carried it back as
   `message, reasoning, function_call, function_call_output` even though the client was a Chat
   Completions client that never saw it. A turn the model answers without reasoning returns no

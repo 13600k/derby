@@ -172,6 +172,12 @@ public struct RoutingPolicy: Codable, Sendable, Hashable {
     /// one that would have to load first. Nil means the strategy's default:
     /// on, except where the user's own ordering is the instruction.
     public var preferWarmModels: Bool?
+    /// Among copies of the same model, keep a conversation on the account that
+    /// wrote its latest answer, where its encrypted reasoning and cached prompt
+    /// are. Nil means on, whatever the strategy: moving a conversation mid-way
+    /// reprocesses its history and loses its reasoning. It only reorders copies
+    /// of one model, and never keeps a target that cannot answer.
+    public var keepConversationsOnAccount: Bool?
 
     public init(strategy: RoutingStrategyKind = .priority,
                 scoreWeights: ScoreWeights = .balanced,
@@ -180,7 +186,8 @@ public struct RoutingPolicy: Codable, Sendable, Hashable {
                 respectQuotas: Bool = true,
                 maxCandidates: Int = 8,
                 deterministic: Bool = false,
-                preferWarmModels: Bool? = nil) {
+                preferWarmModels: Bool? = nil,
+                keepConversationsOnAccount: Bool? = nil) {
         self.strategy = strategy
         self.scoreWeights = scoreWeights
         self.latencyMetric = latencyMetric
@@ -189,10 +196,15 @@ public struct RoutingPolicy: Codable, Sendable, Hashable {
         self.maxCandidates = maxCandidates
         self.deterministic = deterministic
         self.preferWarmModels = preferWarmModels
+        self.keepConversationsOnAccount = keepConversationsOnAccount
     }
 
     public var effectivePreferWarmModels: Bool {
         preferWarmModels ?? !strategy.respectsConfiguredOrder
+    }
+
+    public var effectiveKeepConversationsOnAccount: Bool {
+        keepConversationsOnAccount ?? true
     }
 
     /// Whether ranking reads live load, which makes a reservation necessary.

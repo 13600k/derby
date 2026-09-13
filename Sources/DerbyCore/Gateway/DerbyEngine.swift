@@ -84,6 +84,9 @@ public actor DerbyEngine {
         if config.gateway.requireAPIKey { await ensureLocalAPIKey() }
         do { try await telemetry.open() }
         catch { startupWarnings.append("Request history is unavailable: \(error.localizedDescription)") }
+        // Before the gateway starts, so the first request after a restart already
+        // continues the conversations Derby was carrying.
+        await handoffLedger.attach(store: SQLiteHandoffLedgerStore(path: telemetry.path))
         await telemetry.update(settings: config.logging)
         await healthRegistry.update(settings: config.health)
         await healthRegistry.update(accountLimits: accountLimits(config))

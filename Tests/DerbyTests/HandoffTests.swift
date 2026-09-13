@@ -357,6 +357,51 @@ func registerHandoffTests() {
                        "another account cannot decrypt it, and would reject the request")
         }
 
+        test("encrypted reasoning from finished turns goes back to the account that issued it") {
+            let account = UUID()
+            func sealed(_ payload: String) -> ReasoningArtifact {
+                ReasoningArtifact(format: .openAIEncryptedReasoning, payload: payload, itemID: "rs_\(payload)",
+                                  originModel: "gpt-5.6-sol", originAccount: account)
+            }
+            let gpt = origin("gpt-5.6-sol", .chatgptSubscription, account: account)
+            let request = CanonicalRequest(requestedModel: "smart", messages: [
+                .user("q1"), assistant("a1", artifacts: [sealed("turn-1")], origin: gpt),
+                .user("q2"), assistant(calls: [call("call_1", "orders")], artifacts: [sealed("turn-2")], origin: gpt),
+                result("call_1", "shipped"),
+            ])
+            let same = HandoffPlanner.plan(request, for: HandoffTarget(modelID: "gpt-5.6-sol",
+                                                                       providerKind: .chatgptSubscription,
+                                                                       accountID: account))
+            try expectEqual(same.request.messages[1].reasoningArtifacts.map(\.payload), ["turn-1"],
+                            "the Responses API takes reasoning back from every turn")
+            try expectEqual(same.request.messages[3].reasoningArtifacts.map(\.payload), ["turn-2"])
+            try expectEqual(same.record.signedReasoningCarried, 2)
+            try expect(!same.record.isNotable, "the same model continuing with everything carried is not news")
+            let input = try expectNotNil(ChatGPTCodexAdapter().buildBody(same.request, model: "gpt-5.6-sol")["input"]?.arrayValue)
+            try expectEqual(input.compactMap { $0["type"]?.stringValue },
+                            ["message", "reasoning", "message", "message", "reasoning", "function_call", "function_call_output"])
+
+            let otherAccount = HandoffPlanner.plan(request, for: HandoffTarget(modelID: "gpt-5.6-sol",
+                                                                               providerKind: .chatgptSubscription,
+                                                                               accountID: UUID()))
+            try expect(otherAccount.request.messages.allSatisfy { $0.reasoningArtifacts.isEmpty })
+            try expectEqual(otherAccount.record.signedReasoningWithheld, 2)
+        }
+
+        test("signed thinking from finished turns still stays behind for Claude") {
+            let claude = origin("claude-opus-4-5", .anthropic)
+            let request = CanonicalRequest(requestedModel: "smart", messages: [
+                .user("q1"),
+                assistant("a1", artifacts: [ReasoningArtifact(format: .anthropicThinking, payload: "sig-old")],
+                          origin: claude),
+                .user("q2"),
+            ])
+            let out = HandoffPlanner.plan(request, for: HandoffTarget(modelID: "claude-opus-4-5",
+                                                                      providerKind: .anthropic, accountID: UUID()))
+            try expect(out.request.messages[1].reasoningArtifacts.isEmpty, "Anthropic binds thinking to its turn")
+            try expectEqual(out.record.signedReasoningWithheld, 0, "outside the window is not a loss")
+        }
+
         test("Gemini 3 gets the documented stand-in for another model's tool call") {
             let request = CanonicalRequest(requestedModel: "smart", messages: [
                 .user("look it up"),
@@ -534,6 +579,21 @@ func registerHandoffTests() {
             try expectEqual(await ledger.count, 3)
             let evicted = CanonicalRequest(requestedModel: "m", messages: [.user("q0"), .assistant("a0"), .user("x")])
             try expectNil(await ledger.annotate(evicted).messages[1].origin, "the oldest entries go first")
+        }
+
+        test("a conversation still going keeps its reasoning past the age limit") {
+            let ledger = HandoffLedger(limits: .init(maxAge: 100))
+            let start = Date(timeIntervalSince1970: 1_000_000)
+            await ledger.record(request: CanonicalRequest(requestedModel: "m", messages: [.user("q")]),
+                                response: CanonicalMessage(role: .assistant, content: [.text("a")], reasoning: "thought"),
+                                origin: origin("gpt-5.6-sol", .chatgptSubscription), at: start)
+            let history = CanonicalRequest(requestedModel: "m", messages: [.user("q"), .assistant("a"), .user("next")])
+            try expectEqual(await ledger.annotate(history, now: start.addingTimeInterval(80)).messages[1].reasoning,
+                            "thought")
+            try expectEqual(await ledger.annotate(history, now: start.addingTimeInterval(160)).messages[1].reasoning,
+                            "thought", "each turn that sends it back restarts the clock")
+            try expectNil(await ledger.annotate(history, now: start.addingTimeInterval(400)).messages[1].reasoning,
+                          "one nobody continues still expires")
         }
     }
 

@@ -102,6 +102,23 @@ public enum JSONValue: Codable, Sendable, Hashable {
         return String(data: data, encoding: .utf8) ?? "null"
     }
 
+    /// The same bytes for the same value, every time.
+    ///
+    /// A Swift dictionary's order differs from one instance to the next, so
+    /// encoding an equal value twice can put its keys in a different order.
+    /// Anything a provider renders into a prompt — tool schemas above all — must
+    /// reach it byte-identical on every turn: a reordered key changes the prefix,
+    /// and nothing after it is served from the provider's prompt cache.
+    public func stableJSONData() throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .sortedKeys
+        return try encoder.encode(self)
+    }
+
+    public var stableJSONString: String {
+        String(data: (try? stableJSONData()) ?? Data("null".utf8), encoding: .utf8) ?? "null"
+    }
+
     public static func parse(_ string: String) -> JSONValue? {
         guard let d = string.data(using: .utf8) else { return nil }
         return try? JSONDecoder().decode(JSONValue.self, from: d)

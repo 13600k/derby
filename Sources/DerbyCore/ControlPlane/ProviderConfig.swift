@@ -241,6 +241,19 @@ public enum AdapterFamily: String, Codable, Sendable, CaseIterable {
     public var restrictsToolCallIDAlphabet: Bool {
         self == .anthropic || self == .anthropicOAuth || self == .bedrock
     }
+
+    /// Whether the protocol takes its own opaque reasoning back from every
+    /// earlier turn, not only from the tool loop still in progress.
+    ///
+    /// The Responses API does. Called with `store: false`, a conversation's
+    /// reasoning items are how it continues from its earlier thinking, and the
+    /// server decides what stays in context. Withholding a finished turn's items
+    /// loses that thinking and can change the prompt from that point on, so
+    /// none of what follows is served from the prompt cache. Anthropic and
+    /// Gemini bind signed reasoning to the turn that produced it.
+    public var replaysReasoningFromEarlierTurns: Bool {
+        self == .chatgptCodex
+    }
 }
 
 public enum CLICredentialSource: String, Codable, Sendable, CaseIterable {
