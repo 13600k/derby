@@ -226,9 +226,14 @@ private struct GlassSurfaceModifier<S: InsettableShape>: ViewModifier {
 
     func body(content: Content) -> some View {
         if #available(macOS 26.0, *) {
+            // The glass is a layer *behind* the content, never a wrapper around
+            // it: `content.glassEffect(...)` re-hosts everything inside, and a
+            // `List` hosted that way silently stops starting drags, so `.onMove`
+            // never fires — the logical models sidebar and every Targets card
+            // lost drag-to-reorder that way.
             content
                 .background { scrim }
-                .glassEffect(liquid, in: shape)
+                .background { Color.clear.glassEffect(liquid, in: shape) }
                 .overlay { leading }
         } else {
             content

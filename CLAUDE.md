@@ -260,6 +260,10 @@ base URL and quirk flags — do not add a new adapter for these.
   system appearance picks the text colour, so only an adaptive scrim can
   guarantee a background whose brightness matches it; without one, black text
   in light mode lands on whatever dark window happens to be behind Derby.
+  On macOS 26 the glass is drawn as a *background layer* (`Color.clear.glassEffect`),
+  never applied to the content itself: a `List` inside a view carrying
+  `.glassEffect` never starts a drag, so `.onMove` silently stopped working in
+  the logical models sidebar and the Targets card.
 - Keychain reads can block on a system dialog. Keep them off the launch path and under a
   deadline; when a required key is unavailable the gateway must **fail closed**.
 
