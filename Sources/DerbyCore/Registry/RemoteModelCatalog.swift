@@ -167,6 +167,25 @@ public final class RemoteModelCatalog: @unchecked Sendable {
         return nil
     }
 
+    /// The newest id this provider offers whose name contains `needle`, by
+    /// release date. Used to resolve a tier alias such as "opus" to the model a
+    /// CLI would actually run, which changes whenever the vendor ships one.
+    public func newestID(containing needle: String, kind: ProviderKind) -> String? {
+        lock.lock(); defer { lock.unlock() }
+        ensureLoaded()
+        let needle = needle.lowercased()
+        for provider in Self.providerIDs(for: kind) {
+            guard let models = index.byProvider[provider] else { continue }
+            let matches = models.values.filter { $0.id.lowercased().contains(needle) }
+            // An entry with no stated release date cannot be called the newest.
+            if let newest = matches.filter({ $0.releaseDate != nil })
+                .max(by: { ($0.releaseDate ?? "", $0.id) < ($1.releaseDate ?? "", $1.id) }) {
+                return newest.id
+            }
+        }
+        return nil
+    }
+
     /// Progressively looser forms of a model id, most specific first.
     static func candidateIDs(for modelID: String) -> [String] {
         var out: [String] = []
@@ -193,10 +212,11 @@ public final class RemoteModelCatalog: @unchecked Sendable {
     /// cache in place, so a refresh can never make Derby know less than it did.
     @discardableResult
     public func refresh(url: URL = RemoteModelCatalog.defaultURL,
-                        transport: (any HTTPTransport)? = nil) async -> Result<Int, DerbyError> {
+                        transport: (any HTTPTransport)? = nil,
+                        timeout: TimeInterval = 45) async -> Result<Int, DerbyError> {
         let http = transport ?? URLSessionTransport.shared
         do {
-            let response = try await http.send(OutboundRequest(url: url, method: "GET", timeout: 45))
+            let response = try await http.send(OutboundRequest(url: url, method: "GET", timeout: timeout))
             guard (200..<300).contains(response.status) else {
                 return .failure(DerbyError(kind: .transient,
                                            message: "Model catalog request failed (HTTP \(response.status)).",

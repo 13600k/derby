@@ -103,6 +103,14 @@ up after 20 seconds and says exactly that rather than hanging for the request de
 - **Withheld deliberately.** `context-1m-2025-08-07`. An account without the long-context beta
   answers HTTP 400 to *every* request carrying it, so claiming it would break short calls to
   buy a window most subscriptions cannot use.
+- **Prompt caching.** Anthropic caches the prefix *before* a marked block, four marks to a
+  request, so Derby marks the stable prefix (the last tool, the last system block) and the
+  conversation as it grows (the end of the latest turn, and one turn back to land on when the
+  tail is rewritten). Nothing is marked until a conversation has an answer in it and is past
+  2,048 tokens: a one-shot question would pay for the cache write and never take the read.
+  This is what keeps a hand-off to Claude from re-reading the whole conversation on every
+  turn — the difference the hand-off itself makes is then GPT's thinking, which no other
+  vendor can verify, and nothing else. **Not yet verified live.**
 - **Not done:** rewriting the caller's own system prompt. Other gateways substitute their
   product name out of it to avoid being fingerprinted; that silently alters what the client
   sent, which Derby does not do to a conversation anywhere else.
@@ -144,12 +152,21 @@ up after 20 seconds and says exactly that rather than hanging for the request de
 - **Encrypted reasoning is carried between turns.** Requests ask for
   `include: ["reasoning.encrypted_content"]`, as the Codex CLI does, and the reasoning items
   that come back are sent again ahead of the output they led to, for every earlier turn and not
-  only the open tool loop — to the same account only, since another cannot decrypt them.
+  only the open tool loop — and to either subscription, not only the one that was issued them.
   **Verified live:** a turn that needed thought returned a
   reasoning item with `encrypted_content`, and the next turn carried it back as
   `message, reasoning, function_call, function_call_output` even though the client was a Chat
   Completions client that never saw it. A turn the model answers without reasoning returns no
   item at all, and there is then nothing to carry.
+- **Encrypted reasoning crosses accounts on this backend.** Measured with both subscriptions:
+  the second account replayed the first account's item and named a 4-digit number the first
+  account had chosen silently and written nowhere else (`6831` from both), while the same
+  payload with 32 characters changed was refused with
+  `invalid_encrypted_content: could not be decrypted or parsed`. Verification exists and the
+  key is the endpoint's, so a tool loop cut off mid-thought when one subscription runs out is
+  finished by the other with its thinking intact. The prompt *cache* does not cross: each
+  account names the conversation its own way (`conversationID(scope:)`), so the hand-off turn
+  reads a cold prefix and every turn after it on that account is warm again.
 - **Verified end to end.** Completions now succeed through this backend, on two separate
   accounts simultaneously. Getting there required dropping `max_output_tokens`, which this
   endpoint rejects as an unsupported parameter, and surfacing the backend's `{"detail": …}`

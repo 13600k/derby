@@ -330,7 +330,7 @@ func registerHandoffTests() {
             try expectEqual(toCodex.record.signedReasoningWithheld, 1)
         }
 
-        test("encrypted reasoning returns only to the account that issued it") {
+        test("encrypted reasoning reaches a second account on the same backend") {
             let account = UUID()
             let encrypted = ReasoningArtifact(format: .openAIEncryptedReasoning, payload: "gAAAA-secret",
                                               itemID: "rs_1", summaries: ["Looked up the order"],
@@ -350,11 +350,43 @@ func registerHandoffTests() {
             try expect(reasoningIndex < callIndex, "the reasoning precedes the call it led to")
             try expectEqual(input[reasoningIndex]["encrypted_content"]?.stringValue, "gAAAA-secret")
 
+            // Verified live: a second ChatGPT account decrypts the first
+            // account's item and answers from what was inside it, so a
+            // subscription that ran out mid-tool-loop can hand the loop on.
             let otherAccount = HandoffPlanner.plan(request, for: HandoffTarget(modelID: "gpt-5.1-codex",
                                                                                providerKind: .chatgptSubscription,
                                                                                accountID: UUID()))
-            try expect(otherAccount.request.messages[1].reasoningArtifacts.isEmpty,
-                       "another account cannot decrypt it, and would reject the request")
+            try expectEqual(otherAccount.request.messages[1].reasoningArtifacts.map(\.payload), ["gAAAA-secret"],
+                            "the key belongs to the endpoint, not the account")
+            try expectEqual(otherAccount.record.signedReasoningCarried, 1)
+            try expectEqual(otherAccount.record.signedReasoningWithheld, 0)
+
+            // Another protocol's account still cannot read it, whoever holds it.
+            let elsewhere = HandoffPlanner.plan(request, for: HandoffTarget(modelID: "gpt-5.1-codex",
+                                                                           providerKind: .openai,
+                                                                           accountID: UUID()))
+            try expect(elsewhere.request.messages[1].reasoningArtifacts.isEmpty,
+                       "the public API is a different key domain, and openai_compatible reads no reasoning items")
+        }
+
+        test("reasoning issued somewhere else is not handed to the Codex backend") {
+            let issuer = UUID()
+            // An artifact of this format that an OpenAI-protocol account wrote:
+            // a different endpoint, so a different key.
+            let foreign = ReasoningArtifact(format: .openAIEncryptedReasoning, payload: "gAAAA-elsewhere",
+                                            itemID: "rs_9", originModel: "gpt-5.6-sol", originAccount: issuer)
+            let request = CanonicalRequest(requestedModel: "smart", messages: [
+                .user("q"),
+                assistant(calls: [call("call_1", "orders")], artifacts: [foreign],
+                          origin: origin("gpt-5.6-sol", .openai, account: issuer)),
+                result("call_1", "shipped"),
+            ])
+            let out = HandoffPlanner.plan(request, for: HandoffTarget(modelID: "gpt-5.6-sol",
+                                                                     providerKind: .chatgptSubscription,
+                                                                     accountID: UUID()))
+            try expect(out.request.messages[1].reasoningArtifacts.isEmpty,
+                       "only an account on the same protocol can be assumed to share the key")
+            try expectEqual(out.record.signedReasoningWithheld, 1)
         }
 
         test("encrypted reasoning from finished turns goes back to the account that issued it") {
@@ -381,11 +413,15 @@ func registerHandoffTests() {
             try expectEqual(input.compactMap { $0["type"]?.stringValue },
                             ["message", "reasoning", "message", "message", "reasoning", "function_call", "function_call_output"])
 
+            // The second subscription picks the conversation up with every
+            // turn's thinking, which is what makes a quota hand-off invisible.
             let otherAccount = HandoffPlanner.plan(request, for: HandoffTarget(modelID: "gpt-5.6-sol",
                                                                                providerKind: .chatgptSubscription,
                                                                                accountID: UUID()))
-            try expect(otherAccount.request.messages.allSatisfy { $0.reasoningArtifacts.isEmpty })
-            try expectEqual(otherAccount.record.signedReasoningWithheld, 2)
+            try expectEqual(otherAccount.request.messages[1].reasoningArtifacts.map(\.payload), ["turn-1"])
+            try expectEqual(otherAccount.request.messages[3].reasoningArtifacts.map(\.payload), ["turn-2"])
+            try expectEqual(otherAccount.record.signedReasoningCarried, 2)
+            try expectEqual(otherAccount.record.signedReasoningWithheld, 0)
         }
 
         test("signed thinking from finished turns still stays behind for Claude") {
@@ -758,6 +794,84 @@ func registerHandoffTests() {
     }
 
     // MARK: - Through the executor
+
+    suite("Handoff / Claude prompt cache") {
+        let long = String(repeating: "The migration plan covers every table in the warehouse. ", count: 220)
+
+        func body(_ messages: [CanonicalMessage], tools: [CanonicalTool] = [],
+                  model: String = "claude-sonnet-5") throws -> JSONValue {
+            var request = CanonicalRequest(requestedModel: "m", messages: messages)
+            request.tools = tools
+            request.maxOutputTokens = 1_024
+            return try AnthropicAdapter(oauth: false).buildBody(request, model: model,
+                                                                ctx: ctx(.anthropic, model: model), stream: false)
+        }
+        /// Where a breakpoint was placed, as `section[index]`.
+        func breakpoints(_ body: JSONValue) -> [String] {
+            var found: [String] = []
+            for section in ["system", "tools"] {
+                for (i, entry) in (body[section]?.arrayValue ?? []).enumerated()
+                where entry["cache_control"] != nil { found.append("\(section)[\(i)]") }
+            }
+            for (i, message) in (body["messages"]?.arrayValue ?? []).enumerated() {
+                for (j, block) in (message["content"]?.arrayValue ?? []).enumerated()
+                where block["cache_control"] != nil { found.append("messages[\(i)][\(j)]") }
+            }
+            return found
+        }
+
+        test("a continuing conversation marks what the next turn should not pay for again") {
+            let marks = breakpoints(try body([
+                .system("House style."), .user(long), .assistant("First answer."),
+                .user("and now?"), .assistant("Second answer."), .user("once more"),
+            ], tools: [CanonicalTool(name: "lookup", parameters: .object([:]))]))
+            // The system message moved into `system`, so the five that remain
+            // are user, assistant, user, assistant, user.
+            try expectEqual(marks, ["system[0]", "tools[0]", "messages[2][0]", "messages[4][0]"],
+                            "the stable prefix, the latest turn, and one turn back")
+            try expect(marks.count <= 4, "Anthropic allows four breakpoints per request")
+        }
+
+        test("a one-shot question is not marked, since nothing will read it back") {
+            try expectEqual(breakpoints(try body([.system("House style."), .user(long)])), [],
+                            "a cache write nobody reads is a cost with no saving")
+        }
+
+        test("a short conversation is not marked either") {
+            try expectEqual(breakpoints(try body([.user("hi"), .assistant("hello"), .user("again")])), [],
+                            "below Claude's own minimum a breakpoint does nothing")
+        }
+
+        test("a cached turn still reports the whole prompt, and pays for each part once") {
+            let usage = AnthropicAdapter(oauth: false).parseUsage(try expectNotNil(JSONValue.parse("""
+            {"input_tokens":2,"output_tokens":7,"cache_read_input_tokens":26751,
+             "cache_creation_input_tokens":0}
+            """)))
+            try expectEqual(usage.inputTokens, 26_753,
+                            "Anthropic counts a prompt in parts; Derby counts it whole")
+            try expectEqual(usage.cachedInputTokens, 26_751)
+
+            // A cache write is part of the prompt and priced at its own rate, so
+            // it must not also be billed as fresh input.
+            let pricing = Pricing(inputPerMTok: 3, outputPerMTok: 15, cachedInputPerMTok: 0.3,
+                                  cacheWritePerMTok: 3.75)
+            let write = CanonicalUsage(inputTokens: 1_100, outputTokens: 0,
+                                       cachedInputTokens: 0, cacheWriteTokens: 1_000)
+            try expectClose(try expectNotNil(pricing.cost(for: write)),
+                            100 * 3 / 1e6 + 1_000 * 3.75 / 1e6, tolerance: 1e-9)
+        }
+
+        test("a breakpoint is never placed on a thinking block") {
+            let signed = ReasoningArtifact(format: .anthropicThinking, payload: "sig", text: "thought")
+            let marks = breakpoints(try body([
+                .user(long),
+                CanonicalMessage(role: .assistant, reasoningArtifacts: [signed]),
+                .user("carry on"),
+            ]))
+            try expect(!marks.contains { $0.hasPrefix("messages[1]") },
+                       "the API refuses a breakpoint there: \(marks)")
+        }
+    }
 
     suite("Handoff / end to end") {
         func twoTargets(_ first: (String, ProviderKind, String), _ second: (String, ProviderKind, String))

@@ -191,7 +191,9 @@ func registerClaudeCLITests() {
             {"input_tokens":292,"output_tokens":5,"cache_read_input_tokens":10,
              "cache_creation_input_tokens":27237,"output_tokens_details":{"thinking_tokens":3}}
             """)))
-            try expectEqual(usage.inputTokens, 292)
+            // The CLI reports Anthropic's parts; Derby counts the prompt whole,
+            // so the cached halves are inside `inputTokens`, not beside it.
+            try expectEqual(usage.inputTokens, 292 + 10 + 27_237)
             try expectEqual(usage.outputTokens, 5)
             try expectEqual(usage.cachedInputTokens, 10)
             try expectEqual(usage.cacheWriteTokens, 27237)
@@ -226,6 +228,99 @@ func registerClaudeCLITests() {
         test("an executable is found even when PATH is unhelpful") {
             try expect(ProcessRunner.locate("sh") != nil)
             try expectNil(ProcessRunner.locate("definitely-not-a-real-binary-xyz"))
+        }
+    }
+
+    // `claude login status` was never a subcommand. The CLI took it as a prompt,
+    // answered it out of plan usage, and the answer of course never contained
+    // "logged in" — so the connection test failed while everything else worked.
+    suite("Claude CLI / auth status") {
+        test("the JSON the CLI reports is read, first-party lane included") {
+            let status = try expectNotNil(ClaudeCLIAdapter.parseAuthStatus("""
+            {"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty",
+             "email":"someone@example.com","subscriptionType":"pro"}
+            """))
+            try expect(status.loggedIn)
+            try expect(status.isFirstParty)
+            try expectContains(status.summary, "someone@example.com")
+            try expectContains(status.summary, "pro plan")
+        }
+
+        test("a signed-out account is reported, not guessed at") {
+            let status = try expectNotNil(ClaudeCLIAdapter.parseAuthStatus(#"{"loggedIn":false}"#))
+            try expect(!status.loggedIn)
+            try expect(!status.isFirstParty)
+        }
+
+        test("a conversational answer is never mistaken for a status report") {
+            // What an older CLI does with an unknown subcommand: it answers.
+            try expectNil(ClaudeCLIAdapter.parseAuthStatus(
+                "`login` isn't something I can run for you — type `/login` in the terminal prompt."))
+            try expectNil(ClaudeCLIAdapter.parseAuthStatus(""))
+            // JSON that says nothing about being signed in is not a status either.
+            try expectNil(ClaudeCLIAdapter.parseAuthStatus(#"{"result":"sure, here is how to log in"}"#))
+        }
+    }
+
+    // The CLI takes a tier name, not a model id. Asking the catalog about the
+    // alias itself left every tier an unknown model: no context window, so
+    // `minContextTokens` and `failoverToLargerContext` were inert, and one
+    // quality score for opus and haiku alike.
+    suite("Claude CLI / tier aliases") {
+        let sample = """
+        {"anthropic":{"id":"anthropic","name":"Anthropic","models":{
+           "claude-opus-4-5":{"id":"claude-opus-4-5","name":"Claude Opus 4.5","reasoning":true,
+             "tool_call":true,"structured_output":true,"temperature":false,"release_date":"2025-11-01",
+             "modalities":{"input":["text","image"],"output":["text"]},
+             "limit":{"context":200000,"output":64000}},
+           "claude-opus-5":{"id":"claude-opus-5","name":"Claude Opus 5","reasoning":true,
+             "tool_call":true,"structured_output":true,"temperature":false,"release_date":"2026-07-24",
+             "modalities":{"input":["text","image"],"output":["text"]},
+             "limit":{"context":1000000,"output":128000}}}}}
+        """
+
+        func withCatalog(_ body: () throws -> Void) rethrows {
+            _ = RemoteModelCatalog.shared.loadForTesting(Data(sample.utf8))
+            defer { RemoteModelCatalog.shared.clearForTesting() }
+            try body()
+        }
+
+        test("a tier alias resolves to the newest model in that tier") {
+            try withCatalog {
+                try expectEqual(ModelCatalog.newestInTier("opus", kind: .claudeCodeCLI), "claude-opus-5")
+                // Only where the provider actually resolves aliases, and only
+                // for a tier name — a real model id means itself.
+                try expectNil(ModelCatalog.newestInTier("claude-opus-5", kind: .claudeCodeCLI))
+                try expect(!ProviderKind.anthropic.resolvesTierAliases)
+            }
+        }
+
+        test("the alias inherits the resolved model's window, limits and quality") {
+            try withCatalog {
+                let opus = ModelCatalog.metadata(for: "opus", kind: .claudeCodeCLI)
+                try expectEqual(opus.capabilities.contextWindow, 1_000_000)
+                try expectEqual(opus.capabilities.maxOutputTokens, 128_000)
+                try expect(opus.capabilities.source != .unknown, "an alias is not an unknown model")
+                // The plan pays for it, whatever the list price says.
+                try expect(opus.pricing?.isFlatRate ?? false)
+
+                let haiku = ModelCatalog.metadata(for: "haiku", kind: .claudeCodeCLI)
+                try expect(haiku.quality < opus.quality, "opus must not rank level with haiku")
+            }
+        }
+
+        test("the CLI keeps reasoning but still claims no tools") {
+            try withCatalog {
+                let caps = ClaudeCLIAdapter.capabilities(
+                    ModelCatalog.metadata(for: "opus", kind: .claudeCodeCLI).capabilities)
+                try expectEqual(caps.contextWindow, 1_000_000)
+                try expect(caps.flags.contains(.reasoning))
+                // The CLI runs its own agent loop and takes no caller tool
+                // schemas, so a request needing them must route elsewhere.
+                try expect(!caps.flags.contains(.tools))
+                try expect(!caps.flags.contains(.vision))
+                try expect(caps.unsupportedParameters.contains(.temperature))
+            }
         }
     }
 }

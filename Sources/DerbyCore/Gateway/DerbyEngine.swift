@@ -365,6 +365,12 @@ public actor DerbyEngine {
     }
 
     public func discoverModels(_ account: ProviderAccount) async throws -> [DiscoveredModel] {
+        // Discovery is a live poll, not a cache read. The shared metadata index
+        // is refreshed first so a model released since Derby last looked is
+        // described from current data rather than from the bundled fallback
+        // table, which by design always trails what people are actually running.
+        // A failure here is not fatal: the previous index stays in place.
+        _ = await RemoteModelCatalog.shared.refresh(timeout: 20)
         let adapter = adapters.adapter(for: account.kind)
         return try await adapter.listModels(context(for: account))
     }

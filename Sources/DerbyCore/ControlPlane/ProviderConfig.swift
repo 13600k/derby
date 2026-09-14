@@ -131,6 +131,18 @@ public enum ProviderKind: String, Codable, Sendable, CaseIterable, Hashable {
         }
     }
 
+    /// True when the provider's model ids are tier aliases it resolves itself —
+    /// the `claude` CLI takes `opus`/`sonnet`/`haiku` and runs the newest model
+    /// in that tier. Metadata for the alias therefore has to mean the newest
+    /// model's metadata, or every one of them reads as an unknown model with no
+    /// context window and no capabilities.
+    public var resolvesTierAliases: Bool {
+        switch self {
+        case .claudeCodeCLI: return true
+        default: return false
+        }
+    }
+
     /// True when the provider publishes the definitive list of models this
     /// account may use, so discovery should *replace* the configured set rather
     /// than only adding to it. Otherwise a model that has been retired lingers
@@ -252,6 +264,22 @@ public enum AdapterFamily: String, Codable, Sendable, CaseIterable {
     /// none of what follows is served from the prompt cache. Anthropic and
     /// Gemini bind signed reasoning to the turn that produced it.
     public var replaysReasoningFromEarlierTurns: Bool {
+        self == .chatgptCodex
+    }
+
+    /// Whether opaque reasoning issued to one account can be read back by a
+    /// different account of the same family.
+    ///
+    /// Verified live on the Codex backend with two ChatGPT accounts: the second
+    /// account replays the first account's `encrypted_content` and answers from
+    /// what was inside it — a number the first account chose silently, recorded
+    /// nowhere else, came back verbatim — while the same payload altered by 32
+    /// characters is refused (`invalid_encrypted_content`). So the key belongs
+    /// to the endpoint and the reasoning survives a change of account, which is
+    /// what lets a subscription that ran out hand its tool loop to another one
+    /// mid-thought. Anthropic signs per account and Gemini per turn, so theirs
+    /// does not travel.
+    public var reasoningCrossesAccounts: Bool {
         self == .chatgptCodex
     }
 }

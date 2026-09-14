@@ -116,6 +116,50 @@ func registerContinuityTests() {
         }
     }
 
+    suite("Continuity / rewritten history") {
+        /// Compaction does not only drop turns: it rewrites them. A summary
+        /// replaces the opening, a long tool result is trimmed to a line. The
+        /// answers themselves come back untouched, so they are what Derby
+        /// recognizes the conversation by.
+        let answer = String(repeating: "The migration runs in three phases, each reversible. ", count: 5)
+
+        test("an answer whose question was rewritten still names its conversation") {
+            let ledger = HandoffLedger()
+            let account = UUID()
+            let first = CanonicalRequest(requestedModel: "smart", messages: [
+                .user("Here is the full 40-page migration plan: …(the whole document)…"),
+                .user("What does it say?"),
+            ])
+            await ledger.record(request: first, response: .assistant(answer),
+                                origin: origin("gpt-5.6-sol", account: account))
+
+            // What the client sends next: the document replaced by a summary,
+            // the question it asked rewritten, the answer kept verbatim.
+            let compressed = CanonicalRequest(requestedModel: "smart", messages: [
+                .user("[earlier turns compressed] A migration plan was reviewed."),
+                .assistant(answer),
+                .user("Which phase is reversible?"),
+            ])
+            let annotated = await ledger.annotate(compressed)
+            try expectEqual(annotated.conversationKey, first.conversationKey,
+                            "the session survives the client rewriting everything around the answer")
+            try expectEqual(annotated.messages[1].origin?.accountID, account,
+                            "and the answer is still attributed to the account that wrote it")
+        }
+
+        test("a short answer is only recognized with the turn it answered") {
+            let ledger = HandoffLedger()
+            let request = CanonicalRequest(requestedModel: "smart", messages: [.user("ready?")])
+            await ledger.record(request: request, response: .assistant("Done."),
+                                origin: origin("gpt-5.6-sol", account: UUID()))
+            let rewritten = CanonicalRequest(requestedModel: "smart", messages: [
+                .user("something else entirely"), .assistant("Done."), .user("and now?"),
+            ])
+            try expectNil(await ledger.annotate(rewritten).messages[1].origin,
+                          "'Done.' is not evidence of which conversation this is")
+        }
+    }
+
     suite("Continuity / restarts") {
         func temporaryDatabase() -> String {
             NSTemporaryDirectory() + "derby-ledger-\(UUID().uuidString).sqlite3"
@@ -162,6 +206,131 @@ func registerContinuityTests() {
             let later = HandoffLedger(limits: .init(maxEntries: 2, maxAge: 100))
             await later.attach(store: SQLiteHandoffLedgerStore(path: path), now: start.addingTimeInterval(500))
             try expectEqual(await later.count, 0, "nothing past the age limit is reloaded")
+        }
+    }
+
+    // MARK: - Handing a tool loop to the second subscription
+
+    suite("Continuity / another account") {
+        /// A conversation cut off exactly where it hurts: the model has thought,
+        /// called a tool and the result is back, and only then does its account
+        /// run out. What the second account receives has to be the same
+        /// conversation, thinking included.
+        func interruptedToolLoop(account: UUID) -> CanonicalRequest {
+            CanonicalRequest(requestedModel: "smart", messages: [
+                .user("check order 4471"),
+                CanonicalMessage(role: .assistant,
+                                 toolCalls: [CanonicalToolCall(id: "call_1", name: "orders", argumentsJSON: "{}")],
+                                 reasoningArtifacts: [sealed("mid-loop", account: account)],
+                                 origin: origin("gpt-5.6-sol", account: account)),
+                CanonicalMessage(role: .tool, content: [.text("shipped")], toolCallID: "call_1"),
+            ])
+        }
+
+        test("a tool loop interrupted mid-thought reaches the second subscription with its thinking") {
+            let first = UUID(), second = UUID()
+            let plan = HandoffPlanner.plan(interruptedToolLoop(account: first),
+                                           for: HandoffTarget(modelID: "gpt-5.6-sol",
+                                                              providerKind: .chatgptSubscription,
+                                                              accountID: second))
+            try expectEqual(plan.record.signedReasoningCarried, 1)
+            try expectEqual(plan.record.signedReasoningWithheld, 0)
+            let input = try expectNotNil(ChatGPTCodexAdapter()
+                .buildBody(plan.request, model: "gpt-5.6-sol")["input"]?.arrayValue)
+            try expectEqual(input.compactMap { $0["type"]?.stringValue },
+                            ["message", "reasoning", "function_call", "function_call_output"],
+                            "the second account sees the thinking, the call and its result, in that order")
+            try expectEqual(input[1]["encrypted_content"]?.stringValue, "mid-loop")
+        }
+
+        test("the second account names the conversation its own way, so its own prompt cache keeps working") {
+            let request = interruptedToolLoop(account: UUID())
+            let first = request.conversationID(scope: "account-one")
+            let second = request.conversationID(scope: "account-two")
+            try expect(first != second, "a cache key is only meaningful inside one account")
+            try expectEqual(request.conversationID(scope: "account-two"), second,
+                            "but it is the same on every turn that account serves")
+        }
+    }
+
+    // MARK: - When a backend refuses what was replayed
+
+    suite("Continuity / refused reasoning") {
+        /// The backend verifies encrypted reasoning, so a payload it will not
+        /// read is a 400 on the whole request. That must cost the thinking, not
+        /// the turn.
+        func setup() -> (MockAdapter, Executor, RecordingSink, RoutingDecision, CanonicalRequest) {
+            let adapter = MockAdapter()
+            let sink = RecordingSink()
+            let account = Fixture.account("ChatGPT main", kind: .chatgptSubscription,
+                                          models: [Fixture.model("gpt-5.6-sol")])
+            let executor = Executor(registry: AdapterRegistry(adapters: [.chatgptCodex: adapter]),
+                                    transport: MockTransport(), secrets: InMemorySecretStore(),
+                                    credentials: CredentialCache(),
+                                    health: HealthRegistry(settings: HealthSettings()), telemetry: sink)
+            let config = Fixture.config(accounts: [account],
+                                        logicalModels: [Fixture.logical("smart", accounts: [account])])
+            let decision = try! Fixture.decision(config, model: "smart")
+            var request = CanonicalRequest(requestedModel: "smart", messages: [
+                .user("q"),
+                CanonicalMessage(role: .assistant, content: [.text("a")],
+                                 reasoningArtifacts: [sealed("stale", account: UUID())],
+                                 origin: origin("gpt-5.6-sol", account: UUID())),
+                .user("q2"),
+            ])
+            request.tools = [CanonicalTool(name: "orders", parameters: .object([:]))]
+            return (adapter, executor, sink, decision, request)
+        }
+
+        let refusal = DerbyError(kind: .reasoningRejected,
+                                 message: "The encrypted content for item rs_1 could not be verified.")
+
+        test("reasoning the backend will not verify is re-sent without it, not failed") {
+            let (adapter, executor, _, decision, request) = setup()
+            adapter.set("gpt-5.6-sol", .failThenSucceed(count: 1, error: refusal, text: "answered"))
+            let outcome = try await executor.execute(request, decision: decision, meta: RequestMeta())
+            try expectEqual(outcome.response.message.joinedText, "answered")
+            try expectEqual(adapter.calls("gpt-5.6-sol"), 2, "the same target was asked again")
+            let sent = adapter.seen.map { $0.request.messages[1].reasoningArtifacts.count }
+            try expectEqual(sent, [1, 0], "the retry withheld exactly what was refused")
+            let record = try expectNotNil(outcome.record.attempts.last?.handoff)
+            try expect(record.adjustments.contains { $0.contains("without the replayed reasoning") },
+                       "a repair is never silent: \(record.adjustments)")
+        }
+
+        test("a stream refused before its first byte is repaired on the same target") {
+            let (adapter, executor, _, decision, request) = setup()
+            adapter.set("gpt-5.6-sol", .failThenSucceed(count: 1, error: refusal, text: "streamed"))
+            var streamed = CanonicalRequest(requestedModel: "smart", messages: request.messages)
+            streamed.tools = request.tools
+            streamed.stream = true
+
+            var text = ""
+            var record: RequestRecord?
+            for try await event in executor.stream(streamed, decision: decision, meta: RequestMeta()) {
+                switch event {
+                case .canonical(.textDelta(let t)): text += t
+                case .finished(let r): record = r
+                default: break
+                }
+            }
+            try expectEqual(text.trimmingCharacters(in: .whitespaces), "streamed")
+            let r = try expectNotNil(record)
+            try expect(r.succeeded, "the client never sees the refusal")
+            try expectEqual(r.finalProviderName, "ChatGPT main", "and never leaves the account it was on")
+            try expectEqual(adapter.seen.map { $0.request.messages[1].reasoningArtifacts.count }, [1, 0])
+        }
+
+        test("a target that refuses twice is not asked a third time") {
+            let (adapter, executor, _, decision, request) = setup()
+            adapter.set("gpt-5.6-sol", .fail(refusal))
+            do {
+                _ = try await executor.execute(request, decision: decision, meta: RequestMeta())
+                throw TestFailure(message: "the request should have failed", file: #fileID, line: #line)
+            } catch let error as DerbyError {
+                try expectEqual(error.kind, .reasoningRejected)
+            }
+            try expectEqual(adapter.calls("gpt-5.6-sol"), 2, "one repair, then the error is the client's")
         }
     }
 }

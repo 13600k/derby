@@ -352,6 +352,168 @@ func registerLiveTests() {
         }
     }
 
+
+    // MARK: - One conversation across two subscriptions of the same provider
+
+    suite("Live / two subscriptions") {
+        /// Easy questions are answered without thinking, and a turn with no
+        /// reasoning proves nothing about carrying reasoning. This one earns a
+        /// reasoning item.
+        let puzzle = ("Work this out step by step, do not guess. Among France, Germany, Luxembourg and "
+                      + "the Netherlands, take the country whose English name has the most letters, then "
+                      + "take that country's capital. Call get_weather for that capital, then reply in one "
+                      + "short sentence naming the city and its weather.")
+
+        func thoughtfulTurn(_ model: String) -> JSONValue {
+            .object([
+                "model": .string(model),
+                "messages": .array([.object(["role": .string("user"), "content": .string(puzzle)])]),
+                "tools": .array([weatherTool]),
+                "reasoning_effort": .string("high"),
+                "reasoning": .object(["effort": .string("high"), "summary": .string("auto")]),
+            ])
+        }
+
+        /// The continuation as a Chat Completions client has to send it: the
+        /// call and its result, and no reasoning — the dialect has nowhere to
+        /// keep any. Whatever reaches the provider came from Derby's ledger.
+        func continuation(_ model: String, call: JSONValue, result: String) -> JSONValue {
+            .object([
+                "model": .string(model),
+                "messages": .array([
+                    .object(["role": .string("user"), "content": .string(puzzle)]),
+                    .object(["role": .string("assistant"), "tool_calls": .array([call])]),
+                    .object(["role": .string("tool"), "tool_call_id": call["id"] ?? .string(""),
+                             "content": .string(result)]),
+                ]),
+                "tools": .array([weatherTool]),
+                "reasoning_effort": .string("high"),
+                "reasoning": .object(["effort": .string("high"), "summary": .string("auto")]),
+            ])
+        }
+
+        test("a tool loop interrupted on one subscription is finished by the other, thinking included") {
+            guard let live = try await LiveGateway.shared.start(),
+                  live.has("live-gpt-a"), live.has("live-gpt-b") else { return }
+            live.spy.clear()
+            let first = try await chat(live.port, thoughtfulTurn("live-gpt-a"))
+            let call = try firstToolCall(first)
+            let issued = try expectNotNil(live.spy.bodies(matching: "chatgpt.com").last,
+                                          "nothing reached the Codex backend")
+            _ = issued
+
+            // The account the first turn ran on is now, as far as this turn is
+            // concerned, out of quota: the same conversation goes to the other.
+            let second = try await chat(live.port, continuation("live-gpt-b", call: call, result: "18°C, light rain"))
+            let handedOver = try expectNotNil(live.spy.bodies(matching: "chatgpt.com").last)
+            let items = try expectNotNil(handedOver["input"]?.arrayValue)
+            let reasoning = items.filter { $0["type"]?.stringValue == "reasoning" }
+            print("      the second account received: \(items.compactMap { $0["type"]?.stringValue })")
+            try expect(!reasoning.isEmpty,
+                       "the first account's reasoning should reach the second one")
+            try expect((reasoning.first?["encrypted_content"]?.stringValue ?? "").count > 100,
+                       "and it should be the sealed item, not an empty shell")
+
+            // Same model, everything carried: there is nothing to disclose, and
+            // Derby only reports a hand-off that changed something.
+            if let record = handoff(second) {
+                print("      handoff: \(record["summary"]?.stringValue ?? "—")")
+                try expectEqual(record["signed_reasoning_withheld"]?.intValue ?? 0, 0,
+                                "nothing should be withheld between copies of one model")
+            }
+            try expect(usesToolResult(contentOf(second)),
+                       "and the answer still uses the tool result: \(contentOf(second))")
+        }
+
+        test("each subscription names the conversation its own way, so each keeps its own prompt cache") {
+            guard let live = try await LiveGateway.shared.start(),
+                  live.has("live-gpt-a"), live.has("live-gpt-b") else { return }
+            live.spy.clear()
+            let first = try await chat(live.port, thoughtfulTurn("live-gpt-a"))
+            let call = try firstToolCall(first)
+            _ = try await chat(live.port, continuation("live-gpt-a", call: call, result: "18°C, light rain"))
+            _ = try await chat(live.port, continuation("live-gpt-b", call: call, result: "18°C, light rain"))
+
+            let keys = live.spy.bodies(matching: "chatgpt.com").compactMap { $0["prompt_cache_key"]?.stringValue }
+            let sessions = live.spy.headers(matching: "chatgpt.com").compactMap { $0["session_id"] }
+            print("      cache keys: \(keys)")
+            try expectEqual(keys.count, 3)
+            try expectEqual(keys[0], keys[1], "two turns on one account are one session")
+            try expect(keys[2] != keys[0], "the other account is a different cache, so a different key")
+            try expectEqual(sessions, keys, "the session id and the cache key are the same name")
+        }
+
+    }
+
+
+    // MARK: - A long conversation whose client rewrites its own history
+
+    suite("Live / compression") {
+        /// Big enough that the backend's cache is worth having and that losing
+        /// it would be obvious: roughly 50k tokens of deterministic filler with
+        /// one fact buried in it.
+        func document() -> String {
+            var lines: [String] = ["PROJECT LOG — do not summarize away the serial numbers."]
+            for i in 1...2_600 {
+                lines.append("entry \(i): unit \(1000 + i) shipped from depot \(i % 7) with seal code "
+                             + "\(String(format: "%04X", i &* 2654)) and no exceptions recorded")
+            }
+            lines.insert("entry 0: the master seal code for this project is QX-88317.", at: 1_300)
+            return lines.joined(separator: "\n")
+        }
+
+        func ask(_ model: String, _ messages: [JSONValue]) -> JSONValue {
+            .object([
+                "model": .string(model),
+                "messages": .array(messages),
+                "reasoning_effort": .string("low"),
+            ])
+        }
+        func message(_ role: String, _ text: String) -> JSONValue {
+            .object(["role": .string(role), "content": .string(text)])
+        }
+        func cached(_ answer: JSONValue) -> Int {
+            answer["usage"]?["prompt_tokens_details"]?["cached_tokens"]?.intValue ?? 0
+        }
+        func prompt(_ answer: JSONValue) -> Int { answer["usage"]?["prompt_tokens"]?.intValue ?? 0 }
+
+        test("a long conversation keeps its cache, and keeps it after the client compresses the history") {
+            guard let live = try await LiveGateway.shared.start(), live.has("live-gpt-a") else { return }
+            let doc = document()
+            let opening = message("user", doc + "\n\nAcknowledge in one word.")
+            live.spy.clear()
+
+            let first = try await chat(live.port, ask("live-gpt-a", [opening]), seconds: 600)
+            print("      turn 1: \(prompt(first)) prompt tokens, \(cached(first)) cached (cold)")
+
+            let question = "In about 60 words, say what this log records and quote the master seal code."
+            let history = [opening, message("assistant", contentOf(first)), message("user", question)]
+            let second = try await chat(live.port, ask("live-gpt-a", history), seconds: 600)
+            print("      turn 2: \(prompt(second)) prompt tokens, \(cached(second)) cached")
+            try expect(cached(second) > 1_000,
+                       "the second turn of a long conversation must be served from the cache")
+            try expect(contentOf(second).contains("QX-88317"),
+                       "and the model still reads the document: \(contentOf(second))")
+
+            // What a compressing client does: the opening it sent before is
+            // replaced by a summary of it, so every byte of the prefix changes.
+            // Only the answers Derby recorded say this is the same conversation.
+            let compressed = [
+                message("user", "[earlier context compressed] A long project log was reviewed."),
+                message("assistant", contentOf(second)),
+                message("user", "How many shipping entries were there? Answer with the number only."),
+            ]
+            let third = try await chat(live.port, ask("live-gpt-a", compressed), seconds: 600)
+            print("      turn 3 (compressed): \(prompt(third)) prompt tokens, \(cached(third)) cached")
+
+            let keys = live.spy.bodies(matching: "chatgpt.com").compactMap { $0["prompt_cache_key"]?.stringValue }
+            print("      cache keys across the session: \(Set(keys).count) distinct in \(keys.count) turns")
+            try expectEqual(keys.count, 3)
+            try expectEqual(Set(keys).count, 1,
+                            "compression rewrote the history, but this is still one session: \(keys)")
+        }
+    }
+
     // MARK: - Load and disconnects
 
     suite("Live / load") {
@@ -427,6 +589,9 @@ actor LiveGateway {
     /// The same server declared as an unknown endpoint, so the conservative
     /// path is checked whatever kind the user has configured.
     static let customAccount = "enzotide (as a custom endpoint)"
+    /// The model both ChatGPT subscriptions serve, so a hand-off between them
+    /// is a change of account and nothing else.
+    static let codexModel = "gpt-5.6-sol"
 
     struct Running {
         let port: Int
@@ -496,6 +661,14 @@ actor LiveGateway {
                   let model = chatgpt.models.first(where: { $0.modelID.contains("gpt-5") }) else { continue }
             config.logicalModels.append(LiveGateway.group("live-gpt", targets: [(chatgpt.id, model.id)]))
             groups.insert("live-gpt")
+        }
+        // Each ChatGPT subscription on its own, so a conversation can be handed
+        // from one to the other deliberately rather than by waiting for a quota
+        // to run out; and the same model on both, since reasoning only travels
+        // between copies of one model.
+        let subscriptions = config.providers.filter { $0.kind == .chatgptSubscription }
+        for (i, account) in subscriptions.prefix(2).enumerated() {
+            pin("live-gpt-\(["a", "b"][i])", provider: account.name, model: LiveGateway.codexModel)
         }
         // Two different servers, ranked by how busy each one is.
         if let enzotide = accounts["enzotide"], let ollama = accounts["Ollama (local)"],
@@ -575,7 +748,7 @@ actor LiveGateway {
 final class SpyTransport: HTTPTransport, @unchecked Sendable {
     private let inner: any HTTPTransport
     private let lock = NSLock()
-    private var sent: [(url: String, body: JSONValue)] = []
+    private var sent: [(url: String, body: JSONValue, headers: [String: String])] = []
     private var watching: String?
     private var seen: [String] = []
 
@@ -597,7 +770,7 @@ final class SpyTransport: HTTPTransport, @unchecked Sendable {
 
     private func record(_ request: OutboundRequest) {
         guard let body = request.body, let json = JSONValue.parse(String(decoding: body, as: UTF8.self)) else { return }
-        lock.lock(); sent.append((request.url.absoluteString, json)); lock.unlock()
+        lock.lock(); sent.append((request.url.absoluteString, json, request.headers)); lock.unlock()
     }
 
     func clear() { lock.lock(); sent.removeAll(); lock.unlock() }
@@ -605,6 +778,18 @@ final class SpyTransport: HTTPTransport, @unchecked Sendable {
     func lastBody(matching fragment: String) -> JSONValue? {
         lock.lock(); defer { lock.unlock() }
         return sent.last { $0.url.contains(fragment) }?.body
+    }
+
+    /// Every body sent to a matching endpoint, oldest first.
+    func bodies(matching fragment: String) -> [JSONValue] {
+        lock.lock(); defer { lock.unlock() }
+        return sent.filter { $0.url.contains(fragment) }.map(\.body)
+    }
+
+    /// The headers a matching request went out under — the session it named.
+    func headers(matching fragment: String) -> [[String: String]] {
+        lock.lock(); defer { lock.unlock() }
+        return sent.filter { $0.url.contains(fragment) }.map(\.headers)
     }
 
     func send(_ request: OutboundRequest) async throws -> OutboundResponse {

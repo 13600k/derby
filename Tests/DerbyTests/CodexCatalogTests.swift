@@ -98,6 +98,44 @@ func registerCodexCatalogTests() {
             try expect(!selectable.contains { $0.slug == "gpt-reserve" }, "hidden models must not be offered")
         }
 
+        // The CLI writes the backend's reply to disk unchanged, so the live
+        // answer parses with the same code — and must win, because a cache is
+        // only as fresh as the last time that CLI ran. A model released since
+        // then is simply absent, which is how a new flagship went unlisted while
+        // two accounts pointed at different CODEX_HOMEs reported different sets.
+        test("the backend's own reply parses, and outranks the CLI's cache") {
+            let liveBody = """
+            {"models":[
+              {"slug":"gpt-6-astra","display_name":"GPT-6 Astra","description":"newest","priority":1,
+               "visibility":"list","supported_in_api":true,"default_reasoning_level":"medium",
+               "context_window":272000,"max_context_window":872000,
+               "supported_reasoning_levels":[{"effort":"low"},{"effort":"medium"},{"effort":"high"}]},
+              {"slug":"gpt-reserve","display_name":"GPT-Reserve","description":"","priority":3,
+               "visibility":"hide","supported_in_api":true,
+               "supported_reasoning_levels":[{"effort":"medium"}]}
+            ]}
+            """
+            let live = try expectNotNil(CodexModelCatalog.parse(Data(liveBody.utf8)))
+            let selectable = live.entries.filter { $0.isListed && $0.supportedInAPI }
+            try expectEqual(selectable.map(\.slug), ["gpt-6-astra"])
+            try expectEqual(selectable.first?.maxContextWindow, 872_000)
+            // Priority 1 is the provider's own word for flagship.
+            try expect(try expectNotNil(selectable.first).derivedQuality >= 95)
+
+            // A home whose cached file predates the new model.
+            let url = try writeCache(sample)
+            let home = url.deletingLastPathComponent()
+            defer { try? FileManager.default.removeItem(at: home) }
+            try expect(!CodexModelCatalog.selectableModels(home: home).contains { $0.slug == "gpt-6-astra" },
+                       "the stale file is exactly what hid the model")
+
+            CodexModelCatalog.store(live, home: home)
+            try expectEqual(CodexModelCatalog.selectableModels(home: home).map(\.slug), ["gpt-6-astra"])
+            // Request-time lookups see it too, so its efforts are not guessed at.
+            try expectEqual(CodexModelCatalog.clampEffort(.ultra, for: "gpt-6-astra", home: home), "high")
+            try expectEqual(CodexModelCatalog.entry(for: "gpt-6-astra", home: home)?.displayName, "GPT-6 Astra")
+        }
+
         test("quality follows the provider's own ranking") {
             let url = try writeCache(sample)
             defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }

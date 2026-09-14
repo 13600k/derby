@@ -72,6 +72,40 @@ func registerModelMetadataTests() {
             try expectClose(try expectNotNil(model.pricing?.outputPerMTok), 15.0, tolerance: 0.0001)
         }
 
+        test("llama.cpp's listing and /props state the context window and tool support") {
+            let transport = MockTransport()
+            transport.stub("/models", json: """
+            {"object":"list","data":[{"id":"ornith-1.5-35b-a3b","object":"model","owned_by":"llamacpp",
+              "meta":{"n_ctx":262144,"n_ctx_train":262144,"n_params":34660610688}}]}
+            """)
+            transport.stub("/props", json: """
+            {"total_slots":1,"default_generation_settings":{"n_ctx":131072},
+             "modalities":{"vision":false,"audio":false},
+             "chat_template":"{% if enable_thinking %}<think>{% endif %}",
+             "chat_template_caps":{"supports_tools":true,"supports_tool_calls":true,
+                                   "supports_parallel_tool_calls":true}}
+            """)
+            var account = Fixture.account("llama", kind: .llamaCpp, models: [])
+            account.baseURLOverride = "http://127.0.0.1:8081/v1"
+            let ctx = ProviderContext(account: account, transport: transport, secrets: InMemorySecretStore(),
+                                      credentials: CredentialCache())
+            let models = try await OpenAIAdapter().listModels(ctx)
+            let caps = try expectNotNil(models.first?.capabilities)
+            try expectEqual(caps.contextWindow, 131_072, "the slot context beats the listing's n_ctx")
+            try expect(caps.flags.contains(.tools))
+            try expect(caps.flags.contains(.parallelTools))
+            try expect(caps.flags.contains(.reasoning))
+            try expect(caps.flags.contains(.jsonSchema))
+            try expect(!caps.flags.contains(.vision))
+            try expectEqual(caps.source, .discovered)
+
+            // Without /props, the listing's own n_ctx still beats the 8K placeholder.
+            let listed = try expectNotNil(OpenAIAdapter().parseListedModel(try expectNotNil(JSONValue.parse("""
+            {"id":"ornith-1.5-35b-a3b","meta":{"n_ctx":262144}}
+            """)), kind: .llamaCpp))
+            try expectEqual(listed.capabilities?.contextWindow, 262_144)
+        }
+
         test("a bare listing falls back to the bundled catalog") {
             let adapter = OpenAIAdapter()
             let model = try expectNotNil(

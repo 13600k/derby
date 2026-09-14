@@ -253,9 +253,15 @@ In request order:
      reads back (`LineageTraits.reasoningReplay`: Qwen's template reads reasoning for the open
      tool loop only; DeepSeek's thinking mode needs it on every turn once tools are involved).
    - *Signed reasoning* returns only to a model that can verify it — Anthropic thinking
-     signatures to Claude, OpenAI encrypted reasoning to the account that issued it, Gemini
-     thought signatures to Gemini — and only within the active tool loop, so any replayed
-     prefix is one the provider issued. The Responses API is the exception
+     signatures to Claude, Gemini thought signatures to Gemini, OpenAI encrypted reasoning to
+     any account on the endpoint that issued it (`AdapterFamily.reasoningCrossesAccounts`,
+     verified live: a second ChatGPT subscription decrypts the first one's item and answers
+     from what was inside it, while a payload altered by one byte is refused, so the key is
+     the endpoint's rather than the account's — which is what lets a subscription that has run
+     out hand its tool loop to another one mid-thought) — and only within the active tool loop,
+     so any replayed prefix is one the provider issued. A target that refuses what was
+     replayed to it (`FailureKind.reasoningRejected`) is asked once more with the replay
+     withheld, so reasoning nobody can verify costs the thinking and never the turn. The Responses API is the exception
      (`AdapterFamily.replaysReasoningFromEarlierTurns`): its encrypted reasoning goes back for
      every earlier turn, as its stateless clients send it, since withholding a finished turn's
      items loses that thinking and can move the prompt the cache is keyed on. Gemini 3 requires

@@ -105,11 +105,30 @@ public struct ClaudeCLIAdapter: ProviderAdapter {
             message: "The Claude CLI started but produced nothing, which almost always means macOS is showing a Keychain prompt for it. Look for a dialog asking whether \"claude\" may use your keychain and choose Always Allow, then try again. Running `claude` once in Terminal also clears it.")
     }
 
-    /// Asks the CLI whether it is signed in. Cheap, and costs no plan usage.
-    func loginStatus(_ ctx: ProviderContext) async -> String? {
+    /// What `claude auth status --json` reports.
+    ///
+    /// `apiProvider` is the CLI's own word for which lane a request lands in, so
+    /// this is where "first party, and therefore plan limits" stops being an
+    /// assumption. Derby still never reads the credential itself.
+    struct AuthStatus: Sendable {
+        var loggedIn: Bool
+        var isFirstParty: Bool
+        /// One line for the connection test to show.
+        var summary: String
+    }
+
+    /// Asks the CLI whether it is signed in. Costs no plan usage — but only
+    /// because the subcommand is real.
+    ///
+    /// An unrecognised subcommand is not an error to this CLI: it treats the
+    /// words as a *prompt* and answers them, which spends plan usage and never
+    /// says anything about being signed in. `auth status` therefore has to be
+    /// verified by its output, and reading stops at the first line that is not
+    /// JSON so an old CLI's answer is abandoned rather than paid for.
+    func authStatus(_ ctx: ProviderContext) async -> AuthStatus? {
         guard let binary = try? executable(ctx) else { return nil }
         let lines = ProcessRunner.streamLines(executable: binary,
-                                              arguments: ["login", "status"],
+                                              arguments: ["auth", "status", "--json"],
                                               environment: environment(ctx),
                                               currentDirectory: FileManager.default.temporaryDirectory)
         let channel = AsyncEventChannel<String>()
@@ -124,12 +143,28 @@ public struct ClaudeCLIAdapter: ProviderAdapter {
         var output: [String] = []
         while true {
             let next = try? await channel.next(timeout: Self.firstOutputTimeout,
-                                               timeoutMessage: "claude login status timed out")
+                                               timeoutMessage: "claude auth status timed out")
             guard let line = next ?? nil else { break }
+            if output.isEmpty, !line.trimmingCharacters(in: .whitespaces).isEmpty,
+               !line.trimmingCharacters(in: .whitespaces).hasPrefix("{") {
+                return nil      // not JSON: this CLI is answering, not reporting.
+            }
             output.append(line)
         }
-        return output.isEmpty ? nil : output.joined(separator: " ")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return Self.parseAuthStatus(output.joined(separator: "\n"))
+    }
+
+    static func parseAuthStatus(_ text: String) -> AuthStatus? {
+        guard let json = JSONValue.parse(text), let loggedIn = json["loggedIn"]?.boolValue else { return nil }
+        let isFirstParty = json["apiProvider"]?.stringValue == "firstParty"
+        var parts: [String] = []
+        if let email = json["email"]?.stringValue { parts.append(email) }
+        if let plan = json["subscriptionType"]?.stringValue { parts.append("\(plan) plan") }
+        if let method = json["authMethod"]?.stringValue { parts.append("via \(method)") }
+        let who = parts.isEmpty ? "" : " as " + parts.joined(separator: ", ")
+        return AuthStatus(loggedIn: loggedIn,
+                          isFirstParty: isFirstParty,
+                          summary: loggedIn ? "Signed in\(who)." : "Not signed in.")
     }
 
     public func listModels(_ ctx: ProviderContext) async throws -> [DiscoveredModel] {
@@ -138,11 +173,15 @@ public struct ClaudeCLIAdapter: ProviderAdapter {
         // whatever the metadata catalog knows about the current Claude family.
         let aliases = ["opus", "sonnet", "haiku"]
         return aliases.map { alias in
-            let metadata = ModelCatalog.metadata(for: "claude-\(alias)", kind: ctx.account.kind)
+            // The alias is what the CLI accepts; its metadata is the newest
+            // model in that tier, which is what the CLI will actually run.
+            let metadata = ModelCatalog.metadata(for: alias, kind: ctx.account.kind)
+            let resolved = ModelCatalog.newestInTier(alias, kind: ctx.account.kind)
+            let currently = resolved.map { " (currently \($0))" } ?? ""
             return DiscoveredModel(id: alias,
                                    displayName: "Latest \(alias.capitalized)",
                                    capabilities: Self.capabilities(metadata.capabilities),
-                                   profile: ModelProfile(summary: "Resolved by the CLI to the newest \(alias).",
+                                   profile: ModelProfile(summary: "Resolved by the CLI to the newest \(alias)\(currently).",
                                                          ownedBy: "anthropic"),
                                    pricing: .free)
         }
@@ -170,19 +209,22 @@ public struct ClaudeCLIAdapter: ProviderAdapter {
     public func healthCheck(_ ctx: ProviderContext) async -> ConnectionTestResult {
         do {
             let binary = try executable(ctx)
-            let status = await loginStatus(ctx)
-            let signedIn = status?.lowercased().contains("logged in") ?? false
-            guard signedIn else {
+            guard let status = await authStatus(ctx) else {
                 return .failure(DerbyError(
                     kind: .authentication,
-                    message: status?.isEmpty == false
-                        ? "Claude Code reports: \(status!). Run `claude` in Terminal and sign in."
-                        : "Claude Code is not signed in. Run `claude` in Terminal and sign in, then test again."))
+                    message: "Derby could not read `claude auth status` from \(binary.path). Update Claude Code, then test again."))
+            }
+            guard status.loggedIn else {
+                return .failure(DerbyError(
+                    kind: .authentication,
+                    message: "Claude Code is not signed in. Run `claude` in Terminal, type `/login`, then test again."))
             }
             let models = try await listModels(ctx)
             var details = ["Using \(binary.path).",
-                           status ?? "Signed in.",
-                           "Requests run through the CLI, so they draw on your plan limits rather than extra usage.",
+                           status.summary,
+                           status.isFirstParty
+                               ? "The CLI reports this account as first party, so requests draw on your plan limits rather than extra usage."
+                               : "The CLI does not report this account as first party, so requests may bill as extra usage.",
                            "Tools and images are not available on this path — requests needing them route elsewhere."]
             if let home = ctx.account.credentialHomeURL {
                 details.insert("Account directory: \(home.path).", at: 1)
@@ -378,13 +420,17 @@ public struct ClaudeCLIAdapter: ProviderAdapter {
 
     // MARK: - Parsing
 
+    /// The CLI reports Anthropic's own shape, where `input_tokens` excludes
+    /// what the cache served; Derby counts a prompt whole.
     static func parseUsage(_ usage: JSONValue) -> CanonicalUsage {
         guard !usage.isNull else { return .zero }
+        let read = usage["cache_read_input_tokens"]?.intValue ?? 0
+        let written = usage["cache_creation_input_tokens"]?.intValue ?? 0
         return CanonicalUsage(
-            inputTokens: usage["input_tokens"]?.intValue ?? 0,
+            inputTokens: (usage["input_tokens"]?.intValue ?? 0) + read + written,
             outputTokens: usage["output_tokens"]?.intValue ?? 0,
-            cachedInputTokens: usage["cache_read_input_tokens"]?.intValue ?? 0,
-            cacheWriteTokens: usage["cache_creation_input_tokens"]?.intValue ?? 0,
+            cachedInputTokens: read,
+            cacheWriteTokens: written,
             reasoningTokens: usage["output_tokens_details"]?["thinking_tokens"]?.intValue ?? 0)
     }
 

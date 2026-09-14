@@ -341,6 +341,10 @@ public struct AnthropicAdapter: ProviderAdapter {
             }
         }
 
+        // What this conversation has already said is worth not paying for
+        // twice; the marks go on last so every part of the body exists.
+        Self.markCacheBreakpoints(&body, request: r)
+
         if let reasoning = r.reasoning, reasoning.effort != nil || reasoning.maxTokens != nil {
             // Thinking, in either form, cannot be combined with forced tool use.
             let forcesTool: Bool = {
@@ -486,12 +490,78 @@ public struct AnthropicAdapter: ProviderAdapter {
                                  usage: parseUsage(json["usage"] ?? .null))
     }
 
+    /// Anthropic reports a prompt in parts: `input_tokens` counts only what was
+    /// neither read from the cache nor written to it. Derby's convention is the
+    /// OpenAI one — the cached counts are a *subset* of the prompt — so the
+    /// parts are added back up. Without this a 27k-token cached turn reports a
+    /// two-token prompt.
     func parseUsage(_ u: JSONValue) -> CanonicalUsage {
         guard !u.isNull else { return .zero }
-        return CanonicalUsage(inputTokens: u["input_tokens"]?.intValue ?? 0,
+        let fresh = u["input_tokens"]?.intValue ?? 0
+        let read = u["cache_read_input_tokens"]?.intValue ?? 0
+        let written = u["cache_creation_input_tokens"]?.intValue ?? 0
+        return CanonicalUsage(inputTokens: fresh + read + written,
                               outputTokens: u["output_tokens"]?.intValue ?? 0,
-                              cachedInputTokens: u["cache_read_input_tokens"]?.intValue ?? 0,
-                              cacheWriteTokens: u["cache_creation_input_tokens"]?.intValue ?? 0)
+                              cachedInputTokens: read,
+                              cacheWriteTokens: written)
+    }
+
+    /// Shortest prompt worth marking. Claude's own minimum is 1024 tokens
+    /// (2048 on the small models), and a mark below it is ignored, so this sits
+    /// above both rather than spending a breakpoint on nothing.
+    static let minimumCacheablePrompt = 2_048
+
+    /// Marks the prefixes worth caching, so a conversation that continues
+    /// re-reads only what it has added.
+    ///
+    /// Anthropic caches everything *before* a marked block, up to four marks in
+    /// one request. Two prefixes matter: the stable one — the tools and the
+    /// system prompt, which a client repeats on every turn — and the growing
+    /// one, the conversation itself, where marking the end of the latest turn
+    /// is what lets the next turn read all of it back instead of paying for it
+    /// again. A second mark a turn earlier keeps a prefix to land on when the
+    /// tail of the conversation is rewritten, as compaction rewrites it.
+    ///
+    /// Nothing is marked unless the conversation has an answer in it already: a
+    /// one-shot question would pay for the cache write and never take the read.
+    static func markCacheBreakpoints(_ body: inout [String: JSONValue], request r: CanonicalRequest) {
+        guard r.messages.contains(where: { $0.role == .assistant }),
+              r.estimatedPromptTokens >= minimumCacheablePrompt else { return }
+        let ephemeral = JSONValue.object(["type": .string("ephemeral")])
+
+        /// Thinking blocks cannot carry a breakpoint, and an empty block is not
+        /// worth one.
+        func marked(_ block: JSONValue) -> JSONValue? {
+            guard var fields = block.objectValue else { return nil }
+            let type = fields["type"]?.stringValue ?? ""
+            guard type != "thinking", type != "redacted_thinking" else { return nil }
+            fields["cache_control"] = ephemeral
+            return .object(fields)
+        }
+        func markLastEntry(of key: String) {
+            guard var array = body[key]?.arrayValue, let last = array.indices.last,
+                  let block = marked(array[last]) else { return }
+            array[last] = block
+            body[key] = .array(array)
+        }
+        // Tools come first in the prompt and the system blocks next, so the mark
+        // on the system prompt covers both; the one on the tools survives a
+        // system prompt that changes between turns.
+        markLastEntry(of: "tools")
+        markLastEntry(of: "system")
+
+        guard var messages = body["messages"]?.arrayValue, !messages.isEmpty else { return }
+        // The end of the latest turn, and the end of the turn before it.
+        for index in Set([messages.count - 1, messages.count - 3]).filter({ $0 >= 0 }).sorted() {
+            guard var message = messages[index].objectValue,
+                  var content = message["content"]?.arrayValue,
+                  let last = content.indices.last,
+                  let block = marked(content[last]) else { continue }
+            content[last] = block
+            message["content"] = .array(content)
+            messages[index] = .object(message)
+        }
+        body["messages"] = .array(messages)
     }
 
     func mapStopReason(_ s: String?) -> CanonicalFinishReason {

@@ -87,6 +87,15 @@ when Derby is not running.
   cached to 99–100% on every turn after the first, and its average time to first token halved
   (8.6 s → 4.1 s). A three-turn test conversation read 4,608 of ~4,800 prompt tokens from cache
   on turns two and three, with the first turn's reasoning carried to both.
+- **One conversation survives both subscriptions** (2026-09-13, verified live). The Codex
+  backend verifies encrypted reasoning — a payload altered by 32 characters is refused as
+  `invalid_encrypted_content` — and the *other* ChatGPT account decrypts it anyway: asked for
+  a 4-digit number the first account had chosen silently, both named `6831`, where the same
+  turn with the reasoning withheld invented `5837`. So a tool loop interrupted mid-thought is
+  finished by the second subscription with its thinking intact; only the prompt cache stays
+  behind, since a cache belongs to one account. A 68K-token conversation read 67,712 of its
+  67,922 prompt tokens from cache on the following turn, and kept one session id across a
+  client compaction that rewrote both its opening and the question its last answer replied to.
 - **A provider only hands back what it issued.** A model that answers a turn without reasoning
   leaves nothing to carry, and `x_derby.handoff` then reports nothing withheld — because
   nothing was. Observed live: the same model reasons on a question that needs it and skips it

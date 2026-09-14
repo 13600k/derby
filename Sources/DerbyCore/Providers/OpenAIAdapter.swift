@@ -44,6 +44,16 @@ public struct OpenAIQuirks: Sendable {
         case llamaCppSlots
     }
     public var occupancyStyle: OccupancyStyle = .unreported
+    /// Where the server describes the model it is serving beyond its `/models`
+    /// entry. A bare listing states only an id, so without this a model the
+    /// catalog has never heard of looks like an 8K, tool-less chat model.
+    public enum PropsStyle: Sendable {
+        case unreported
+        /// llama.cpp's `/props`: slot context size, modalities, and what the
+        /// chat template can render (`chat_template_caps`).
+        case llamaCppProps
+    }
+    public var propsStyle: PropsStyle = .unreported
     /// Assistant-message fields that carry earlier reasoning back.
     public var reasoningReplayFields: [String] = []
     /// Accepts `chat_template_kwargs`, the switch self-hosted servers use to
@@ -103,6 +113,7 @@ public struct OpenAIQuirks: Sendable {
                 q.supportsChatTemplateKwargs = true
                 q.occupancyStyle = kind == .vllm ? .vllmMetrics
                     : (kind == .sglang ? .sglangMetrics : .llamaCppSlots)
+                if kind == .llamaCpp { q.propsStyle = .llamaCppProps }
             default: break
             }
         case .openAICompatible:
@@ -204,8 +215,69 @@ public struct OpenAIAdapter: ProviderAdapter {
             throw DerbyError(kind: .transient, message: "Model list was not valid JSON.")
         }
         let items = json["data"]?.arrayValue ?? json.arrayValue ?? []
-        return items.compactMap { parseListedModel($0, kind: ctx.account.kind) }
-            .sorted { $0.id < $1.id }
+        var models = items.compactMap { parseListedModel($0, kind: ctx.account.kind) }
+        if q.propsStyle == .llamaCppProps {
+            // Router mode serves several models and describes each on request;
+            // a single-model server ignores the parameter.
+            let native = OllamaDiscovery.nativeBase(from: auth.baseURLOverride ?? ctx.account.baseURL)
+            for index in models.indices {
+                var components = URLComponents(string: native + "/props")
+                if models.count > 1 { components?.queryItems = [URLQueryItem(name: "model", value: models[index].id)] }
+                guard let propsURL = components?.url,
+                      let response = try? await ctx.transport.send(OutboundRequest(
+                        url: propsURL, method: "GET", headers: headers(ctx, auth: auth),
+                        timeout: min(ctx.account.requestTimeoutSeconds, 30),
+                        allowInsecureTLS: ctx.account.allowInsecureTLS)),
+                      (200..<300).contains(response.status), let props = response.bodyJSON
+                else { continue }
+                models[index] = Self.applyingLlamaCppProps(props, to: models[index])
+            }
+        }
+        return models.sorted { $0.id < $1.id }
+    }
+
+    /// Folds what llama.cpp's `/props` states into a discovered model. Best
+    /// effort: a field the build does not publish leaves what was known alone.
+    static func applyingLlamaCppProps(_ props: JSONValue, to model: DiscoveredModel) -> DiscoveredModel {
+        var caps = model.capabilities ?? .unknown
+        var learnedSomething = false
+
+        // The slot's context is what a request can actually use.
+        if let window = props["default_generation_settings"]?["n_ctx"]?.intValue, window > 0 {
+            caps.contextWindow = window
+            learnedSomething = true
+        }
+        if let templateCaps = props["chat_template_caps"], templateCaps.objectValue != nil {
+            learnedSomething = true
+            caps.flags.formUnion([.text, .streaming])
+            if templateCaps["supports_tools"]?.boolValue == true
+                || templateCaps["supports_tool_calls"]?.boolValue == true {
+                caps.flags.insert(.tools)
+                if templateCaps["supports_parallel_tool_calls"]?.boolValue == true {
+                    caps.flags.insert(.parallelTools)
+                }
+            }
+            // llama.cpp enforces `response_format` with a grammar, whatever the model.
+            caps.flags.formUnion([.jsonMode, .jsonSchema])
+        }
+        if let template = props["chat_template"]?.stringValue,
+           ["<think>", "enable_thinking", "reasoning_content"].contains(where: template.contains) {
+            caps.flags.insert(.reasoning)
+            learnedSomething = true
+        }
+        if let modalities = props["modalities"], modalities.objectValue != nil {
+            // The server's word on modalities is final; a catalog guess is not.
+            learnedSomething = true
+            caps.flags.subtract(.allModalities)
+            if modalities["vision"]?.boolValue == true { caps.flags.insert(.vision) }
+            if modalities["audio"]?.boolValue == true { caps.flags.insert(.audioInput) }
+        }
+
+        guard learnedSomething else { return model }
+        caps.source = .discovered
+        var enriched = model
+        enriched.capabilities = caps
+        return enriched
     }
 
     // MARK: - Loaded models
@@ -321,7 +393,9 @@ public struct OpenAIAdapter: ProviderAdapter {
         var learnedSomething = false
 
         if let window = item["context_length"]?.intValue ?? item["context_window"]?.intValue
-            ?? item["max_context_length"]?.intValue {
+            ?? item["max_context_length"]?.intValue
+            // llama.cpp puts the context it was started with under `meta`.
+            ?? item["meta"]?["n_ctx"]?.intValue {
             discovered.contextWindow = window
             learnedSomething = true
         }

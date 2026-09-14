@@ -31,18 +31,54 @@ public struct ChatGPTCodexAdapter: ProviderAdapter {
         return auth
     }
 
+    /// The catalog endpoint takes the client version the CLI would send.
+    static let catalogClientVersion = "1.0.0"
+
+    /// Asks the backend which models this account may use, right now.
+    ///
+    /// The CLI caches the same payload at `models_cache.json`, but a cache is
+    /// only as fresh as the last time that CLI ran: a model released since then
+    /// is missing, and an account whose `CODEX_HOME` has sat unused for weeks
+    /// reports a different, older set than one that ran this morning. Asking the
+    /// backend is what makes discovery a live poll rather than a file read.
+    func fetchCatalog(_ ctx: ProviderContext, auth: ResolvedAuth) async throws -> CodexModelCatalog.Catalog {
+        let u = try url(ctx, path: "models", auth: auth,
+                        extraQuery: ["client_version": Self.catalogClientVersion])
+        var h = headers(ctx, auth: auth)
+        h["accept"] = "application/json"
+        let response = try await ctx.transport.send(OutboundRequest(
+            url: u, method: "GET", headers: h,
+            timeout: min(ctx.account.requestTimeoutSeconds, 30), allowInsecureTLS: false))
+        guard (200..<300).contains(response.status) else {
+            throw classifyError(status: response.status, headers: response.headers,
+                                body: response.body, model: "")
+        }
+        guard let catalog = CodexModelCatalog.parse(response.body) else {
+            throw DerbyError(kind: .transient,
+                             message: "The ChatGPT model catalog was not in the expected format.")
+        }
+        return catalog
+    }
+
     public func listModels(_ ctx: ProviderContext) async throws -> [DiscoveredModel] {
-        _ = try await authenticate(ctx)
-        // The backend publishes no model-listing endpoint, but the Codex CLI
-        // caches the real catalog locally — which is both current and exactly
-        // the set this account can actually use.
+        let auth = try await authenticate(ctx)
         let home = ctx.account.credentialHomeURL
-        let entries = CodexModelCatalog.selectableModels(home: home)
+
+        // Live first. The CLI's cache is the fallback for an offline machine,
+        // never the primary answer — it is what hid a newly released model.
+        var entries: [CodexModelCatalog.Entry] = []
+        if let live = try? await fetchCatalog(ctx, auth: auth) {
+            CodexModelCatalog.store(live, home: home)
+            entries = live.entries.filter { $0.isListed && $0.supportedInAPI }
+        }
+        if entries.isEmpty {
+            entries = CodexModelCatalog.selectableModels(home: home)
+        }
         guard !entries.isEmpty else {
             let path = CodexModelCatalog.cacheURL(home: home).path
             let prefix = home.map { "CODEX_HOME=\($0.path) " } ?? ""
             throw DerbyError(kind: .modelUnavailable,
-                             message: "Derby could not read the Codex model catalog at \(path). Run `\(prefix)codex` once so the CLI downloads it, then test the connection again.")
+                             message: "Derby could not reach the ChatGPT model catalog, and no cached copy was readable at \(path). Check your connection, or run `\(prefix)codex` once so the CLI downloads it, then test the connection again.")
         }
         return entries.map { entry in
             // The Codex catalog states modalities and reasoning levels but not
@@ -379,7 +415,13 @@ public struct ChatGPTCodexAdapter: ProviderAdapter {
         var kind: FailureKind
         switch status {
         case 400:
-            kind = lower.contains("context") || lower.contains("too long") ? .contextOverflow : .invalidRequest
+            if lower.contains("encrypted_content") || lower.contains("invalid_encrypted_content") {
+                // Reasoning this endpoint will not verify. Nothing else about
+                // the request is wrong, so it is worth re-sending without it.
+                kind = .reasoningRejected
+            } else {
+                kind = lower.contains("context") || lower.contains("too long") ? .contextOverflow : .invalidRequest
+            }
         case 401, 403:
             kind = .authentication
         case 404: kind = .modelUnavailable

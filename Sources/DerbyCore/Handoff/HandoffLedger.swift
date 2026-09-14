@@ -44,6 +44,9 @@ public actor HandoffLedger {
         public var toolCallIDs: [String]
         public var conversation: String?
         public var lastUsedAt: Date
+        /// Digest of the answer alone, when it was long enough to identify
+        /// itself. Absent in rows written before this index existed.
+        public var answerIndex: String?
     }
 
     private struct Entry {
@@ -55,6 +58,7 @@ public actor HandoffLedger {
         var toolCallIDs: [String]
         /// `CanonicalRequest.conversationKey` of the request this answered.
         var conversation: String?
+        var answerIndex: String?
     }
 
     private let limits: Limits
@@ -62,6 +66,9 @@ public actor HandoffLedger {
     /// Least recently used first.
     private var order: [String] = []
     private var byToolCall: [String: String] = [:]
+    /// Answers long enough to identify themselves without the turn they
+    /// answered, for clients that rewrite their earlier turns.
+    private var byAnswer: [String: String] = [:]
     private var totalBytes = 0
     private var store: (any HandoffLedgerStore)?
 
@@ -72,7 +79,7 @@ public actor HandoffLedger {
     public var count: Int { entries.count }
 
     public func removeAll() {
-        entries.removeAll(); order.removeAll(); byToolCall.removeAll(); totalBytes = 0
+        entries.removeAll(); order.removeAll(); byToolCall.removeAll(); byAnswer.removeAll(); totalBytes = 0
         store?.removeAll()
     }
 
@@ -84,7 +91,8 @@ public actor HandoffLedger {
         for stored in store.load().sorted(by: { $0.lastUsedAt < $1.lastUsedAt }) where entries[stored.key] == nil {
             insert(Entry(origin: stored.origin, reasoning: nil, artifacts: stored.artifacts,
                          lastUsedAt: stored.lastUsedAt, bytes: Self.bytes(reasoning: nil, artifacts: stored.artifacts),
-                         toolCallIDs: stored.toolCallIDs, conversation: stored.conversation),
+                         toolCallIDs: stored.toolCallIDs, conversation: stored.conversation,
+                         answerIndex: stored.answerIndex),
                    key: stored.key)
         }
         evict(now: now)
@@ -102,10 +110,12 @@ public actor HandoffLedger {
         let entry = Entry(origin: origin, reasoning: reasoning, artifacts: message.reasoningArtifacts,
                           lastUsedAt: date,
                           bytes: Self.bytes(reasoning: reasoning, artifacts: message.reasoningArtifacts),
-                          toolCallIDs: message.toolCalls.map(\.id), conversation: request.conversationKey)
+                          toolCallIDs: message.toolCalls.map(\.id), conversation: request.conversationKey,
+                          answerIndex: Self.answerIndex(for: message))
         insert(entry, key: key)
         store?.save(Stored(key: key, origin: origin, artifacts: entry.artifacts, toolCallIDs: entry.toolCallIDs,
-                           conversation: entry.conversation, lastUsedAt: date))
+                           conversation: entry.conversation, lastUsedAt: date,
+                           answerIndex: entry.answerIndex))
         evict(now: date)
     }
 
@@ -128,7 +138,14 @@ public actor HandoffLedger {
             guard message.role == .assistant else { continue }
 
             var key = message.toolCalls.compactMap { byToolCall[$0.id] }.first
-            if key == nil { key = Self.fingerprint(precedingUserText: lastUserText, message: message) }
+            if key == nil {
+                let pair = Self.fingerprint(precedingUserText: lastUserText, message: message)
+                // Compaction rewrites earlier turns — a summary in place of the
+                // history, a long tool result trimmed — which breaks the pair
+                // even where the answer itself came back untouched. An answer
+                // this long identifies itself.
+                key = entries[pair] != nil ? pair : Self.answerIndex(for: message).flatMap { byAnswer[$0] }
+            }
             guard let key, let entry = entries[key] else { continue }
             guard now.timeIntervalSince(entry.lastUsedAt) <= limits.maxAge else { remove(key); continue }
             // The age limit is for conversations nobody continues: one still in
@@ -195,6 +212,19 @@ public actor HandoffLedger {
         messages.last { $0.role == .user }?.joinedText ?? ""
     }
 
+    /// Shortest answer trusted to identify itself. Short answers repeat across
+    /// conversations ("Done."), so they are only ever found with the turn they
+    /// answered; this much prose does not collide in a six-hour window.
+    static let distinctiveAnswerLength = 200
+
+    /// A digest of the answer alone, for answers long enough to be unmistakable.
+    static func answerIndex(for message: CanonicalMessage) -> String? {
+        let text = ReasoningMarkup.answerText(message.joinedText)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard text.count >= distinctiveAnswerLength else { return nil }
+        return HandoffHash.hex("answer\u{1F}" + text)
+    }
+
     // MARK: - Bookkeeping
 
     private func insert(_ entry: Entry, key: String) {
@@ -202,6 +232,7 @@ public actor HandoffLedger {
         order.append(key)
         totalBytes += entry.bytes
         for id in entry.toolCallIDs where !id.isEmpty { byToolCall[id] = key }
+        if let index = entry.answerIndex { byAnswer[index] = key }
     }
 
     private static func bytes(reasoning: String?, artifacts: [ReasoningArtifact]) -> Int {
@@ -218,6 +249,7 @@ public actor HandoffLedger {
         totalBytes -= entry.bytes
         if let index = order.firstIndex(of: key) { order.remove(at: index) }
         for id in entry.toolCallIDs where byToolCall[id] == key { byToolCall.removeValue(forKey: id) }
+        if let index = entry.answerIndex, byAnswer[index] == key { byAnswer.removeValue(forKey: index) }
         if persisting { store?.remove([key]) }
     }
 

@@ -66,8 +66,14 @@ public enum CodexModelCatalog {
     /// Parses a catalog file. Separate from `load()` so it can be tested against
     /// a fixture rather than the real `$HOME`.
     public static func parse(contentsOf url: URL) -> Catalog? {
-        guard let data = try? Data(contentsOf: url),
-              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return parse(data)
+    }
+
+    /// Parses the catalog payload. The CLI writes the backend's own response to
+    /// disk unchanged, so the same parser reads the file and the live reply.
+    public static func parse(_ data: Data) -> Catalog? {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let raw = root["models"] as? [[String: Any]] else { return nil }
 
         let entries: [Entry] = raw.compactMap { item in
@@ -97,19 +103,39 @@ public enum CodexModelCatalog {
                        clientVersion: root["client_version"] as? String)
     }
 
+    /// Catalogs fetched live from the backend, by Codex home.
+    private static var live: [String: Catalog] = [:]
+
+    /// Remembers what the backend just reported, so request-time lookups
+    /// describe the same models discovery listed — including one the CLI's file
+    /// has never seen, whose reasoning levels would otherwise be unknown.
+    public static func store(_ catalog: Catalog, home: URL? = nil) {
+        lock.lock(); defer { lock.unlock() }
+        live[cacheURL(home: home).path] = catalog
+    }
+
+    /// The best catalog available for a home: what the backend last told us,
+    /// else what the CLI cached.
+    public static func catalog(home: URL? = nil) -> Catalog? {
+        lock.lock()
+        let fetched = live[cacheURL(home: home).path]
+        lock.unlock()
+        return fetched ?? load(home: home)
+    }
+
     /// Models Derby should offer: listed, API-capable, best first.
     public static func selectableModels(home: URL? = nil) -> [Entry] {
-        (load(home: home)?.entries ?? []).filter { $0.isListed && $0.supportedInAPI }
+        (catalog(home: home)?.entries ?? []).filter { $0.isListed && $0.supportedInAPI }
     }
 
     public static func entry(for slug: String, home: URL? = nil) -> Entry? {
-        load(home: home)?.entries.first { $0.slug == slug }
+        catalog(home: home)?.entries.first { $0.slug == slug }
     }
 
     /// Clamps a requested effort to what a specific model actually accepts, so a
     /// level this model has never heard of does not become a 400.
     public static func clampEffort(_ effort: ReasoningEffort, for slug: String, home: URL? = nil) -> String {
-        clampEffort(effort, for: slug, in: load(home: home))
+        clampEffort(effort, for: slug, in: catalog(home: home))
     }
 
     public static func clampEffort(_ effort: ReasoningEffort, for slug: String, in catalog: Catalog?) -> String {

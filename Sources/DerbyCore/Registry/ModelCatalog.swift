@@ -130,6 +130,19 @@ public enum ModelCatalog {
         return best
     }
 
+    /// Tier names a provider may accept in place of a model id.
+    static let tierAliases: Set<String> = ["opus", "sonnet", "haiku"]
+
+    /// The newest concrete model in a tier, or nil when `modelID` is not one of
+    /// the tier names. The live index decides by release date; the bundled table
+    /// is listed newest-first, so its first match is the newest it knows.
+    public static func newestInTier(_ modelID: String, kind: ProviderKind) -> String? {
+        let tier = modelID.lowercased()
+        guard tierAliases.contains(tier) else { return nil }
+        if let live = RemoteModelCatalog.shared.newestID(containing: tier, kind: kind) { return live }
+        return entries.first { $0.pattern.contains(tier) }?.pattern
+    }
+
     /// Capabilities + pricing + quality for a model on a given provider kind.
     ///
     /// Order of authority: the live `models.dev` index first, because a
@@ -138,6 +151,13 @@ public enum ModelCatalog {
     /// answers, gaps are filled from the next one down rather than left blank.
     public static func metadata(for modelID: String, kind: ProviderKind)
         -> (capabilities: ModelCapabilities, pricing: Pricing?, quality: Double) {
+
+        // An alias the provider resolves for itself describes whichever model it
+        // currently runs, so answer for that model rather than for a name no
+        // catalog lists.
+        if kind.resolvesTierAliases, let resolved = newestInTier(modelID, kind: kind) {
+            return metadata(for: resolved, kind: kind)
+        }
 
         let bundled = lookup(modelID)
 
@@ -204,6 +224,13 @@ public enum ModelCatalog {
             // The CLI resolves these aliases to the newest model in each tier.
             return ["opus", "sonnet", "haiku"]
         case .anthropicSubscription, .anthropic:
+            // Derived from the live index, so a model released since this file
+            // was written is offered on the day it ships. The hand-written ids
+            // below are only what is left when nothing live is available — a
+            // stale list here quietly caps an account at last year's models.
+            let live = ["opus", "sonnet", "haiku"]
+                .compactMap { RemoteModelCatalog.shared.newestID(containing: $0, kind: kind) }
+            if !live.isEmpty { return live }
             return ["claude-opus-4-5-20251101", "claude-sonnet-4-5-20250929", "claude-haiku-4-5-20251001"]
         case .chatgptSubscription:
             // Discovered from the Codex CLI's own cached catalog instead — a

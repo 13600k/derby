@@ -242,14 +242,27 @@ public enum HandoffPlanner {
             // the API drops the rest without error.
             return target.lineage.family == "claude" && origin?.lineage.family == "claude"
         case .openAIEncryptedReasoning:
-            // Encrypted for the account that received it.
-            return artifact.originAccount == target.accountID && affinity.sharesReasoningFormat
+            guard affinity.sharesReasoningFormat else { return false }
+            if artifact.originAccount == target.accountID { return true }
+            // Another account on the same protocol can read it: the key is the
+            // endpoint's, not the account's. Only this family issues this
+            // format, so an answer Derby never attributed is still one of its
+            // own — and a payload refused after all costs a repaired attempt,
+            // not the turn.
+            let family = target.providerKind.adapterFamily
+            guard family.reasoningCrossesAccounts else { return false }
+            return issuingFamily(origin).map { $0 == family } ?? true
         case .geminiThoughtSignature:
             if artifact.payload == ReasoningArtifact.geminiUnsignedCallSentinel {
                 return target.lineage.family == "gemini"
             }
             return artifact.originAccount == target.accountID && affinity.sharesReasoningFormat
         }
+    }
+
+    /// The protocol that issued an answer, when Derby recorded its author.
+    static func issuingFamily(_ origin: MessageOrigin?) -> AdapterFamily? {
+        origin.flatMap { ProviderKind(rawValue: $0.providerKind)?.adapterFamily }
     }
 
     // MARK: - Structure

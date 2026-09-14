@@ -15,6 +15,11 @@ public enum FailureKind: String, Codable, Sendable, CaseIterable, Hashable {
     case capabilityMismatch = "CAPABILITY_MISMATCH"
     case modelUnavailable = "MODEL_UNAVAILABLE"
     case quotaExhausted = "QUOTA_EXHAUSTED"
+    /// Replayed reasoning the server would not read back: expired, or issued
+    /// somewhere it cannot be verified. The conversation is fine; only the
+    /// thinking carried with it is not, so the attempt is repaired rather than
+    /// failed.
+    case reasoningRejected = "REASONING_REJECTED"
     case clientCancelled = "CLIENT_CANCELLED"
     case unknown = "UNKNOWN"
 
@@ -26,7 +31,9 @@ public enum FailureKind: String, Codable, Sendable, CaseIterable, Hashable {
         case .contextOverflow: return .failoverToLargerContext
         case .capabilityMismatch: return .failover
         case .authentication: return .failoverAndMarkUnhealthy
-        case .invalidRequest, .contentPolicy: return .returnToClient
+        // Repaired in the executor first; if it happens again with nothing
+        // replayed, the request really is malformed.
+        case .invalidRequest, .contentPolicy, .reasoningRejected: return .returnToClient
         case .clientCancelled: return .abort
         case .unknown: return .failover
         }
@@ -35,7 +42,7 @@ public enum FailureKind: String, Codable, Sendable, CaseIterable, Hashable {
     /// Whether this failure should count against the target's circuit breaker.
     public var countsAgainstHealth: Bool {
         switch self {
-        case .invalidRequest, .contentPolicy, .clientCancelled, .capabilityMismatch: return false
+        case .invalidRequest, .contentPolicy, .clientCancelled, .capabilityMismatch, .reasoningRejected: return false
         default: return true
         }
     }
@@ -113,7 +120,7 @@ public struct DerbyError: Error, Codable, Sendable {
     /// HTTP status Derby should return to the client for this error.
     public var clientHTTPStatus: Int {
         switch kind {
-        case .invalidRequest: return 400
+        case .invalidRequest, .reasoningRejected: return 400
         case .authentication: return 401
         case .contentPolicy: return 403
         case .rateLimit, .quotaExhausted: return 429

@@ -320,14 +320,17 @@ public final class Executor: Sendable {
         // Carry the conversation to this particular model: what an earlier
         // model left behind reaches it only if it can read it, and the
         // structure follows its rules.
-        let handoff = HandoffPlanner.plan(original, for: HandoffTarget(target: target),
+        var handoff = HandoffPlanner.plan(original, for: HandoffTarget(target: target),
                                           policy: plan.handoff, repairs: repairs)
+        /// Set once the target has refused the reasoning replayed to it, so the
+        /// repair below is attempted exactly once.
+        var withheldRejectedReasoning = false
 
         // Each target has its own window, so this is per attempt rather than
         // per request: a conversation that overflows the local model may fit
         // the cloud one the plan falls back to.
-        let request: CanonicalRequest
-        let compaction: CompactionRecord?
+        var request: CanonicalRequest
+        var compaction: CompactionRecord?
         do {
             (request, compaction) = try await prepareRequest(handoff.request, for: target, plan: plan,
                                                              deadline: deadline, meta: meta)
@@ -383,6 +386,28 @@ public final class Executor: Sendable {
                 await health.recordFailureMessage(key, message: derby.message)
 
                 if derby.kind == .clientCancelled { break }
+
+                // Reasoning the target will not verify costs the thinking, not
+                // the turn: the same target is asked again with the replay
+                // withheld, and the record says that is what happened.
+                if derby.kind == .reasoningRejected, !withheldRejectedReasoning {
+                    withheldRejectedReasoning = true
+                    var policy = plan.handoff
+                    policy.replayReasoning = false
+                    handoff = HandoffPlanner.plan(original, for: HandoffTarget(target: target),
+                                                  policy: policy, repairs: repairs)
+                    handoff.record.adjustments.append(
+                        "re-sent without the replayed reasoning, which \(target.label) would not verify")
+                    do {
+                        (request, compaction) = try await prepareRequest(handoff.request, for: target, plan: plan,
+                                                                        deadline: deadline, meta: meta)
+                    } catch { break }
+                    await telemetry.log(LogEntry(level: .debug, category: "executor",
+                                                 message: "\(target.label) refused the replayed reasoning; re-sending without it",
+                                                 requestID: meta.requestID))
+                    continue
+                }
+
                 let disposition = plan.failover.disposition(for: derby.kind)
                 guard disposition.allowsRetry, retries < planned.maxRetries else { break }
 
@@ -497,6 +522,9 @@ public final class Executor: Sendable {
         var queue = plan.attempts
         var attemptIndex = 0
         var failoverTotal = 0
+        /// Targets that refused the reasoning replayed to them, which are asked
+        /// once more with it withheld rather than being failed over.
+        var withholdReasoning: Set<TargetKey> = []
         var lastError = DerbyError(kind: .modelUnavailable,
                                    message: "No provider attempt was made for '\(plan.logicalModelName)'.")
         let normalized = ConversationNormalizer.normalize(request)
@@ -539,8 +567,14 @@ public final class Executor: Sendable {
             // Same per-target shaping as the non-streaming path. It happens
             // before the first byte is written, so a stream never has to be
             // rewound because of it.
-            let handoff = HandoffPlanner.plan(applied, for: HandoffTarget(target: target),
-                                              policy: plan.handoff, repairs: normalized.repairs)
+            var handoffPolicy = plan.handoff
+            if withholdReasoning.contains(key) { handoffPolicy.replayReasoning = false }
+            var handoff = HandoffPlanner.plan(applied, for: HandoffTarget(target: target),
+                                              policy: handoffPolicy, repairs: normalized.repairs)
+            if withholdReasoning.contains(key) {
+                handoff.record.adjustments.append(
+                    "re-sent without the replayed reasoning, which \(target.label) would not verify")
+            }
             let outbound: CanonicalRequest
             let compaction: CompactionRecord?
             do {
@@ -653,6 +687,18 @@ public final class Executor: Sendable {
                     continuation.finish()
                     return
                 }
+                // Reasoning this target will not verify: ask it again with the
+                // replay withheld before giving up on it. Nothing has been
+                // written to the client yet, so this is invisible but recorded.
+                if f.kind == .reasoningRejected, !withholdReasoning.contains(key) {
+                    withholdReasoning.insert(key)
+                    queue.insert(planned, at: 0)
+                    await telemetry.log(LogEntry(level: .debug, category: "executor",
+                                                 message: "\(target.label) refused the replayed reasoning; re-sending without it",
+                                                 requestID: meta.requestID))
+                    continue
+                }
+
                 let disposition = plan.failover.disposition(for: f.kind)
                 if !disposition.allowsFailover { break }
                 if disposition == .failoverToLargerContext {

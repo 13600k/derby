@@ -29,7 +29,7 @@ public struct Pricing: Codable, Sendable, Hashable {
         guard inputPerMTok != nil || outputPerMTok != nil else { return nil }
         let m = 1_000_000.0
         let cachedRate = cachedInputPerMTok ?? (inputPerMTok.map { $0 * 0.1 })
-        let freshInput = max(0, usage.inputTokens - usage.cachedInputTokens)
+        let freshInput = max(0, usage.inputTokens - usage.cachedInputTokens - usage.cacheWriteTokens)
         var total = 0.0
         total += Double(freshInput) * (inputPerMTok ?? 0) / m
         total += Double(usage.cachedInputTokens) * (cachedRate ?? 0) / m
