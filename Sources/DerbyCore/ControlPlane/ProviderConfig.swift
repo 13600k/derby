@@ -147,7 +147,14 @@ public enum ProviderKind: String, Codable, Sendable, CaseIterable, Hashable {
     /// account may use, so discovery should *replace* the configured set rather
     /// than only adding to it. Otherwise a model that has been retired lingers
     /// forever and fails whenever it is routed to.
-    public var hasAuthoritativeCatalog: Bool { isSubscription }
+    ///
+    /// A local server is authoritative too: it publishes exactly the models it
+    /// is serving, so one swapped out for another is gone, not merely unlisted.
+    /// Treating local listings as additive left a retired model in the config
+    /// forever, advertised to clients and routed to until it failed. A custom
+    /// endpoint stays additive — Derby never assumes what is behind a URL it
+    /// knows nothing about, and some gateways list nothing at all.
+    public var hasAuthoritativeCatalog: Bool { isSubscription || isLocal }
 
     /// Whether this kind needs an API key, and how strictly.
     ///

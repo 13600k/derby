@@ -222,6 +222,14 @@ func registerCodexCatalogTests() {
             try expect(ProviderKind.chatgptSubscription.hasAuthoritativeCatalog)
             try expect(ProviderKind.anthropicSubscription.hasAuthoritativeCatalog)
             try expect(!ProviderKind.openai.hasAuthoritativeCatalog)
+            // A local server serves what it lists, so a model swapped out for
+            // another is gone — not merely missing from this listing. Leaving it
+            // configured advertises a model the server will refuse.
+            try expect(ProviderKind.llamaCpp.hasAuthoritativeCatalog)
+            try expect(ProviderKind.vllm.hasAuthoritativeCatalog)
+            try expect(ProviderKind.ollama.hasAuthoritativeCatalog)
+            // A URL Derby knows nothing about stays additive.
+            try expect(!ProviderKind.openAICompatible.hasAuthoritativeCatalog)
             try expect(ProviderKind.chatgptSubscription.supportsModelDiscovery,
                        "discovery must be reachable, or a stale list can never be refreshed")
         }
