@@ -160,16 +160,31 @@ public enum ModelCatalog {
         }
 
         let bundled = lookup(modelID)
+        let live = RemoteModelCatalog.shared.lookup(modelID, kind: kind)
 
-        if let live = RemoteModelCatalog.shared.lookup(modelID, kind: kind) {
+        // How much a model will emit is the serving policy of whoever runs it,
+        // not a property of the weights: the index carries caps from 16k to
+        // 262k for one copy of `qwen3.8-27b`. So a cap is only believed when it
+        // came from the provider this account actually is.
+        //
+        // A local server is never that provider — nothing on the internet
+        // publishes a listing for someone's own box — so for one of those the
+        // limit stays unknown, which costs nothing (an unknown limit never
+        // excludes a target) and is corrected by one field in the UI. Inheriting
+        // a stranger's turned a machine that imposes no cap at all into a 16k
+        // model, because a single aggregator's row happened to answer first.
+        let believeServingLimits = !kind.isLocal && (live?.matchedOwnProvider ?? true)
+
+        if let live {
             var capabilities = live.capabilities
             if let fallback = bundled {
                 capabilities = capabilities.fillingGaps(
                     from: ModelCapabilities(flags: fallback.flags,
                                             contextWindow: fallback.context,
-                                            maxOutputTokens: fallback.maxOutput,
+                                            maxOutputTokens: believeServingLimits ? fallback.maxOutput : nil,
                                             source: .builtin))
             }
+            if !believeServingLimits { capabilities.maxOutputTokens = nil }
             // Local and subscription targets have no marginal per-token cost,
             // whatever the vendor's list price is.
             let pricing: Pricing? = (kind.isLocal || kind.isSubscription) ? .free : live.pricing
@@ -187,7 +202,8 @@ public enum ModelCatalog {
             return (caps, kind.isLocal || kind.isSubscription ? .free : nil, kind.isLocal ? 55 : 60)
         }
         let caps = ModelCapabilities(flags: e.flags, contextWindow: e.context,
-                                     maxOutputTokens: e.maxOutput, source: .builtin)
+                                     maxOutputTokens: believeServingLimits ? e.maxOutput : nil,
+                                     source: .builtin)
         // Local and subscription targets have no marginal per-token cost.
         let pricing: Pricing? = (kind.isLocal || kind.isSubscription) ? .free : e.pricing
         return (caps, pricing, e.quality)

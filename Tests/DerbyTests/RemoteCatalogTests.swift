@@ -29,13 +29,48 @@ func registerRemoteCatalogTests() {
        "anthropic/claude-opus-4-8":{"id":"anthropic/claude-opus-4-8","name":"Claude Opus 4.8 (OR)",
          "reasoning":true,"tool_call":true,
          "modalities":{"input":["text"],"output":["text"]},
-         "limit":{"context":900000,"output":64000}}}}}
+         "limit":{"context":900000,"output":64000}},
+       "qwen3.8-27b":{"id":"qwen3.8-27b","name":"Qwen3.8 27B",
+         "tool_call":true,
+         "modalities":{"input":["text"],"output":["text"]},
+         "limit":{"context":262144,"output":16384}}}}}
     """
 
     func withCatalog(_ body: () throws -> Void) rethrows {
         _ = RemoteModelCatalog.shared.loadForTesting(Data(sample.utf8))
         defer { RemoteModelCatalog.shared.clearForTesting() }
         try body()
+    }
+
+    suite("Remote catalog / cross-provider fallback") {
+        test("a local server does not inherit another host's output cap") {
+            // A vLLM box serving qwen3.8-27b is listed under no provider in the
+            // index, so the lookup falls through to whoever else publishes the
+            // id. Their max output is *their* policy — the index carries caps
+            // from 16k to 262k for these same weights — and adopting it made a
+            // server that imposes no limit report 16k.
+            try withCatalog {
+                let entry = try expectNotNil(
+                    RemoteModelCatalog.shared.lookup("Qwen3.8-27B", kind: .vllm))
+                try expect(!entry.matchedOwnProvider)
+                // The window is a property of the model, so it still applies.
+                try expectEqual(entry.capabilities.contextWindow, 262_144)
+                try expectNil(entry.capabilities.maxOutputTokens,
+                              "a stranger's output cap was adopted anyway")
+                // And the same through the layer the importer actually calls.
+                let metadata = ModelCatalog.metadata(for: "Qwen3.8-27B", kind: .vllm)
+                try expectNil(metadata.capabilities.maxOutputTokens)
+            }
+        }
+
+        test("a model listed under the account's own provider keeps its cap") {
+            try withCatalog {
+                let entry = try expectNotNil(
+                    RemoteModelCatalog.shared.lookup("claude-opus-4-8", kind: .anthropic))
+                try expect(entry.matchedOwnProvider)
+                try expectEqual(entry.capabilities.maxOutputTokens, 128_000)
+            }
+        }
     }
 
     suite("Remote catalog / parsing") {

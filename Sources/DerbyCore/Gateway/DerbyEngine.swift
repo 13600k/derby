@@ -375,6 +375,177 @@ public actor DerbyEngine {
         return try await adapter.listModels(context(for: account))
     }
 
+    // MARK: - Benchmarks
+
+    /// What one benchmark fetch did.
+    public struct BenchmarkReport: Sendable {
+        /// Models the index had an entry for, and what changed on each.
+        public var outcomes: [BenchmarkApplication.Outcome]
+        /// How many models the index is carrying, after any refresh.
+        public var catalogCount: Int
+        public var indexVersion: String?
+        /// Set when the download failed. Non-fatal on its own: a previously
+        /// cached index is still applied, and saying so is the point.
+        public var error: DerbyError?
+        /// Targets whose logical model pins a quality of its own, which still
+        /// wins over the score just fetched. Reported rather than overridden:
+        /// a number that disagrees with the model's own was a deliberate choice.
+        public var stillPinned: [String] = []
+
+        public var matched: [BenchmarkApplication.Outcome] { outcomes.filter(\.isMatched) }
+        public var unmatched: [String] { outcomes.filter { !$0.isMatched }.map(\.modelID) }
+        public var changeCount: Int { outcomes.reduce(0) { $0 + $1.changes.count } }
+
+        public var headline: String {
+            if outcomes.isEmpty { return "No models to look up" }
+            let n = matched.count
+            if n == 0 { return "Artificial Analysis lists none of these models" }
+            return "Updated \(n) model\(n == 1 ? "" : "s") from Artificial Analysis"
+        }
+    }
+
+    /// Fetches Artificial Analysis scores and copies them into a provider's
+    /// models, or into named models of it.
+    ///
+    /// The download is skipped when the cached index is still fresh, so pressing
+    /// the button on ten models in a row costs one request, not ten — the free
+    /// tier allows a thousand a day and the data moves weekly at most.
+    public func applyBenchmarks(providerID: UUID,
+                                modelIDs: [String]? = nil,
+                                forceRefresh: Bool = false) async -> BenchmarkReport {
+        let config = await state.currentConfig()
+        let settings = config.benchmarks
+        let catalog = BenchmarkCatalog.shared
+
+        var fetchError: DerbyError?
+        if forceRefresh || catalog.isStale {
+            // The Keychain is only reached for this when a fetch is actually
+            // due, and never on the request path.
+            let key = secrets.get(settings.apiKeyRef)
+            let result = await catalog.refresh(apiKey: key, tier: settings.tier,
+                                               transport: transport, timeout: 30)
+            if case .failure(let error) = result { fetchError = error }
+        }
+
+        // Nothing cached and nothing downloaded: there is no data to apply, and
+        // reporting "matched 0 models" would hide why.
+        guard catalog.status.modelCount > 0 else {
+            return BenchmarkReport(outcomes: [], catalogCount: 0, indexVersion: nil,
+                                   error: fetchError ?? DerbyError(
+                                    kind: .transient,
+                                    message: "No benchmark data yet. Add an Artificial Analysis API key in Settings → Benchmarks."))
+        }
+
+        let indexVersion = catalog.indexVersion
+        var outcomes: [BenchmarkApplication.Outcome] = []
+        var rewritten: [UUID: PhysicalModel] = [:]
+        var previousScores: [UUID: Double] = [:]
+        let now = Date()
+
+        // Worked out first, then written in one pass: `update` takes a
+        // `@Sendable` closure, which cannot mutate anything captured from here.
+        if let account = config.provider(id: providerID) {
+            for model in account.models {
+                if let modelIDs, !modelIDs.contains(model.modelID) { continue }
+                guard let entry = catalog.lookup(model.modelID) else {
+                    outcomes.append(BenchmarkApplication.Outcome(modelID: model.modelID,
+                                                                 matched: nil, changes: []))
+                    continue
+                }
+                // The window the router would otherwise use, so the index only
+                // ever fills a blank rather than contradicting the provider.
+                let catalogCaps = ModelCatalog.metadata(for: model.modelID, kind: account.kind).capabilities
+                let known = model.capabilities.contextWindow ?? catalogCaps.contextWindow
+
+                var updated = model
+                previousScores[model.id] = model.qualityScore
+                let changes = BenchmarkApplication.apply(entry, to: &updated, kind: account.kind,
+                                                        settings: settings,
+                                                        knownContextWindow: known,
+                                                        indexVersion: indexVersion,
+                                                        now: now)
+                rewritten[model.id] = updated
+                outcomes.append(BenchmarkApplication.Outcome(modelID: model.modelID,
+                                                             matched: entry.name, changes: changes))
+            }
+        }
+
+        // A logical model may pin a target's quality, which overrides the
+        // model's own score everywhere routing reads it. A pin that merely
+        // mirrored the old score was never a decision — the quality field in
+        // the logical model view writes one on any commit, so tabbing through
+        // it froze the target at that moment — and leaving it would make a
+        // fetched score appear to do nothing. One that says something different
+        // is a real choice and is kept, and reported so it is never a mystery.
+        var unpin = Set<UUID>()
+        var shadowed: [(model: String, logicalModel: String, pinned: Double)] = []
+        for logical in config.logicalModels {
+            for ref in logical.targets {
+                guard let pinned = ref.qualityOverride,
+                      let updated = rewritten[ref.modelUUID],
+                      let previous = previousScores[ref.modelUUID],
+                      abs(updated.qualityScore - previous) >= 0.5 else { continue }
+                if abs(pinned - previous) < 0.5 {
+                    unpin.insert(ref.id)
+                } else {
+                    shadowed.append((updated.modelID, logical.name, pinned))
+                }
+            }
+        }
+
+        if !rewritten.isEmpty {
+            let applied = rewritten
+            let unpinned = unpin
+            let result = await update { config in
+                guard let accountIndex = config.providers.firstIndex(where: { $0.id == providerID })
+                else { return }
+                for modelIndex in config.providers[accountIndex].models.indices {
+                    let id = config.providers[accountIndex].models[modelIndex].id
+                    if let model = applied[id] { config.providers[accountIndex].models[modelIndex] = model }
+                }
+                guard !unpinned.isEmpty else { return }
+                for logicalIndex in config.logicalModels.indices {
+                    for refIndex in config.logicalModels[logicalIndex].targets.indices
+                    where unpinned.contains(config.logicalModels[logicalIndex].targets[refIndex].id) {
+                        config.logicalModels[logicalIndex].targets[refIndex].qualityOverride = nil
+                    }
+                }
+            }
+            if case .failure(let error) = result {
+                return BenchmarkReport(outcomes: outcomes, catalogCount: catalog.status.modelCount,
+                                       indexVersion: indexVersion,
+                                       error: DerbyError(kind: .transient,
+                                                         message: error.localizedDescription))
+            }
+        }
+
+        if !unpin.isEmpty {
+            for index in outcomes.indices where !outcomes[index].changes.isEmpty {
+                outcomes[index].changes.append(BenchmarkApplication.Change(
+                    field: "logical models", before: "pinned to the old score",
+                    after: "following this model again"))
+            }
+        }
+
+        await telemetry.log(LogEntry(level: fetchError == nil ? .info : .warn, category: "benchmarks",
+                                     message: "Artificial Analysis: matched \(outcomes.filter(\.isMatched).count)/\(outcomes.count) models"
+                                        + (fetchError.map { ", download failed: \($0.message)" } ?? "")))
+
+        return BenchmarkReport(outcomes: outcomes, catalogCount: catalog.status.modelCount,
+                               indexVersion: indexVersion, error: fetchError,
+                               stillPinned: shadowed.map {
+                                   "\($0.model) in “\($0.logicalModel)” stays pinned at \(Int($0.pinned))"
+                               })
+    }
+
+    /// Downloads the index without applying it, for the Settings screen.
+    public func refreshBenchmarkCatalog() async -> Result<Int, DerbyError> {
+        let settings = await state.currentConfig().benchmarks
+        return await BenchmarkCatalog.shared.refresh(apiKey: secrets.get(settings.apiKeyRef),
+                                                     tier: settings.tier,
+                                                     transport: transport, timeout: 30)
+    }
+
     /// Sends a single cheap completion to verify a specific model really works.
     public func probeModel(account: ProviderAccount, modelID: String) async -> ConnectionTestResult {
         let adapter = adapters.adapter(for: account.kind)
@@ -542,6 +713,10 @@ public actor DerbyEngine {
 
     public func modelCatalogStatus() -> (modelCount: Int, fetchedAt: Date?) {
         RemoteModelCatalog.shared.status
+    }
+
+    public nonisolated func benchmarkCatalogStatus() -> (modelCount: Int, fetchedAt: Date?, indexVersion: String?) {
+        BenchmarkCatalog.shared.status
     }
 
     public func exportDiagnostics() async -> String {

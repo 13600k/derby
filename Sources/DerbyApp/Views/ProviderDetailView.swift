@@ -14,6 +14,11 @@ struct ProviderDetailView: View {
     @State private var modelToAdd = ""
     @State private var confirmDelete = false
     @State private var probingModel: String?
+    /// The model whose specs are being fetched, or `allModels` for the whole
+    /// account. One at a time, so the button that is working is obvious.
+    @State private var fetchingSpecs: String?
+    @State private var benchmarkReport: DerbyEngine.BenchmarkReport?
+    private static let allModels = "\u{0}all"
 
     private var account: ProviderAccount? {
         model.config.providers.first { $0.id == accountID }
@@ -59,6 +64,7 @@ struct ProviderDetailView: View {
             VStack(alignment: .leading, spacing: 16) {
                 connectionCard(current)
                 if let result = testResult { testResultCard(result) }
+                if let report = benchmarkReport { benchmarkReportCard(report) }
                 credentialsCard(current)
                 modelsCard(current)
                 limitsCard(current)
@@ -413,11 +419,28 @@ struct ProviderDetailView: View {
                 if current.models.isEmpty {
                     Text("No models yet. Use Discover Models, or add one by name.")
                         .font(.callout).foregroundStyle(.secondary)
+                } else {
+                    HStack(spacing: 10) {
+                        Button {
+                            Task { await fetchSpecs(for: nil, marker: Self.allModels) }
+                        } label: {
+                            if fetchingSpecs == Self.allModels {
+                                ProgressView().controlSize(.small)
+                            } else {
+                                Label("Fetch Specs for All Models", systemImage: "chart.bar.doc.horizontal")
+                            }
+                        }
+                        .disabled(fetchingSpecs != nil)
+                        .help("Look every model here up on Artificial Analysis")
+                        Spacer()
+                    }
                 }
                 ForEach(current.models) { physical in
                     ModelRow(account: current, physical: physical,
                              health: model.health(providerID: current.id, modelID: physical.modelID),
                              isProbing: probingModel == physical.modelID,
+                             isFetchingSpecs: fetchingSpecs == physical.modelID
+                                 || fetchingSpecs == Self.allModels,
                              onToggle: { enabled in
                                  updateModel(physical.id) { $0.enabled = enabled }
                              },
@@ -434,6 +457,8 @@ struct ProviderDetailView: View {
                                  updateModel(physical.id) { $0.pricingOverride = pricing }
                              },
                              onProbe: { Task { await probe(physical.modelID) } },
+                             onFetchSpecs: { Task { await fetchSpecs(for: [physical.modelID],
+                                                                     marker: physical.modelID) } },
                              onRemove: { removeModel(physical.id) },
                              onResetCircuit: {
                                  Task {
@@ -543,13 +568,23 @@ struct ProviderDetailView: View {
 
     // MARK: - Actions
 
-    private func save() {
+    /// Fire-and-forget save, for the form's own edits.
+    private func save() { Task { await saveNow() } }
+
+    /// Saves and *waits*.
+    ///
+    /// This write replaces the whole provider with the draft, so anything that
+    /// asks the engine to change the same provider must let it land first.
+    /// `save()` only queues the write: a fetch that called it and then awaited
+    /// the engine had both land on the engine actor in an order nobody
+    /// controlled, and the stale draft routinely overwrote the scores that had
+    /// just been fetched — the log said "matched 1/1" while the config never
+    /// moved.
+    private func saveNow() async {
         guard let draft else { return }
-        Task {
-            await model.mutate { config in
-                if let index = config.providers.firstIndex(where: { $0.id == draft.id }) {
-                    config.providers[index] = draft
-                }
+        await model.mutate { config in
+            if let index = config.providers.firstIndex(where: { $0.id == draft.id }) {
+                config.providers[index] = draft
             }
         }
     }
@@ -582,7 +617,7 @@ struct ProviderDetailView: View {
         guard let draft else { return }
         isTesting = true
         defer { isTesting = false }
-        save()
+        await saveNow()
         testResult = await model.engine.testConnection(draft)
     }
 
@@ -590,7 +625,7 @@ struct ProviderDetailView: View {
         guard let draft else { return }
         isDiscovering = true
         defer { isDiscovering = false }
-        save()
+        await saveNow()
         do {
             let found = try await model.engine.discoverModels(draft)
             importModels(found)
@@ -657,6 +692,85 @@ struct ProviderDetailView: View {
                    parts.isEmpty ? nil : parts.joined(separator: ", ")
                        + (removed.isEmpty ? "" : " (\(removed.joined(separator: ", ")))"))
         testResult = nil
+    }
+
+    /// Fetches Artificial Analysis specs for `modelIDs`, or for every model on
+    /// this account when nil.
+    ///
+    /// The engine owns the write, because it is the same job either way and the
+    /// index is shared: one press for ten models is one request, not ten.
+    private func fetchSpecs(for modelIDs: [String]?, marker: String) async {
+        guard let draft, fetchingSpecs == nil else { return }
+        fetchingSpecs = marker
+        defer { fetchingSpecs = nil }
+        // Persist first, and wait for it: the engine writes into the saved
+        // config, and a queued draft save would otherwise land afterwards and
+        // undo everything this fetch just wrote.
+        await saveNow()
+        let report = await model.engine.applyBenchmarks(providerID: draft.id, modelIDs: modelIDs)
+        await model.reloadConfig()
+        load()
+        benchmarkReport = report
+        if let error = report.error, report.matched.isEmpty {
+            model.show(.error, "Could not fetch specs", error.message)
+        }
+    }
+
+    /// Always shown after a fetch, listing every field that changed and every
+    /// model the index had nothing for — a rewrite of numbers the user chose
+    /// should never be something they have to go looking for.
+    private func benchmarkReportCard(_ report: DerbyEngine.BenchmarkReport) -> some View {
+        Card {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: report.matched.isEmpty ? "questionmark.circle.fill" : "chart.bar.doc.horizontal")
+                    .font(.title2)
+                    .foregroundStyle(report.matched.isEmpty ? .orange : .green)
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(report.headline).font(.headline)
+                    if let error = report.error {
+                        Text(error.message).font(.callout).foregroundStyle(.orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    if report.changeCount == 0 && !report.matched.isEmpty {
+                        Text("Everything already matched the index — nothing changed.")
+                            .font(.callout).foregroundStyle(.secondary)
+                    }
+                    ForEach(report.matched.filter { !$0.changes.isEmpty }, id: \.modelID) { outcome in
+                        VStack(alignment: .leading, spacing: 1) {
+                            // Naming the row each model took is what makes the
+                            // reasoning-level choice checkable: an id that names
+                            // no level is scored at the highest one published
+                            // for those weights, which is visible only here.
+                            Text(outcome.modelID + (outcome.matched.map { " → \($0)" } ?? ""))
+                                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                            ForEach(outcome.changes, id: \.self) { change in
+                                Text("· " + change.description)
+                                    .font(.system(size: 10, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                    ForEach(report.stillPinned, id: \.self) { line in
+                        Label(line, systemImage: "pin.fill")
+                            .font(.caption).foregroundStyle(.orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    if !report.unmatched.isEmpty {
+                        Text("Not listed by Artificial Analysis: \(report.unmatched.joined(separator: ", "))")
+                            .font(.caption2).foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Text("\(report.catalogCount) models in the index"
+                         + (report.indexVersion.map { " · methodology v\($0)" } ?? "")
+                         + ". Scores were copied into each model's own fields, where you can change them.")
+                        .font(.caption2).foregroundStyle(.tertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer()
+                Button { benchmarkReport = nil } label: { Image(systemName: "xmark") }
+                    .buttonStyle(.borderless)
+            }
+        }
     }
 
     private func probe(_ modelID: String) async {

@@ -72,6 +72,26 @@ func registerModelMetadataTests() {
             try expectClose(try expectNotNil(model.pricing?.outputPerMTok), 15.0, tolerance: 0.0001)
         }
 
+        test("a llama.cpp server started with --n-predict reports that ceiling") {
+            // The only authority on how much this server will emit. A catalog
+            // can only say what some other host caps the same weights at, which
+            // is how a box with no limit came to be described as a 16k model.
+            let transport = MockTransport()
+            transport.stub("/models", json: """
+            {"object":"list","data":[{"id":"ornith-1.5-35b-a3b","object":"model","owned_by":"llamacpp"}]}
+            """)
+            transport.stub("/props", json: """
+            {"total_slots":1,
+             "default_generation_settings":{"n_ctx":131072,"params":{"n_predict":4096,"max_tokens":4096}}}
+            """)
+            var account = Fixture.account("llama", kind: .llamaCpp, models: [])
+            account.baseURLOverride = "http://127.0.0.1:8081/v1"
+            let ctx = ProviderContext(account: account, transport: transport, secrets: InMemorySecretStore(),
+                                      credentials: CredentialCache())
+            let models = try await OpenAIAdapter().listModels(ctx)
+            try expectEqual(models.first?.capabilities?.maxOutputTokens, 4096)
+        }
+
         test("llama.cpp's listing and /props state the context window and tool support") {
             let transport = MockTransport()
             transport.stub("/models", json: """
@@ -79,7 +99,7 @@ func registerModelMetadataTests() {
               "meta":{"n_ctx":262144,"n_ctx_train":262144,"n_params":34660610688}}]}
             """)
             transport.stub("/props", json: """
-            {"total_slots":1,"default_generation_settings":{"n_ctx":131072},
+            {"total_slots":1,"default_generation_settings":{"n_ctx":131072,"params":{"n_predict":-1,"max_tokens":-1}},
              "modalities":{"vision":false,"audio":false},
              "chat_template":"{% if enable_thinking %}<think>{% endif %}",
              "chat_template_caps":{"supports_tools":true,"supports_tool_calls":true,
@@ -92,6 +112,10 @@ func registerModelMetadataTests() {
             let models = try await OpenAIAdapter().listModels(ctx)
             let caps = try expectNotNil(models.first?.capabilities)
             try expectEqual(caps.contextWindow, 131_072, "the slot context beats the listing's n_ctx")
+            // `-1` is llama.cpp saying it caps a completion at nothing. Left
+            // unknown, which never excludes a target — as opposed to the 16k
+            // that a cloud host's listing for the same weights used to supply.
+            try expectNil(caps.maxOutputTokens, "an unlimited server reported a ceiling")
             try expect(caps.flags.contains(.tools))
             try expect(caps.flags.contains(.parallelTools))
             try expect(caps.flags.contains(.reasoning))

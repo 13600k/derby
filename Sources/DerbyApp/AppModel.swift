@@ -99,6 +99,13 @@ final class AppModel: ObservableObject {
         await refreshLogs()
     }
 
+    /// Re-reads configuration the engine changed on its own, without the full
+    /// database refresh `refreshAll` does.
+    func reloadConfig() async {
+        config = await engine.config()
+        await refreshLive()
+    }
+
     func refreshUsage() async {
         usage = await engine.telemetry.usage(window: usageWindow)
     }

@@ -38,6 +38,15 @@ public final class RemoteModelCatalog: @unchecked Sendable {
         public var pricing: Pricing?
         public var releaseDate: String?
         public var openWeights: Bool
+        /// False when this row was found only by a cross-provider fallback —
+        /// some *other* service's listing for the same weights.
+        ///
+        /// It changes what may be believed. A context window is a property of
+        /// the model, but a maximum output is the serving policy of whoever
+        /// published the row: for `qwen3.8-27b` the index carries caps from
+        /// 16k to 262k depending on the host. Adopting a stranger's is how a
+        /// local server that imposes no limit at all came to report 16k.
+        public var matchedOwnProvider: Bool = true
 
         /// Translated into Derby's capability vocabulary. Modalities come from
         /// what the index states and are never inferred.
@@ -63,7 +72,7 @@ public final class RemoteModelCatalog: @unchecked Sendable {
 
             return ModelCapabilities(flags: flags,
                                      contextWindow: contextWindow,
-                                     maxOutputTokens: maxOutputTokens,
+                                     maxOutputTokens: matchedOwnProvider ? maxOutputTokens : nil,
                                      unsupportedParameters: unsupported,
                                      supportedReasoningEfforts: reasoningEfforts.isEmpty ? nil : reasoningEfforts,
                                      source: .discovered)
@@ -160,9 +169,13 @@ public final class RemoteModelCatalog: @unchecked Sendable {
             }
         }
         // A model served through an aggregator, or a local copy of a hosted one,
-        // still matches on id alone.
-        for candidate in candidates where index.anyProvider[candidate] != nil {
-            return index.anyProvider[candidate]
+        // still matches on id alone — but it is someone else's listing, so what
+        // it says about serving limits is not carried over.
+        for candidate in candidates {
+            if var entry = index.anyProvider[candidate] {
+                entry.matchedOwnProvider = false
+                return entry
+            }
         }
         return nil
     }
@@ -263,7 +276,11 @@ public final class RemoteModelCatalog: @unchecked Sendable {
     static func parse(_ data: Data) -> Index? {
         guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
         var index = Index()
-        for (providerID, rawProvider) in root {
+        // Sorted, because `anyProvider` below is first-writer-wins and a
+        // dictionary's order is not stable: iterating `root` directly let the
+        // same model take a different provider's figures on every refresh.
+        for providerID in root.keys.sorted() {
+            let rawProvider = root[providerID] as Any
             guard let provider = rawProvider as? [String: Any],
                   let models = provider["models"] as? [String: Any] else { continue }
             var parsed: [String: Entry] = [:]

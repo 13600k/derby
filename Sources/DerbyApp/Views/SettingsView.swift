@@ -7,6 +7,9 @@ struct SettingsView: View {
     @State private var portText = ""
     @State private var confirmReset = false
     @State private var isRefreshingCatalog = false
+    @State private var isRefreshingBenchmarks = false
+    @State private var benchmarkKeyInput = ""
+    @State private var benchmarkKeyLoaded = false
 
     var body: some View {
         Page(title: "Settings", subtitle: "Gateway, application and data") {
@@ -17,12 +20,19 @@ struct SettingsView: View {
                 securityCard
                 applicationCard
                 catalogCard
+                benchmarksCard
                 loggingCard
                 dataCard
                 aboutCard
             }
         }
-        .task { portText = String(model.config.gateway.port) }
+        .task {
+            portText = String(model.config.gateway.port)
+            if !benchmarkKeyLoaded {
+                benchmarkKeyInput = model.engine.secrets.get(model.config.benchmarks.apiKeyRef) ?? ""
+                benchmarkKeyLoaded = true
+            }
+        }
     }
 
     // MARK: - Gateway
@@ -233,6 +243,120 @@ struct SettingsView: View {
                 Text("Source: models.dev")
                     .font(.caption2).foregroundStyle(.tertiary)
             }
+        }
+    }
+
+    // MARK: - Benchmarks
+
+    private var benchmarksCard: some View {
+        let status = model.engine.benchmarkCatalogStatus()
+        let settings = model.config.benchmarks
+        return Card(title: "Benchmarks",
+                    subtitle: "Independent scores from Artificial Analysis",
+                    systemImage: "chart.bar.doc.horizontal") {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Weighted-score routing ranks targets by an intelligence score that Derby otherwise asks you to invent for every model. Artificial Analysis publishes one, along with prices and measured speeds. Use the Specs buttons on a provider to copy them into its models — nothing is fetched or changed until you do.")
+                    .font(.callout).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("API key").font(.caption).foregroundStyle(.secondary)
+                    HStack(spacing: 8) {
+                        SecureField("Paste your Artificial Analysis API key", text: $benchmarkKeyInput)
+                            .textFieldStyle(.roundedBorder)
+                            .onSubmit(saveBenchmarkKey)
+                            .frame(maxWidth: 360)
+                        Button("Save", action: saveBenchmarkKey)
+                            .disabled(benchmarkKeyInput.trimmingCharacters(in: .whitespaces).isEmpty)
+                    }
+                    Text("Create one at artificialanalysis.ai → API. The free tier allows 1,000 requests a day; Derby downloads the whole index at most once a day and looks models up from its own cache.")
+                        .font(.caption2).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Picker("Plan", selection: Binding(
+                    get: { settings.tier },
+                    set: { newValue in Task { await model.mutate { $0.benchmarks.tier = newValue } } })) {
+                    ForEach(BenchmarkTier.allCases, id: \.self) { tier in
+                        Text(tier.displayName).tag(tier)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .frame(width: 200)
+                if settings.tier == .free {
+                    Text("The free endpoint omits context windows; the Pro one includes them.")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+
+                Divider()
+                Text("What a fetch writes").font(.caption).foregroundStyle(.secondary)
+                Toggle("Intelligence score (used by weighted-score routing)", isOn: Binding(
+                    get: { settings.applyIntelligenceScore },
+                    set: { v in Task { await model.mutate { $0.benchmarks.applyIntelligenceScore = v } } }))
+                Toggle("Input and output prices", isOn: Binding(
+                    get: { settings.applyPricing },
+                    set: { v in Task { await model.mutate { $0.benchmarks.applyPricing = v } } }))
+                if settings.applyPricing {
+                    Toggle("…including prices you have already entered", isOn: Binding(
+                        get: { settings.overwriteExistingPricing },
+                        set: { v in Task { await model.mutate { $0.benchmarks.overwriteExistingPricing = v } } }))
+                        .padding(.leading, 18)
+                    Text("Local and subscription targets are always skipped: their marginal cost is zero whatever the hosted copy of the same model is billed at.")
+                        .font(.caption2).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Toggle("Context window, when nothing else reported one", isOn: Binding(
+                    get: { settings.applyContextWindow },
+                    set: { v in Task { await model.mutate { $0.benchmarks.applyContextWindow = v } } }))
+                if settings.appliesNothing {
+                    Label("With all three off, a fetch records the scores for reference but changes nothing.",
+                          systemImage: "info.circle")
+                        .font(.caption).foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Divider()
+                DetailRow(label: "Models scored", value: status.modelCount == 0 ? "none yet" : "\(status.modelCount)")
+                DetailRow(label: "Last updated",
+                          value: status.fetchedAt.map { Format.relative($0) } ?? "never")
+                if let version = status.indexVersion {
+                    DetailRow(label: "Index methodology", value: "v\(version)")
+                }
+                HStack(spacing: 10) {
+                    Button {
+                        Task {
+                            isRefreshingBenchmarks = true
+                            defer { isRefreshingBenchmarks = false }
+                            switch await model.engine.refreshBenchmarkCatalog() {
+                            case .success(let count):
+                                await model.refreshLive()
+                                model.show(.success, "Benchmark data updated", "\(count) models scored.")
+                            case .failure(let error):
+                                model.show(.error, "Could not update benchmark data", error.message)
+                            }
+                        }
+                    } label: {
+                        if isRefreshingBenchmarks { ProgressView().controlSize(.small) }
+                        else { Label("Update Now", systemImage: "arrow.down.circle") }
+                    }
+                    .disabled(isRefreshingBenchmarks)
+                    Spacer()
+                }
+                Text("Source: artificialanalysis.ai. Scores are only comparable within one methodology version.")
+                    .font(.caption2).foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private func saveBenchmarkKey() {
+        let value = benchmarkKeyInput.trimmingCharacters(in: .whitespaces)
+        do {
+            try model.engine.secrets.set(value.isEmpty ? nil : value,
+                                         for: model.config.benchmarks.apiKeyRef)
+            model.show(.success, value.isEmpty ? "Benchmark API key removed" : "Benchmark API key saved to Keychain")
+        } catch {
+            model.show(.error, "Could not save the API key", error.localizedDescription)
         }
     }
 

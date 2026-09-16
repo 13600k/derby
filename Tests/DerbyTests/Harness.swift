@@ -1,4 +1,5 @@
 import Foundation
+@testable import DerbyCore
 
 /// A minimal test harness.
 ///
@@ -96,7 +97,28 @@ func expectThrows(_ body: () async throws -> Void,
 
 @main
 struct TestMain {
+    /// Redirects every path the suite could write to into a throwaway
+    /// directory, before a single test runs.
+    ///
+    /// `BenchmarkCatalog.refresh` caches to `AppPaths.supportDirectory` on
+    /// success, and the pagination suite is the first thing here to drive a
+    /// *successful* refresh — so running the tests replaced the real catalog
+    /// with a one-row fixture, and the app then reported that Artificial
+    /// Analysis had never heard of any configured model. Nothing in a suite
+    /// that is required to pass with no network should be able to reach the
+    /// user's Application Support directory at all.
+    static func isolateOnDiskState() -> URL {
+        let sandbox = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("derby-tests-\(ProcessInfo.processInfo.processIdentifier)",
+                                    isDirectory: true)
+        try? FileManager.default.createDirectory(at: sandbox, withIntermediateDirectories: true)
+        AppPaths.supportDirectory = sandbox
+        return sandbox
+    }
+
     static func main() async {
+        let sandbox = isolateOnDiskState()
+        defer { try? FileManager.default.removeItem(at: sandbox) }
         registerAllTests()
         let filter = CommandLine.arguments.dropFirst().first
         let cases = TestRegistry.shared.cases.filter { c in

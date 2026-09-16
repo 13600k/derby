@@ -156,3 +156,71 @@ public struct AppSettings: Codable, Sendable, Hashable {
     }
     public static let `default` = AppSettings()
 }
+
+/// How Derby fills a model's specs in from Artificial Analysis.
+///
+/// Off by default in the sense that nothing is ever fetched or applied without
+/// the user pressing a button — these settings only say *what* a press writes.
+/// Which fields are copied is a choice because they are not equally safe to
+/// overwrite: an intelligence score is something Derby asks the user to invent
+/// out of thin air, while prices they have already typed are worth keeping.
+public struct BenchmarkSettings: Codable, Sendable, Hashable {
+    /// Keychain reference for the Artificial Analysis API key. Only read when a
+    /// fetch is actually requested, so the default configuration never touches
+    /// the Keychain for it.
+    public var apiKeyRef: SecretRef
+    public var tier: BenchmarkTier
+    /// Copy the Intelligence Index into `PhysicalModel.qualityScore`, which is
+    /// the same 0–100 scale weighted-score routing already reads.
+    public var applyIntelligenceScore: Bool
+    /// Copy per-million-token prices into the model's pricing override. Skipped
+    /// for local and subscription targets, whose marginal cost is zero whatever
+    /// the hosted version of the same weights costs.
+    public var applyPricing: Bool
+    /// Fill in a context window nothing else reported. Never overwrites a window
+    /// the provider or the model catalog already knows.
+    public var applyContextWindow: Bool
+    /// Overwrite prices the user has already entered by hand.
+    public var overwriteExistingPricing: Bool
+
+    public init(apiKeyRef: SecretRef = SecretRef(account: "benchmarks.artificialAnalysis"),
+                tier: BenchmarkTier = .free,
+                applyIntelligenceScore: Bool = true,
+                applyPricing: Bool = true,
+                applyContextWindow: Bool = true,
+                overwriteExistingPricing: Bool = false) {
+        self.apiKeyRef = apiKeyRef
+        self.tier = tier
+        self.applyIntelligenceScore = applyIntelligenceScore
+        self.applyPricing = applyPricing
+        self.applyContextWindow = applyContextWindow
+        self.overwriteExistingPricing = overwriteExistingPricing
+    }
+    public static let `default` = BenchmarkSettings()
+
+    /// Nothing would be written, so there is no point fetching.
+    public var appliesNothing: Bool {
+        !applyIntelligenceScore && !applyPricing && !applyContextWindow
+    }
+
+    // Persisted, so every field is decoded individually with a default. A
+    // non-optional property added here without one would make the whole `app`
+    // section undecodable and silently reset it.
+    private enum CodingKeys: String, CodingKey {
+        case apiKeyRef, tier, applyIntelligenceScore, applyPricing
+        case applyContextWindow, overwriteExistingPricing
+    }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let fallback = BenchmarkSettings()
+        apiKeyRef = (try? c.decode(SecretRef.self, forKey: .apiKeyRef)) ?? fallback.apiKeyRef
+        tier = (try? c.decode(BenchmarkTier.self, forKey: .tier)) ?? fallback.tier
+        applyIntelligenceScore = (try? c.decode(Bool.self, forKey: .applyIntelligenceScore))
+            ?? fallback.applyIntelligenceScore
+        applyPricing = (try? c.decode(Bool.self, forKey: .applyPricing)) ?? fallback.applyPricing
+        applyContextWindow = (try? c.decode(Bool.self, forKey: .applyContextWindow))
+            ?? fallback.applyContextWindow
+        overwriteExistingPricing = (try? c.decode(Bool.self, forKey: .overwriteExistingPricing))
+            ?? fallback.overwriteExistingPricing
+    }
+}

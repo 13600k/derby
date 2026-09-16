@@ -837,10 +837,32 @@ struct TargetRow: View {
             }
 
             VStack(alignment: .trailing, spacing: 2) {
-                Text("quality").font(.caption2).foregroundStyle(.secondary)
+                HStack(spacing: 3) {
+                    Text(ref.qualityOverride == nil ? "quality" : "quality (pinned)")
+                        .font(.caption2)
+                        .foregroundStyle(ref.qualityOverride == nil ? .secondary : Color.orange)
+                    if ref.qualityOverride != nil {
+                        Button {
+                            var u = ref; u.qualityOverride = nil; onUpdate(u)
+                        } label: {
+                            Image(systemName: "arrow.uturn.backward")
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Stop pinning: follow the model's own intelligence score again")
+                    }
+                }
                 TextField("", value: Binding(
-                    get: { ref.qualityOverride ?? resolved?.1.qualityScore ?? 60 },
-                    set: { v in var u = ref; u.qualityOverride = v; onUpdate(u) }),
+                    get: { ref.qualityOverride ?? inheritedQuality },
+                    // The field shows the model's own score when nothing is
+                    // pinned, so committing that value must not turn it into a
+                    // pin — merely tabbing through would freeze the target at
+                    // today's number and silently shadow every later update to
+                    // the model, including a fetched benchmark.
+                    set: { v in
+                        var u = ref
+                        u.qualityOverride = abs(v - inheritedQuality) < 0.5 ? nil : v
+                        onUpdate(u)
+                    }),
                           format: .number)
                     .textFieldStyle(.roundedBorder)
                     .frame(width: 56)
@@ -859,6 +881,9 @@ struct TargetRow: View {
         .opacity(ref.enabled ? 1 : 0.55)
     }
 
+    /// The model's own score, which a target follows unless it pins one.
+    private var inheritedQuality: Double { resolved?.1.qualityScore ?? 60 }
+
     private func detailLine(_ account: ProviderAccount, _ physical: PhysicalModel) -> String {
         var parts = [account.name]
         if let health, health.totalSamples > 0 {
@@ -866,6 +891,11 @@ struct TargetRow: View {
             if let p = health.ttftP50Seconds ?? health.p50Seconds { parts.append("p50 \(p.msString)") }
         } else {
             parts.append("no traffic yet")
+        }
+        // Where the number in the quality field comes from, so the two views
+        // agree visibly rather than only in the config file.
+        if let index = physical.benchmark?.intelligenceIndex {
+            parts.append(String(format: "AA %.1f", index))
         }
         if let price = physical.pricingOverride, price.isFlatRate {
             parts.append("no marginal cost")

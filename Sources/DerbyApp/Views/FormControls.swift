@@ -138,12 +138,14 @@ struct ModelRow: View {
     var physical: PhysicalModel
     var health: TargetHealth
     var isProbing: Bool
+    var isFetchingSpecs: Bool
     var onToggle: (Bool) -> Void
     var onQuality: (Double) -> Void
     var onContext: (Int?) -> Void
     var onMaxOutput: (Int?) -> Void
     var onPricing: (Pricing?) -> Void
     var onProbe: () -> Void
+    var onFetchSpecs: () -> Void
     var onRemove: () -> Void
     var onResetCircuit: () -> Void
 
@@ -172,6 +174,13 @@ struct ModelRow: View {
                 }
                 Spacer(minLength: 6)
 
+                if isFetchingSpecs {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Button("Specs") { onFetchSpecs() }
+                        .buttonStyle(.borderless)
+                        .help("Look this model up on Artificial Analysis and fill in its intelligence score and prices")
+                }
                 if isProbing {
                     ProgressView().controlSize(.small)
                 } else {
@@ -201,6 +210,7 @@ struct ModelRow: View {
         if let out = caps.maxOutputTokens { parts.append("\(out.formattedTokens) out") }
         if let dimensions = caps.embeddingDimensions { parts.append("\(dimensions)-dim") }
         parts.append(contentsOf: physical.profile?.descriptors ?? [])
+        parts.append(contentsOf: physical.benchmark?.descriptors ?? [])
         if !caps.flags.names.isEmpty { parts.append(caps.flags.names.joined(separator: "/")) }
         if health.totalSamples > 0 {
             parts.append("\(Format.percent(health.successRate)) ok")
@@ -294,6 +304,11 @@ struct ModelRow: View {
                 }
             }
 
+            if let benchmark = physical.benchmark, !benchmark.isEmpty {
+                Divider()
+                benchmarkSection(benchmark)
+            }
+
             Divider()
 
             // What a person legitimately decides about a model.
@@ -362,6 +377,46 @@ struct ModelRow: View {
         }
         .padding(.horizontal, 12)
         .padding(.bottom, 12)
+    }
+
+    /// What the index measured. Shown beside the editable score rather than in
+    /// place of it: the fetch wrote that score, and a person may disagree.
+    @ViewBuilder
+    private func benchmarkSection(_ benchmark: ModelBenchmark) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("Measured by Artificial Analysis").font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                if let version = benchmark.indexVersion {
+                    StatusPill(text: "INDEX v\(version)", tint: .derbyAccent)
+                }
+            }
+            HStack(spacing: 16) {
+                factView("Intelligence", benchmark.intelligenceIndex.map { String(format: "%.1f", $0) })
+                factView("Coding", benchmark.codingIndex.map { String(format: "%.1f", $0) })
+                factView("Agentic", benchmark.agenticIndex.map { String(format: "%.1f", $0) })
+                factView("Output speed", benchmark.outputTokensPerSecond.map { String(format: "%.0f tok/s", $0) })
+                factView("First token", benchmark.timeToFirstTokenSeconds.map { String(format: "%.2f s", $0) })
+                Spacer()
+            }
+            // Naming the row that matched is what makes a wrong match findable:
+            // ids differ between the index and every provider that serves a
+            // model, so the match is a judgement, not a lookup by primary key.
+            if let name = benchmark.sourceName {
+                Text(matchLine(name, benchmark))
+                    .font(.caption2).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private func matchLine(_ name: String, _ benchmark: ModelBenchmark) -> String {
+        var line = "Matched “\(name)”"
+        if let creator = benchmark.creator { line += " by \(creator)" }
+        if let at = benchmark.fetchedAt {
+            line += ", fetched \(at.formatted(date: .abbreviated, time: .shortened))"
+        }
+        return line + ". Speeds are the index's own measurements across providers, not this account's."
     }
 
     private func factView(_ label: String, _ value: String?) -> some View {

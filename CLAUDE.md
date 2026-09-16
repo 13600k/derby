@@ -107,12 +107,79 @@ rather than rejected, because most OpenAI SDKs refuse to start without some key;
 on, a key that cannot be read from the Keychain **fails closed**. The default configuration
 never touches the Keychain for the gateway key at all.
 
+A **maximum output is serving policy, not a property of the weights** — the live index
+carries caps from 16k to 262k for one copy of `qwen3.8-27b` — so it is only believed when it
+came from the provider the account actually is. `RemoteModelCatalog.Entry.matchedOwnProvider`
+is false when a row was found only by the cross-provider fallback, and a local server is
+never its own publisher, so for one of those the limit stays unknown. That costs nothing (an
+unknown limit never excludes a target) and is corrected by one field in the UI. Inheriting a
+stranger's turned a vLLM box that imposes no cap at all into a 16k model, because a single
+aggregator's row happened to answer first — and *which* row answered was not even stable,
+since the fallback table was built by iterating an unordered dictionary.
+
+What the server itself states always wins: llama.cpp's `/props` publishes
+`default_generation_settings.params.n_predict` — `--n-predict` if one was set, `-1` for the
+default of no ceiling — and that is read during discovery. Unlimited is recorded as
+*unknown* rather than as a number, since the two behave identically in routing and inventing
+one would make `/v1/models` promise an output floor no prompt can leave room for. vLLM
+publishes nothing comparable, because it has no output cap: generation is bounded by
+`max_model_len` minus the prompt, which the context filter already enforces.
+
 Capability metadata is *completed*, not chosen: a provider's model list reports features but
 seldom a context window, so `ModelCapabilities.completed(by:)` fills the gaps discovery left
 from the bundled catalog. Only a model with `source == .unknown` takes the catalog wholesale.
 Getting this wrong left every discovered model (the whole ChatGPT-subscription catalog) with
 no context window, which silently disabled `minContextTokens` filtering and
 `failoverToLargerContext`.
+
+### Benchmark specs
+
+`qualityScore` is the one number Derby cannot learn from anywhere: weighted-score routing
+ranks by it, and nothing in a provider's model listing says how good a model is, so it was a
+figure the user had to invent per model. `BenchmarkCatalog` fills it from Artificial
+Analysis (`/api/v2/language/models`, `x-api-key`), cached on disk beside the models.dev
+index and refreshed at most daily — the free tier allows 1,000 requests a day, so one press
+of a button fetches the whole index, not one model.
+
+Three rules keep it honest:
+
+- **Nothing is on the request path.** A fetch copies what it takes into the model's *own*
+  fields — `qualityScore`, `pricingOverride`, `capabilityOverrides.contextWindow` — which
+  routing then reads exactly as it reads anything typed by hand. The full record stays on
+  `PhysicalModel.benchmark` for display and provenance, and the router never reads it.
+  `BenchmarkApplication.apply` is pure, so what a button press will write is testable.
+- **A benchmark never contradicts the provider.** It fills a context window nobody reported
+  and leaves a stated one alone; it skips pricing on local and subscription targets, whose
+  marginal cost is zero whatever the hosted copy of the same weights is billed at.
+- **Matching is exact or absent.** The index spells models its own way (`claude-4-5-sonnet`
+  against Anthropic's `claude-sonnet-4-5`), so ids are normalized, date-stamped and
+  namespaced forms are stripped, and token order is ignored — but a near-miss matches
+  nothing, because a wrong match writes another model's score into a target the router
+  ranks by. The matched row's name is recorded and shown, so a wrong one is findable.
+- **An unspecified reasoning level means the highest.** The index publishes a row per
+  effort; a provider publishes one endpoint that serves any of them, so rows differing only
+  by level are one group and an id naming no level takes the group's ceiling. An id that
+  *does* name one gets exactly that, falling to the strongest level below it when the index
+  does not publish it. Ordering is by level, never by score — Qwen3.5 122B scores *higher*
+  without reasoning, and taking the better number would undo the rule.
+- **The level is stated in the row's name, not its slug.** `qwen3-5-9b` is "(Reasoning)"
+  while `qwen3-5-9b-non-reasoning` is not — the bare slug is usually the reasoning row —
+  and `gemini-3-5-flash` carries "(high)" in no slug at all. So the level is parsed from the
+  name's trailing parenthetical and a row stating none is stripped of nothing, which is what
+  keeps `mistral-medium-3-1` as Mistral Medium rather than a medium-effort anything. `max`
+  counts as a level in a name ("Max Effort") but never in a slug or a provider's id, where
+  Qwen Max and Grok 4 Max are weights.
+- **A logical model's quality pin must not shadow a fetch.** `TargetRef.qualityOverride`
+  wins over `PhysicalModel.qualityScore` everywhere routing reads it, and the quality field
+  in the logical model view writes one on *any* commit — so tabbing through it froze the
+  target at that moment and made every later fetch appear to do nothing. The field now only
+  pins a value that differs from the model's own, and a fetch clears a pin that merely
+  mirrored the old score while keeping (and reporting) one that says something different.
+- **The endpoint pages.** It answers 200 rows and a `total_pages`; fetching only the first
+  hid three quarters of the index, and with it every reasoning level that had not landed on
+  page 1. `refresh` walks the pages and caches them as one document, stopping early if a
+  page repeats what is already held (a server ignoring `page`) so a per-request quota is not
+  spent re-reading it.
 
 ### Context compaction
 

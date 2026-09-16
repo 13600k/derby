@@ -412,6 +412,22 @@ public struct OpenAIAdapter: ProviderAdapter {
             caps.contextWindow = window
             learnedSomething = true
         }
+        // The server's own ceiling on a completion, which is the only authority
+        // on the subject: `--n-predict` if one was set, and `-1` for the default
+        // of no ceiling at all. Nothing else knows this — a catalog can only
+        // report what some *other* host caps the same weights at.
+        //
+        // Unlimited stays unknown rather than becoming a number: the two behave
+        // identically in routing (an unknown limit never excludes a target) and
+        // inventing one would have `/v1/models` promise an output floor that
+        // cannot be met alongside a prompt.
+        if let params = props["default_generation_settings"]?["params"] {
+            let stated = params["n_predict"]?.intValue ?? params["max_tokens"]?.intValue
+            if let stated {
+                caps.maxOutputTokens = stated > 0 ? stated : nil
+                learnedSomething = true
+            }
+        }
         if let templateCaps = props["chat_template_caps"], templateCaps.objectValue != nil {
             learnedSomething = true
             caps.flags.formUnion([.text, .streaming])

@@ -12,6 +12,9 @@ public struct DerbyConfig: Codable, Sendable {
     public var health: HealthSettings
     public var logging: LoggingSettings
     public var app: AppSettings
+    /// What a benchmark fetch writes into a model. Nothing is ever fetched
+    /// without the user asking; this only says what a request would apply.
+    public var benchmarks: BenchmarkSettings
     /// Pricing overrides keyed by "<providerID>/<modelID>", applied on top of
     /// catalog pricing. Per-model overrides live on the model itself; this map
     /// exists so import/export can carry pricing without the rest of the model.
@@ -25,6 +28,7 @@ public struct DerbyConfig: Codable, Sendable {
                 health: HealthSettings = .default,
                 logging: LoggingSettings = .default,
                 app: AppSettings = .default,
+                benchmarks: BenchmarkSettings = .default,
                 pricingOverrides: [String: Pricing] = [:],
                 updatedAt: Date = Date()) {
         self.schemaVersion = schemaVersion
@@ -34,6 +38,7 @@ public struct DerbyConfig: Codable, Sendable {
         self.health = health
         self.logging = logging
         self.app = app
+        self.benchmarks = benchmarks
         self.pricingOverrides = pricingOverrides
         self.updatedAt = updatedAt
     }
@@ -71,6 +76,8 @@ public struct DerbyConfig: Codable, Sendable {
         health = decode(HealthSettings.self, .health, default: .default, label: "health settings")
         logging = decode(LoggingSettings.self, .logging, default: .default, label: "logging settings")
         app = decode(AppSettings.self, .app, default: .default, label: "application settings")
+        benchmarks = decode(BenchmarkSettings.self, .benchmarks, default: .default,
+                            label: "benchmark settings")
         pricingOverrides = decode([String: Pricing].self, .pricingOverrides, default: [:],
                                   label: "pricing overrides")
         updatedAt = (try? c.decode(Date.self, forKey: .updatedAt)) ?? Date()
@@ -100,7 +107,7 @@ public struct DerbyConfig: Codable, Sendable {
 
     /// Every secret reference the config depends on, used to prune the Keychain.
     public var allSecretRefs: [SecretRef] {
-        providers.flatMap { $0.auth.secretRefs } + [gateway.localKeyRef]
+        providers.flatMap { $0.auth.secretRefs } + [gateway.localKeyRef, benchmarks.apiKeyRef]
     }
 
     // MARK: - Seeds

@@ -418,6 +418,11 @@ public struct PhysicalModel: Codable, Sendable, Hashable, Identifiable {
     public var discoveredAt: Date?
     /// Descriptive facts learned during discovery (size, quantization, family).
     public var profile: ModelProfile?
+    /// Independent scores last fetched for this model, kept for display and
+    /// provenance. Optional, and never read by the router: what a fetch decides
+    /// to keep is copied into the fields above, where the user can see and
+    /// correct it.
+    public var benchmark: ModelBenchmark?
 
     public init(id: UUID = UUID(), modelID: String, displayName: String? = nil,
                 enabled: Bool = true,
@@ -426,7 +431,8 @@ public struct PhysicalModel: Codable, Sendable, Hashable, Identifiable {
                 pricingOverride: Pricing? = nil,
                 qualityScore: Double = 60,
                 discoveredAt: Date? = nil,
-                profile: ModelProfile? = nil) {
+                profile: ModelProfile? = nil,
+                benchmark: ModelBenchmark? = nil) {
         self.id = id; self.modelID = modelID; self.displayName = displayName
         self.enabled = enabled; self.capabilities = capabilities
         self.capabilityOverrides = capabilityOverrides
@@ -434,6 +440,7 @@ public struct PhysicalModel: Codable, Sendable, Hashable, Identifiable {
         self.qualityScore = qualityScore
         self.discoveredAt = discoveredAt
         self.profile = profile
+        self.benchmark = benchmark
     }
 
     public var effectiveCapabilities: ModelCapabilities { capabilities.overridden(by: capabilityOverrides) }
