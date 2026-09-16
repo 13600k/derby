@@ -362,7 +362,8 @@ which is what keeps it pure.
 **What the server itself says.** Derby's own counts see only Derby's traffic. A serving engine
 sees everyone's, and knows what actually runs out first: vLLM and SGLang publish requests
 running and waiting plus KV cache use as Prometheus gauges, and llama.cpp's `/slots` reports how
-many decoding slots are busy. `ProviderAdapter.occupancy` reads whichever of those a server
+many decoding slots are busy, while its `/metrics` (served with `--metrics`) counts the requests
+deferred until one frees. `ProviderAdapter.occupancy` reads whichever of those a server
 speaks — declared per kind as an `OccupancyStyle`, never branched on — and the poller keeps it
 beside the loaded-model report. `loadUtilization` then takes whichever is worse, Derby's view or
 the server's, so a box someone else is already hammering ranks as busy even when Derby has sent
@@ -371,9 +372,16 @@ it nothing.
 A server reporting **no free slot** — every slot taken, work queued, or the KV cache effectively
 full — is passed over while another target can answer now, and recorded as an exclusion carrying
 what the server said. It is not an error: the request would only queue, so a full server stays
-eligible when it is the only one left. There is no setting for it. This is a rate limit learned
-from the server rather than configured, so it follows the logical model's existing
-`respectQuotas` switch and adds no new knob.
+eligible when it is the only one left. It is a rate limit learned from the server, so it follows
+the logical model's existing `respectQuotas` switch.
+
+How much waiting counts as full belongs to the provider: `RateLimitConfig.maxQueuedRequests`,
+none by default, so any wait is too long. Set higher, a server with every slot busy keeps taking
+work until that many requests are already waiting. It counts the server's whole queue rather
+than Derby's share, and is independent of `maxConcurrentRequests`, which caps only what Derby
+itself has open. Where a server reports its slots but no queue — llama.cpp without `--metrics` —
+`RoutingSnapshot.effectiveOccupancy` counts Derby's own requests beyond those slots as waiting,
+which also covers the seconds between polls.
 
 **Loaded models.** While the gateway runs, `DerbyEngine` asks each enabled local server every
 5 seconds what it holds in memory (`ProviderAdapter.loadedModels`) and keeps the answers in

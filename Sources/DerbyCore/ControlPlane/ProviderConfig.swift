@@ -103,6 +103,15 @@ public enum ProviderKind: String, Codable, Sendable, CaseIterable, Hashable {
         }
     }
 
+    /// Serving engines that publish what they are running and what is waiting,
+    /// so routing can pass over one whose queue is too long.
+    public var reportsServerOccupancy: Bool {
+        switch self {
+        case .vllm, .sglang, .llamaCpp: return true
+        default: return false
+        }
+    }
+
     /// Subscription-backed accounts are flat-rate: they have a quota, not a bill.
     public var isSubscription: Bool {
         switch self {
@@ -367,15 +376,28 @@ public struct RateLimitConfig: Codable, Sendable, Hashable {
     public var maxConcurrentRequests: Int
     public var dailyRequestQuota: Int?
     public var monthlyCostBudgetUSD: Double?
+    /// How many requests a serving engine may already have waiting for a slot
+    /// before routing passes it over — everyone's, not only Derby's, and
+    /// unrelated to `maxConcurrentRequests`. Nil means none: it is passed over
+    /// as soon as a request would wait. Only servers that report their
+    /// occupancy are judged by it.
+    public var maxQueuedRequests: Int?
 
     public init(requestsPerMinute: Int? = nil, tokensPerMinute: Int? = nil,
                 maxConcurrentRequests: Int = 8, dailyRequestQuota: Int? = nil,
-                monthlyCostBudgetUSD: Double? = nil) {
+                monthlyCostBudgetUSD: Double? = nil, maxQueuedRequests: Int? = nil) {
         self.requestsPerMinute = requestsPerMinute
         self.tokensPerMinute = tokensPerMinute
         self.maxConcurrentRequests = maxConcurrentRequests
         self.dailyRequestQuota = dailyRequestQuota
         self.monthlyCostBudgetUSD = monthlyCostBudgetUSD
+        self.maxQueuedRequests = maxQueuedRequests
+    }
+
+    /// `maxQueuedRequests` with its default applied.
+    public var allowedQueuedRequests: Int {
+        get { max(0, maxQueuedRequests ?? 0) }
+        set { maxQueuedRequests = max(0, newValue) }
     }
     public static let `default` = RateLimitConfig()
 }

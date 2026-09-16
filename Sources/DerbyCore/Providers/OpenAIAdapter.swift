@@ -54,6 +54,16 @@ public struct OpenAIQuirks: Sendable {
         case llamaCppProps
     }
     public var propsStyle: PropsStyle = .unreported
+    /// Whether Derby may learn a model's capabilities by *asking* the server —
+    /// one tiny request per feature, at discovery time only.
+    ///
+    /// Most self-hosted servers publish an id and nothing else, and what the
+    /// build supports depends on how it was launched: a vLLM started without a
+    /// tool parser and one started with it list the same model. No document
+    /// distinguishes them, so the only honest source is the server's own answer.
+    /// Off for metered APIs, which bill for every probe and publish their
+    /// metadata anyway.
+    public var probesCapabilities = false
     /// Assistant-message fields that carry earlier reasoning back.
     public var reasoningReplayFields: [String] = []
     /// Accepts `chat_template_kwargs`, the switch self-hosted servers use to
@@ -106,6 +116,7 @@ public struct OpenAIQuirks: Sendable {
             q.supportsParallelToolCalls = false
             q.authStyle = .none
             q.strictSchema = (kind == .llamaCpp || kind == .localai)
+            q.probesCapabilities = true
             switch kind {
             case .lmStudio: q.residencyStyle = .lmStudioInstances
             case .vllm, .sglang, .llamaCpp:
@@ -121,6 +132,8 @@ public struct OpenAIQuirks: Sendable {
             q.supportsStreamOptions = false
             q.supportsParallelToolCalls = false
             q.strictSchema = true
+            // Derby cannot guess what is behind a custom URL, so it asks.
+            q.probesCapabilities = true
         default:
             break
         }
@@ -233,8 +246,160 @@ public struct OpenAIAdapter: ProviderAdapter {
                 models[index] = Self.applyingLlamaCppProps(props, to: models[index])
             }
         }
+
+        if q.probesCapabilities {
+            // Ask only about models the server already has loaded. On a host
+            // that loads on demand, probing the rest would page each one into
+            // memory in turn just to ask it a question.
+            let loaded = try? await loadedModels(ctx)
+            let probeable = models.filter { loaded?.contains($0.id) ?? true }
+            if probeable.count <= Self.maxModelsToProbe {
+                for index in models.indices where probeable.contains(where: { $0.id == models[index].id }) {
+                    guard let probed = await probedCapabilities(model: models[index].id, ctx: ctx,
+                                                                quirks: q, auth: auth) else { continue }
+                    // What the server just demonstrated wins; what it was silent
+                    // about is still filled in from what the listing stated, and
+                    // what it refused is removed however confident the guess was.
+                    var merged = probed.capabilities
+                        .fillingGaps(from: models[index].capabilities ?? .unknown)
+                    merged.flags.subtract(probed.refused)
+                    models[index].capabilities = merged
+                }
+            }
+        }
         return models.sorted { $0.id < $1.id }
     }
+
+    // MARK: - Capability probing
+
+    /// One question put to the server, and what its answer proves.
+    ///
+    /// Accepted means the feature is there; a 4xx means this build refuses it.
+    /// Anything else — a timeout, a 500, a connection that drops — proves
+    /// nothing, and is therefore recorded as nothing.
+    struct CapabilityProbe: Sendable {
+        var label: String
+        /// Granted when the server accepts the request.
+        var grants: CapabilityFlags = []
+        /// Marked unsupported when the server rejects it with a 4xx.
+        var denies: RequestParameters = []
+        var extraBody: [String: JSONValue]
+        /// Flags a refusal disproves. A server that rejects an image is stating
+        /// this model has no vision, which must override a catalog that guessed
+        /// otherwise from the model's name — claiming a modality the model
+        /// lacks is a hard failure at request time.
+        var refutes: CapabilityFlags { grants }
+    }
+
+    /// What the server demonstrated, and what it refused.
+    struct ProbeResult: Sendable {
+        var capabilities: ModelCapabilities
+        var refused: CapabilityFlags = []
+    }
+
+    /// A 1×1 transparent PNG: the smallest thing that asks "do you take images?"
+    static let probePixel = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+
+    static let capabilityProbes: [CapabilityProbe] = [
+        CapabilityProbe(label: "tools", grants: [.tools], extraBody: [
+            "tools": .array([.object([
+                "type": .string("function"),
+                "function": .object([
+                    "name": .string("derby_probe"),
+                    "description": .string("Capability probe."),
+                    "parameters": .object(["type": .string("object"),
+                                           "properties": .object([:])])])])]),
+            "tool_choice": .string("auto"),
+        ]),
+        CapabilityProbe(label: "parallel tool calls", grants: [.parallelTools],
+                        denies: [.parallelToolCalls], extraBody: [
+            "tools": .array([.object([
+                "type": .string("function"),
+                "function": .object([
+                    "name": .string("derby_probe"),
+                    "description": .string("Capability probe."),
+                    "parameters": .object(["type": .string("object"),
+                                           "properties": .object([:])])])])]),
+            "parallel_tool_calls": .bool(true),
+        ]),
+        CapabilityProbe(label: "structured output", grants: [.jsonMode, .jsonSchema],
+                        denies: [.responseFormat], extraBody: [
+            "response_format": .object([
+                "type": .string("json_schema"),
+                "json_schema": .object([
+                    "name": .string("derby_probe"),
+                    "schema": .object(["type": .string("object"),
+                                       "properties": .object([:])])])]),
+        ]),
+        CapabilityProbe(label: "vision", grants: [.vision], extraBody: [
+            "messages": .array([.object([
+                "role": .string("user"),
+                "content": .array([
+                    .object(["type": .string("text"), "text": .string("hi")]),
+                    .object(["type": .string("image_url"),
+                             "image_url": .object(["url": .string(OpenAIAdapter.probePixel)])]),
+                ])])]),
+        ]),
+        CapabilityProbe(label: "temperature", denies: [.temperature],
+                        extraBody: ["temperature": .number(0.5)]),
+    ]
+
+    /// Asks the server what this model can do, one feature at a time.
+    ///
+    /// Returns nil when the plain baseline request does not succeed: a server
+    /// that cannot answer at all proves nothing about any feature, and guessing
+    /// from a failure would strip capabilities the model really has.
+    func probedCapabilities(model: String, ctx: ProviderContext, quirks q: OpenAIQuirks,
+                            auth: ResolvedAuth) async -> ProbeResult? {
+        func ask(_ extra: [String: JSONValue]) async -> (status: Int, body: JSONValue?)? {
+            var body: [String: JSONValue] = [
+                "model": .string(model),
+                "messages": .array([.object(["role": .string("user"),
+                                             "content": .string("hi")])]),
+                "max_tokens": .number(1),
+                "stream": .bool(false),
+            ]
+            for (k, v) in extra { body[k] = v }
+            guard let u = try? chatURL(ctx, model: model, quirks: q, auth: auth),
+                  let data = try? JSONValue.object(body).stableJSONData() else { return nil }
+            let request = OutboundRequest(url: u, method: "POST", headers: headers(ctx, auth: auth),
+                                          body: data, timeout: Self.probeTimeout,
+                                          allowInsecureTLS: ctx.account.allowInsecureTLS)
+            guard let response = try? await ctx.transport.send(request) else { return nil }
+            return (response.status, response.bodyJSON)
+        }
+
+        // Baseline: does this model answer a plain request at all?
+        guard let baseline = await ask([:]), (200..<300).contains(baseline.status) else { return nil }
+        var caps = ModelCapabilities(flags: [.text, .streaming], source: .discovered)
+        // Servers that run a reasoning parser say so in the answer itself.
+        if let message = baseline.body?["choices"]?[0]?["message"],
+           ["reasoning", "reasoning_content", "thinking"].contains(where: { !(message[$0]?.isNull ?? true) }) {
+            caps.flags.insert(.reasoning)
+        }
+
+        var refused: CapabilityFlags = []
+        for probe in Self.capabilityProbes {
+            guard let answer = await ask(probe.extraBody) else { continue }
+            if (200..<300).contains(answer.status) {
+                caps.flags.formUnion(probe.grants)
+            } else if (400..<500).contains(answer.status) {
+                // Only an outright refusal denies a parameter. A 5xx or a
+                // timeout says the server is unwell, not that the feature is
+                // missing.
+                caps.unsupportedParameters.formUnion(probe.denies)
+                refused.formUnion(probe.refutes)
+            }
+        }
+        return ProbeResult(capabilities: caps, refused: refused)
+    }
+
+    /// Probes are tiny, but a cold model can still take a while to load.
+    static let probeTimeout: TimeInterval = 30
+    /// Above this many listed models, probing is skipped: a proxy that lists a
+    /// hundred models would otherwise be hammered, and on a server that loads
+    /// on demand each probe would page a different model into memory.
+    static let maxModelsToProbe = 8
 
     /// Folds what llama.cpp's `/props` states into a discovered model. Best
     /// effort: a field the build does not publish leaves what was known alone.
@@ -330,21 +495,11 @@ public struct OpenAIAdapter: ProviderAdapter {
         guard q.occupancyStyle != .unreported else { return nil }
         let auth = try await authenticate(ctx)
         let native = OllamaDiscovery.nativeBase(from: auth.baseURLOverride ?? ctx.account.baseURL)
-        let path: String
-        switch q.occupancyStyle {
-        case .vllmMetrics, .sglangMetrics: path = "/metrics"
-        case .llamaCppSlots: path = "/slots"
-        case .unreported: return nil
-        }
-        guard let requestURL = URL(string: native + path) else { return nil }
-        let response = try await ctx.transport.send(OutboundRequest(
-            url: requestURL, method: "GET", headers: headers(ctx, auth: auth),
-            timeout: ctx.attemptTimeout, allowInsecureTLS: ctx.account.allowInsecureTLS))
-        guard (200..<300).contains(response.status) else { return nil }
 
         switch q.occupancyStyle {
         case .vllmMetrics:
-            let s = PrometheusText.samples(String(decoding: response.body, as: UTF8.self))
+            guard let page = await statusPage("/metrics", native: native, ctx, auth: auth) else { return nil }
+            let s = PrometheusText.samples(String(decoding: page.body, as: UTF8.self))
             // The v1 engine publishes kv_cache_usage_perc; earlier ones called
             // the same gauge gpu_cache_usage_perc.
             let cache = PrometheusText.peak(s, "vllm:kv_cache_usage_perc")
@@ -355,7 +510,8 @@ public struct OpenAIAdapter: ProviderAdapter {
                 kvCacheUsage: cache.map(Self.asFraction))
             return occupancy.isEmpty ? nil : occupancy
         case .sglangMetrics:
-            let s = PrometheusText.samples(String(decoding: response.body, as: UTF8.self))
+            guard let page = await statusPage("/metrics", native: native, ctx, auth: auth) else { return nil }
+            let s = PrometheusText.samples(String(decoding: page.body, as: UTF8.self))
             let occupancy = ServerOccupancy(
                 running: PrometheusText.total(s, "sglang:num_running_reqs").map { Int($0.rounded()) },
                 queued: PrometheusText.total(s, "sglang:num_queue_reqs").map { Int($0.rounded()) },
@@ -363,23 +519,59 @@ public struct OpenAIAdapter: ProviderAdapter {
                                ?? PrometheusText.peak(s, "sglang:kv_cache_usage")).map(Self.asFraction))
             return occupancy.isEmpty ? nil : occupancy
         case .llamaCppSlots:
+            // Two pages, either of which a server may have switched off, so
+            // each is asked on its own and at the same time.
+            async let slotsPage = statusPage("/slots", native: native, ctx, auth: auth)
+            async let metricsPage = statusPage("/metrics", native: native, ctx, auth: auth)
+            var occupancy = ServerOccupancy()
             // `/slots` is one entry per decoding slot; older builds report
             // `state` (0 idle), newer ones `is_processing`.
-            guard let slots = response.bodyJSON?.arrayValue, !slots.isEmpty else { return nil }
-            let busy = slots.filter { slot in
-                if let processing = slot["is_processing"]?.boolValue { return processing }
-                return (slot["state"]?.intValue ?? 0) != 0
-            }.count
-            return ServerOccupancy(running: busy, totalSlots: slots.count)
+            if let slots = await slotsPage?.bodyJSON?.arrayValue, !slots.isEmpty {
+                occupancy.running = slots.filter { slot in
+                    if let processing = slot["is_processing"]?.boolValue { return processing }
+                    return (slot["state"]?.intValue ?? 0) != 0
+                }.count
+                occupancy.totalSlots = slots.count
+            }
+            // `/metrics`, served only with `--metrics`, is the one place
+            // llama.cpp counts the requests deferred until a slot frees.
+            if let page = await metricsPage {
+                let s = PrometheusText.samples(String(decoding: page.body, as: UTF8.self))
+                if occupancy.running == nil {
+                    occupancy.running = PrometheusText.total(s, "llamacpp:requests_processing").map { Int($0.rounded()) }
+                }
+                occupancy.queued = PrometheusText.total(s, "llamacpp:requests_deferred").map { Int($0.rounded()) }
+            }
+            return occupancy.isEmpty ? nil : occupancy
         case .unreported:
             return nil
         }
+    }
+
+    /// One GET of a server's status page, or nil when it did not answer with one.
+    private func statusPage(_ path: String, native: String, _ ctx: ProviderContext,
+                            auth: ResolvedAuth) async -> OutboundResponse? {
+        guard let url = URL(string: native + path),
+              let response = try? await ctx.transport.send(OutboundRequest(
+                url: url, method: "GET", headers: headers(ctx, auth: auth),
+                timeout: ctx.attemptTimeout, allowInsecureTLS: ctx.account.allowInsecureTLS)),
+              (200..<300).contains(response.status) else { return nil }
+        return response
     }
 
     /// Some builds publish a ratio, others the same thing as a percentage.
     private static func asFraction(_ value: Double) -> Double {
         value > 1.5 ? value / 100 : value
     }
+
+    /// Every name a server might publish its context window under, most
+    /// specific first. OpenAI publishes none, so each implementation invented
+    /// its own: vLLM `max_model_len`, llama.cpp `meta.n_ctx`, aggregators
+    /// `context_length`. Reading only some of them is why a server that states
+    /// its window plainly still ended up with a guessed one.
+    static let contextWindowKeys = ["context_length", "context_window", "max_context_length",
+                                    "max_model_len", "max_seq_len", "max_sequence_length",
+                                    "max_position_embeddings", "n_ctx"]
 
     /// Reads whatever an OpenAI-style `/models` entry chooses to publish.
     /// Aggregators such as OpenRouter report context length, modalities,
@@ -392,10 +584,13 @@ public struct OpenAIAdapter: ProviderAdapter {
         var discovered = ModelCapabilities(flags: [], source: .discovered)
         var learnedSomething = false
 
-        if let window = item["context_length"]?.intValue ?? item["context_window"]?.intValue
-            ?? item["max_context_length"]?.intValue
-            // llama.cpp puts the context it was started with under `meta`.
-            ?? item["meta"]?["n_ctx"]?.intValue {
+        // Every server spells the context window differently and none of them
+        // uses OpenAI's name for it, because OpenAI does not publish one. Read
+        // all of them: vLLM says `max_model_len`, llama.cpp `meta.n_ctx`,
+        // aggregators `context_length`.
+        if let window = Self.contextWindowKeys.lazy
+            .compactMap({ item[$0]?.intValue ?? item["meta"]?[$0]?.intValue })
+            .first(where: { $0 > 0 }) {
             discovered.contextWindow = window
             learnedSomething = true
         }

@@ -20,6 +20,8 @@ final class MockTransport: HTTPTransport, @unchecked Sendable {
     var responses: [String: OutboundResponse] = [:]
     var streams: [String: [String]] = [:]
     var defaultResponse: OutboundResponse?
+    /// Consulted before the path stubs; return nil to fall through to them.
+    var responder: (@Sendable (OutboundRequest) -> OutboundResponse?)?
     var artificialDelay: Double = 0
     var failWith: DerbyError?
 
@@ -47,6 +49,9 @@ final class MockTransport: HTTPTransport, @unchecked Sendable {
         record(request)
         if artificialDelay > 0 { try? await Task.sleep(nanoseconds: UInt64(artificialDelay * 1_000_000_000)) }
         if let failWith { throw failWith }
+        // Path stubs answer the same way every time; a responder can answer by
+        // what was actually asked, which is what capability probing needs.
+        if let responder, let answer = responder(request) { return answer }
         if let key = responses.keys.first(where: { request.url.path.hasSuffix($0) }) {
             return responses[key]!
         }

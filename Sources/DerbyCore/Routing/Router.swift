@@ -199,19 +199,22 @@ public struct Router: Sendable {
             }
         }
 
-        // 4b. A server that says it has no free slot is passed over while
-        // something else can answer now. This is the same idea as a rate limit,
-        // learned from the server rather than configured — so it is never a
-        // knob. It is not an error either: the request would only queue, so a
-        // full server stays eligible when it is the only one left.
+        // 4b. A server with no room for one more request is passed over while
+        // something else can answer now: no free slot, and at least as many
+        // requests already waiting as its account allows to queue (none by
+        // default). This is a rate limit learned from the server, so it rides
+        // on `respectQuotas`. It is not an error either: the request would only
+        // queue, so a full server stays eligible when it is the only one left.
         if lm.policy.respectQuotas {
-            let full = eligible.filter { snapshot.occupancy(for: $0)?.isSaturated == true }
+            let full = eligible.filter { snapshot.isSaturated($0) }
             if !full.isEmpty, full.count < eligible.count {
                 for t in full {
-                    let state = snapshot.occupancy(for: t)?.summary ?? "no free capacity"
+                    let state = snapshot.effectiveOccupancy(for: t)?.summary ?? "no free capacity"
+                    let allowance = t.account.rateLimits.allowedQueuedRequests
+                    let allowed = allowance > 0 ? " (\(allowance) allowed to wait)" : ""
                     exclusions.append(ExclusionRecord(targetLabel: t.label, providerName: t.providerName,
                                                       modelID: t.modelID, stage: .quota,
-                                                      reason: "server reports \(state)"))
+                                                      reason: "server reports \(state)\(allowed)"))
                 }
                 let fullIDs = Set(full.map(\.id))
                 eligible.removeAll { fullIDs.contains($0.id) }

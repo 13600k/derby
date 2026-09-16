@@ -106,6 +106,83 @@ func registerModelMetadataTests() {
             try expectEqual(listed.capabilities?.contextWindow, 262_144)
         }
 
+        // A self-hosted server states an id and, if you are lucky, a window. What
+        // the build supports depends on how it was launched — a vLLM started
+        // with a tool parser lists the same model as one started without — so
+        // the only source is the server's own answer.
+        test("a self-hosted server is asked what it supports, and answers") {
+            let transport = MockTransport()
+            transport.stub("/models", json: """
+            {"object":"list","data":[{"id":"Qwen 3.8","object":"model","owned_by":"vllm",
+              "max_model_len":262144,"root":"/models/Qwen3.8-27B-FP8"}]}
+            """)
+            // This build takes everything except images.
+            transport.responder = { request in
+                guard request.url.path.hasSuffix("/chat/completions") else { return nil }
+                let body = request.body.flatMap { try? JSONDecoder().decode(JSONValue.self, from: $0) }
+                let asksForImage = (body?["messages"]?[0]?["content"]?.arrayValue ?? [])
+                    .contains { $0["type"]?.stringValue == "image_url" }
+                if asksForImage {
+                    return OutboundResponse(status: 400, headers: [:],
+                                            body: Data(#"{"error":{"message":"multimodal not supported"}}"#.utf8))
+                }
+                return OutboundResponse(status: 200, headers: [:], body: Data("""
+                {"id":"c","choices":[{"index":0,"message":{"role":"assistant","content":null,
+                  "reasoning":"We"},"finish_reason":"length"}]}
+                """.utf8))
+            }
+
+            var account = Fixture.account("enzotide", kind: .vllm, models: [])
+            account.baseURLOverride = "http://enzotide:8000/v1"
+            let ctx = ProviderContext(account: account, transport: transport,
+                                      secrets: InMemorySecretStore(), credentials: CredentialCache())
+            let model = try expectNotNil(try await OpenAIAdapter().listModels(ctx).first)
+            let caps = try expectNotNil(model.capabilities)
+
+            // vLLM publishes the window under its own name, not OpenAI's.
+            try expectEqual(caps.contextWindow, 262_144)
+            try expect(caps.flags.contains(.tools))
+            try expect(caps.flags.contains(.parallelTools))
+            try expect(caps.flags.contains(.jsonSchema))
+            // The answer carried a reasoning field, so a parser is running.
+            try expect(caps.flags.contains(.reasoning))
+            // Refused outright, so not claimed however the name reads.
+            try expect(!caps.flags.contains(.vision))
+            try expectEqual(caps.source, .discovered)
+        }
+
+        test("a server that cannot answer loses nothing it already stated") {
+            let transport = MockTransport()
+            transport.stub("/models", json: """
+            {"object":"list","data":[{"id":"gpt-4o","object":"model","max_model_len":128000}]}
+            """)
+            // Every probe fails the way an overloaded server fails.
+            transport.responder = { request in
+                guard request.url.path.hasSuffix("/chat/completions") else { return nil }
+                return OutboundResponse(status: 503, headers: [:], body: Data())
+            }
+            var account = Fixture.account("busy", kind: .vllm, models: [])
+            account.baseURLOverride = "http://127.0.0.1:8000/v1"
+            let ctx = ProviderContext(account: account, transport: transport,
+                                      secrets: InMemorySecretStore(), credentials: CredentialCache())
+            let model = try expectNotNil(try await OpenAIAdapter().listModels(ctx).first)
+            let caps = try expectNotNil(model.capabilities)
+            // A 5xx proves nothing: the catalog's own account of gpt-4o stands.
+            try expect(caps.flags.contains(.tools), "a sick server must not strip known capabilities")
+            try expectEqual(caps.contextWindow, 128_000)
+        }
+
+        test("metered APIs are never probed") {
+            let transport = MockTransport()
+            transport.stub("/models", json: #"{"data":[{"id":"gpt-4o","object":"model"}]}"#)
+            let account = Fixture.account("OpenAI", kind: .openai, models: [])
+            let ctx = ProviderContext(account: account, transport: transport,
+                                      secrets: InMemorySecretStore(), credentials: CredentialCache())
+            _ = try await OpenAIAdapter().listModels(ctx)
+            try expect(!transport.requests.contains { $0.url.path.hasSuffix("/chat/completions") },
+                       "probing a metered API would bill the user to learn what it already publishes")
+        }
+
         test("a bare listing falls back to the bundled catalog") {
             let adapter = OpenAIAdapter()
             let model = try expectNotNil(

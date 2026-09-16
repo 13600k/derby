@@ -498,7 +498,8 @@ public enum OpenAIResponseWriter {
         // What the server said about itself, for anyone watching capacity.
         if let busy = snapshot.occupancy(for: t) {
             var reported: [String: JSONValue] = ["summary": .string(busy.summary),
-                                                 "saturated": .bool(busy.isSaturated)]
+                                                 "saturated": .bool(snapshot.isSaturated(t)),
+                                                 "queue_allowance": .number(Double(t.account.rateLimits.allowedQueuedRequests))]
             if let running = busy.running { reported["running"] = .number(Double(running)) }
             if let queued = busy.queued { reported["queued"] = .number(Double(queued)) }
             if let slots = busy.totalSlots { reported["total_slots"] = .number(Double(slots)) }

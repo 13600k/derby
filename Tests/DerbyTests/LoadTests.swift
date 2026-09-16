@@ -417,6 +417,82 @@ func registerLoadTests() {
             try expectEqual(order(alone), ["Busy"], "queueing there beats failing the request")
         }
 
+        test("a queue allowance lets a busy server take work until that many are waiting") {
+            let oneWaiting = ServerOccupancy(running: 4, queued: 1, totalSlots: 4)
+            try expect(oneWaiting.isSaturated, "with no allowance, any wait is too long")
+            try expect(!oneWaiting.isSaturated(allowingQueued: 2), "one waiting and two allowed: the new request is second")
+            try expect(ServerOccupancy(running: 4, queued: 2, totalSlots: 4).isSaturated(allowingQueued: 2),
+                       "two already waiting: the new one would be third")
+            try expect(ServerOccupancy(running: 4, totalSlots: 4).isSaturated(allowingQueued: 0))
+            try expect(!ServerOccupancy(running: 4, totalSlots: 4).isSaturated(allowingQueued: 1))
+            try expect(!ServerOccupancy(running: 2, totalSlots: 4).isSaturated(allowingQueued: 0),
+                       "a free slot means nothing waits")
+            try expect(!ServerOccupancy(kvCacheUsage: 0.99).isSaturated(allowingQueued: 1))
+        }
+
+        test("how many may wait is the provider's allowance, whatever its concurrency limit") {
+            var busy = account("Busy", kind: .vllm, model: "qwen3.8-27b-fp8", capacity: 64)
+            busy.rateLimits.maxQueuedRequests = 2
+            let free = account("Free", kind: .ollama, model: "qwen3.6:27b")
+            let both = config([busy, free], strategy: .priority)
+            func waiting(_ n: Int) -> [UUID: AccountResidency] {
+                [busy.id: AccountResidency(occupancy: ServerOccupancy(running: 4, queued: n, totalSlots: 4))]
+            }
+            try expectEqual(order(try route(both, residency: waiting(1))).first, "Busy")
+            let skipped = try route(both, residency: waiting(2))
+            try expectEqual(order(skipped), ["Free"])
+            try expect(skipped.exclusions.contains { $0.reason.contains("2 queued (2 allowed to wait)") })
+        }
+
+        test("where a server reports slots but no queue, Derby's requests beyond them are waiting") {
+            var box = account("Box", kind: .llamaCpp, model: "qwen3.6-27b", capacity: 16)
+            box.rateLimits.maxQueuedRequests = 2
+            let spare = account("Spare", kind: .ollama, model: "qwen3.6:27b")
+            let both = config([box, spare], strategy: .priority)
+            let slots = [box.id: AccountResidency(occupancy: ServerOccupancy(running: 1, totalSlots: 4))]
+            try expectEqual(order(try route(both, load: [box.id: .init(inFlight: 5)], residency: slots)).first, "Box",
+                            "one of Derby's requests is waiting, and two may")
+            let skipped = try route(both, load: [box.id: .init(inFlight: 5, reserved: 1)], residency: slots)
+            try expectEqual(order(skipped), ["Spare"])
+            try expect(skipped.exclusions.contains { $0.reason.contains("4 of 4 slots busy, 2 queued") },
+                       "an old report of one busy slot does not hide what Derby has sent since")
+        }
+
+        test("llama.cpp's metrics add the requests waiting for a slot") {
+            let transport = MockTransport()
+            transport.stub("/slots", json: #"[{"id":0,"is_processing":true},{"id":1,"is_processing":true}]"#)
+            transport.stub("/metrics", json: """
+            # HELP llamacpp:requests_deferred Number of requests deferred.
+            # TYPE llamacpp:requests_deferred gauge
+            llamacpp:requests_processing 2
+            llamacpp:requests_deferred 3
+            """)
+            let busy = try expectNotNil(try await OpenAIAdapter()
+                .occupancy(server(.llamaCpp, "http://127.0.0.1:8080/v1", transport)))
+            try expectEqual(busy.running, 2)
+            try expectEqual(busy.totalSlots, 2)
+            try expectEqual(busy.queued, 3)
+            try expectEqual(busy.summary, "2 of 2 slots busy, 3 queued")
+            try expect(busy.isSaturated(allowingQueued: 3))
+            try expect(!busy.isSaturated(allowingQueued: 4))
+
+            // Started with --no-slots, the metrics alone still say what is waiting.
+            let noSlots = MockTransport()
+            noSlots.stub("/slots", status: 501, json: #"{"error":{"message":"This server does not support slots endpoint."}}"#)
+            noSlots.stub("/metrics", json: "llamacpp:requests_processing 1\nllamacpp:requests_deferred 0")
+            let partial = try expectNotNil(try await OpenAIAdapter()
+                .occupancy(server(.llamaCpp, "http://127.0.0.1:8080/v1", noSlots)))
+            try expectEqual(partial.running, 1)
+            try expectEqual(partial.queued, 0)
+            try expectNil(partial.totalSlots)
+
+            // Neither published: nothing is claimed.
+            let silent = MockTransport()
+            silent.stub("/slots", status: 501, json: "{}")
+            silent.stub("/metrics", status: 501, json: "{}")
+            try expectNil(try await OpenAIAdapter().occupancy(server(.llamaCpp, "http://127.0.0.1:8080/v1", silent)))
+        }
+
         test("the poller keeps what a server did answer when the other probe fails") {
             let transport = MockTransport()
             transport.stub("/metrics", json: "vllm:num_requests_running{model_name=\"m\"} 2.0")
@@ -470,6 +546,17 @@ func registerLoadTests() {
             try expectEqual(decoded.policy.preferWarmModels, false)
             try expectEqual(decoded.policy.strategy, .leastLoaded)
             try expectEqual(decoded.policy.scoreWeights.continuity, 0.4)
+        }
+
+        test("a provider saved before the queue allowance existed allows no waiting") {
+            let limits = try JSONDecoder().decode(RateLimitConfig.self, from: Data(#"{"maxConcurrentRequests":2}"#.utf8))
+            try expectNil(limits.maxQueuedRequests)
+            try expectEqual(limits.allowedQueuedRequests, 0)
+            var edited = limits
+            edited.allowedQueuedRequests = 3
+            let decoded = try JSONDecoder().decode(RateLimitConfig.self, from: JSONEncoder().encode(edited))
+            try expectEqual(decoded.maxQueuedRequests, 3)
+            try expectEqual(decoded.maxConcurrentRequests, 2)
         }
 
         test("a message stored without hand-off fields decodes") {

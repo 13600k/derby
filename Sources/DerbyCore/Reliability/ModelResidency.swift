@@ -82,11 +82,16 @@ public struct ServerOccupancy: Sendable, Hashable, Codable {
 
     /// Nothing more can start without waiting: every slot taken, work already
     /// queued, or the cache that holds a conversation effectively full.
-    public var isSaturated: Bool {
-        if let queued, queued > 0 { return true }
-        if let running, let totalSlots, totalSlots > 0, running >= totalSlots { return true }
-        if let kvCacheUsage, kvCacheUsage >= 0.98 { return true }
-        return false
+    public var isSaturated: Bool { isSaturated(allowingQueued: 0) }
+
+    /// A new request would have to wait, behind at least `allowance` requests
+    /// already waiting. With no allowance, any wait is too long.
+    public func isSaturated(allowingQueued allowance: Int) -> Bool {
+        let waiting = queued ?? 0
+        var wouldWait = waiting > 0
+        if let running, let totalSlots, totalSlots > 0, running >= totalSlots { wouldWait = true }
+        if let kvCacheUsage, kvCacheUsage >= 0.98 { wouldWait = true }
+        return wouldWait && waiting >= max(0, allowance)
     }
 
     /// "3 of 4 slots busy, 2 queued, KV cache 87%" — for an exclusion reason.

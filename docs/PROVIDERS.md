@@ -323,10 +323,12 @@ answer before the client sees it.
 **How busy it is.** The same poll asks what the server is working on, where it will say: vLLM
 and SGLang publish `vllm:num_requests_running` / `waiting` and KV cache use (`kv_cache_usage_perc`
 on v1 engines, `gpu_cache_usage_perc` before that; SGLang's own names under `sglang:`) on
-`/metrics`, and llama.cpp's `/slots` lists one entry per decoding slot. That report counts work
+`/metrics`, and llama.cpp's `/slots` lists one entry per decoding slot while its `/metrics` — served only when
+started with `--metrics` — counts `llamacpp:requests_deferred`, the requests waiting for one. That report counts work
 Derby did not send, which its own in-flight counters cannot see, so routing prefers it whenever
 it is the worse number — and a server with no free slot is passed over while another target can
-answer. Ollama, LM Studio and LocalAI publish no such thing, so their targets are ranked on
+answer, once as many requests are already waiting as the provider's *Queued requests allowed*
+(0 by default). Ollama, LM Studio and LocalAI publish no such thing, so their targets are ranked on
 Derby's own counts alone.
 
 **Add a local server by its own kind.** One added as a *custom OpenAI-compatible* endpoint is

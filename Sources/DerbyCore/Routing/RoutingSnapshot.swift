@@ -96,6 +96,26 @@ public struct RoutingSnapshot: Sendable {
         return occupancy
     }
 
+    /// The server's report with Derby's own traffic folded in. A report can be
+    /// seconds old, and llama.cpp's `/slots` has no queue at all, but requests
+    /// Derby has sent beyond the server's slots are certainly running or waiting.
+    public func effectiveOccupancy(for target: ResolvedTarget) -> ServerOccupancy? {
+        guard var busy = occupancy(for: target) else { return nil }
+        guard let slots = busy.totalSlots, slots > 0 else { return busy }
+        let load = accountLoad[target.account.id] ?? HealthRegistry.AccountLoad()
+        let mine = load.inFlight + load.reserved
+        busy.running = max(busy.running ?? 0, min(mine, slots))
+        if mine > slots { busy.queued = max(busy.queued ?? 0, mine - slots) }
+        return busy
+    }
+
+    /// One more request would wait behind as many requests as the target's
+    /// account allows to queue (`RateLimitConfig.maxQueuedRequests`).
+    public func isSaturated(_ target: ResolvedTarget) -> Bool {
+        let allowance = target.account.rateLimits.allowedQueuedRequests
+        return effectiveOccupancy(for: target)?.isSaturated(allowingQueued: allowance) == true
+    }
+
     /// Share of the target's capacity already committed: requests Derby has in
     /// flight or about to start, or what the server itself reports — whichever
     /// is higher. Derby sees only its own traffic; a server sees everyone's.

@@ -181,7 +181,10 @@ load-bearing rules:
   vLLM, SGLang and llama.cpp publish (an `OccupancyStyle` per kind, never a branch), and
   `loadUtilization` takes whichever is worse. A server reporting no free slot is skipped while
   another target can answer, and kept when it is the only one — queueing beats failing. It is a
-  learned rate limit, so it rides on `respectQuotas` and never becomes a new setting.
+  learned rate limit, so it rides on `respectQuotas`. How much waiting counts as full is
+  the provider's `RateLimitConfig.maxQueuedRequests` (none by default) — the server's whole queue,
+  independent of `maxConcurrentRequests`. Where a server reports slots but no queue,
+  `RoutingSnapshot.effectiveOccupancy` counts Derby's own requests beyond those slots as waiting.
 - `HTTPServer` watches the socket while a handler runs and cancels it on EOF. **Only one
   receive may be outstanding on an `NWConnection`**: the watch and request parsing share
   `pendingReceive`, and each watch is numbered so a stale one cannot act for a later request.

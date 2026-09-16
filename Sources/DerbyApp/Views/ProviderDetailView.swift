@@ -458,20 +458,32 @@ struct ProviderDetailView: View {
     private func limitsCard(_ current: ProviderAccount) -> some View {
         Card(title: "Limits & timeouts", subtitle: "Derby enforces these before contacting the provider",
              systemImage: "speedometer") {
-            AdaptiveGrid(minWidth: 210) {
-                NumberField(label: "Request timeout (s)", value: binding(\.requestTimeoutSeconds),
-                            range: 5...1800, onCommit: save)
-                NumberField(label: "Max concurrent requests",
-                            value: intBinding(\.rateLimits.maxConcurrentRequests),
-                            range: 1...64, onCommit: save)
-                OptionalNumberField(label: "Requests / minute",
-                                    value: optionalIntBinding(\.rateLimits.requestsPerMinute), onCommit: save)
-                OptionalNumberField(label: "Tokens / minute",
-                                    value: optionalIntBinding(\.rateLimits.tokensPerMinute), onCommit: save)
-                OptionalNumberField(label: "Daily request quota",
-                                    value: optionalIntBinding(\.rateLimits.dailyRequestQuota), onCommit: save)
-                OptionalDoubleField(label: "Monthly budget (USD)",
-                                    value: optionalDoubleBinding(\.rateLimits.monthlyCostBudgetUSD), onCommit: save)
+            VStack(alignment: .leading, spacing: 8) {
+                AdaptiveGrid(minWidth: 210) {
+                    NumberField(label: "Request timeout (s)", value: binding(\.requestTimeoutSeconds),
+                                range: 5...1800, onCommit: save)
+                    NumberField(label: "Max concurrent requests",
+                                value: intBinding(\.rateLimits.maxConcurrentRequests),
+                                range: 1...64, onCommit: save)
+                    if current.kind.reportsServerOccupancy {
+                        NumberField(label: "Queued requests allowed",
+                                    value: intBinding(\.rateLimits.allowedQueuedRequests),
+                                    range: 0...256, onCommit: save)
+                    }
+                    OptionalNumberField(label: "Requests / minute",
+                                        value: optionalIntBinding(\.rateLimits.requestsPerMinute), onCommit: save)
+                    OptionalNumberField(label: "Tokens / minute",
+                                        value: optionalIntBinding(\.rateLimits.tokensPerMinute), onCommit: save)
+                    OptionalNumberField(label: "Daily request quota",
+                                        value: optionalIntBinding(\.rateLimits.dailyRequestQuota), onCommit: save)
+                    OptionalDoubleField(label: "Monthly budget (USD)",
+                                        value: optionalDoubleBinding(\.rateLimits.monthlyCostBudgetUSD), onCommit: save)
+                }
+                if current.kind.reportsServerOccupancy {
+                    Text("Queued requests allowed: once every slot is busy and this many requests are already waiting — from any client, not only Derby — routing skips this server for the next target. 0 skips it as soon as a request would wait. It is still used when nothing else can answer. llama.cpp reports its queue only when started with --metrics; without it, Derby counts its own requests beyond the server's slots.")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
         }
     }

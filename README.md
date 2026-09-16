@@ -260,7 +260,8 @@ private servers.
 - **Servers that report their own load are believed.** vLLM, SGLang and llama.cpp publish how
   many requests they are running, how many are queued and how full the KV cache is — including
   work Derby never sent. Derby ranks on it, and passes over a server with no free slot while
-  another target can answer.
+  another target can answer — or, with a per-provider queue allowance, once that many requests
+  are already waiting.
 
 ---
 
