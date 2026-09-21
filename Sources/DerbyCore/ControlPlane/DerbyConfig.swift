@@ -3,7 +3,7 @@ import Foundation
 /// The complete persisted control-plane state. Versioned: `ConfigMigrator`
 /// upgrades older documents in place so a newer Derby can always read them.
 public struct DerbyConfig: Codable, Sendable {
-    public static let currentSchemaVersion = 2
+    public static let currentSchemaVersion = 3
 
     public var schemaVersion: Int
     public var gateway: GatewaySettings
@@ -184,6 +184,32 @@ public enum ConfigMigrator {
                 }
             }
             version = 2
+        }
+
+        // 2 → 3: a provider's timeouts used to be a ceiling only — routing took
+        // `min(logical model, provider)`, so raising an account to 600 s did
+        // nothing while its logical model still said 120 s, and there was no
+        // provider-level first-token setting at all. Both now say how long the
+        // endpoint needs. Accounts written before this have no first-token value
+        // to say it with, so kinds that are slow to speak are given their
+        // declared one; anything the user typed is left exactly as it is.
+        if version == 2 {
+            if var providers = rawObject["providers"] as? [[String: Any]] {
+                var filled: [String] = []
+                for i in providers.indices {
+                    guard providers[i]["firstTokenTimeoutSeconds"] == nil,
+                          let raw = providers[i]["kind"] as? String,
+                          let kind = ProviderKind(rawValue: raw),
+                          let stated = kind.defaultTimeouts.firstTokenSeconds else { continue }
+                    providers[i]["firstTokenTimeoutSeconds"] = stated
+                    filled.append((providers[i]["name"] as? String) ?? kind.displayName)
+                }
+                if !filled.isEmpty {
+                    rawObject["providers"] = providers
+                    notes.append("A provider's timeouts now lengthen what a logical model allows one attempt, instead of only shortening it. \(filled.joined(separator: ", ")) were given a first-token timeout to match, since a server that prefills a long conversation can be silent for minutes before it answers.")
+                }
+            }
+            version = 3
         }
 
         if version > DerbyConfig.currentSchemaVersion {

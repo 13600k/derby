@@ -548,6 +548,9 @@ struct LogicalModelDetailView: View {
                     NumberField(label: "First-token timeout (s)", value: binding(\.timeouts.firstTokenSeconds),
                                 range: 1...600, onCommit: save)
                 }
+                Text("A provider that asks for longer than the per-attempt or first-token figure gets it — a slow endpoint is a fact about the server. The overall timeout is the one ceiling nothing can raise.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 HStack(spacing: 20) {
                     Toggle("Enable failover", isOn: binding(\.failover.enabled))
                         .onChange(of: lm.failover.enabled) { _, _ in save() }

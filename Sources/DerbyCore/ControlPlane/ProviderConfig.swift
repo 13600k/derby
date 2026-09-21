@@ -112,6 +112,29 @@ public enum ProviderKind: String, Codable, Sendable, CaseIterable, Hashable {
         }
     }
 
+    /// How long this kind's endpoints legitimately take, before anything the
+    /// user sets. Derived from what the kind *is*, so a newly added provider
+    /// inherits timing that suits it without routing, execution or the UI
+    /// learning its name — and without another `if kind == …` anywhere.
+    public var defaultTimeouts: AccountTimeouts {
+        // A local server prefills the whole prompt on whatever hardware is in
+        // the box before it emits its first token, and a CLI-backed account has
+        // to spawn a process and run an agent turn first. Either can sit silent
+        // for minutes on a long tool loop and be perfectly healthy.
+        if isLocal || cliCredentialSource != nil {
+            return AccountTimeouts(requestSeconds: 600, firstTokenSeconds: 300)
+        }
+        // Derby cannot guess what is behind a user-supplied endpoint, so it is
+        // patient rather than quick to call one dead.
+        if self == .openAICompatible || self == .bedrock {
+            return AccountTimeouts(requestSeconds: 600, firstTokenSeconds: 180)
+        }
+        // A metered API in front of a warm fleet answers, queues briefly, or
+        // fails — it does not go quiet for minutes, so it asks for nothing and
+        // whichever logical model is routing decides.
+        return .unstated
+    }
+
     /// Subscription-backed accounts are flat-rate: they have a quota, not a bill.
     public var isSubscription: Bool {
         switch self {
@@ -459,7 +482,16 @@ public struct ProviderAccount: Codable, Sendable, Hashable, Identifiable {
     public var baseURLOverride: String?
     public var auth: AuthConfig
     public var extraHeaders: [String: String]
-    public var requestTimeoutSeconds: Double
+    /// Ceiling for one attempt against this endpoint, or nil when this account
+    /// states nothing and the logical model's policy decides alone. Stating one
+    /// *raises* what routing allows — a slow endpoint is a fact about the
+    /// server, not a preference — so it is only ever set deliberately.
+    /// New accounts are seeded from `kind.defaultTimeouts`.
+    public var requestTimeoutSeconds: Double?
+    /// How long this endpoint may stay silent before a stream is called
+    /// stalled, on the same terms. Optional so configurations written before
+    /// this field decode unchanged.
+    public var firstTokenTimeoutSeconds: Double?
     public var connectTimeoutSeconds: Double
     public var rateLimits: RateLimitConfig
     public var models: [PhysicalModel]
@@ -482,7 +514,8 @@ public struct ProviderAccount: Codable, Sendable, Hashable, Identifiable {
     public init(id: UUID = UUID(), name: String, kind: ProviderKind, enabled: Bool = true,
                 baseURLOverride: String? = nil, auth: AuthConfig = .none,
                 extraHeaders: [String: String] = [:],
-                requestTimeoutSeconds: Double = 120,
+                requestTimeoutSeconds: Double? = nil,
+                firstTokenTimeoutSeconds: Double? = nil,
                 connectTimeoutSeconds: Double = 10,
                 rateLimits: RateLimitConfig = .default,
                 models: [PhysicalModel] = [],
@@ -497,6 +530,7 @@ public struct ProviderAccount: Codable, Sendable, Hashable, Identifiable {
         self.baseURLOverride = baseURLOverride; self.auth = auth
         self.extraHeaders = extraHeaders
         self.requestTimeoutSeconds = requestTimeoutSeconds
+        self.firstTokenTimeoutSeconds = firstTokenTimeoutSeconds
         self.connectTimeoutSeconds = connectTimeoutSeconds
         self.rateLimits = rateLimits; self.models = models; self.notes = notes
         self.createdAt = createdAt; self.apiVersion = apiVersion
@@ -517,6 +551,20 @@ public struct ProviderAccount: Codable, Sendable, Hashable, Identifiable {
             ?? kind.defaultBaseURL?.trimmedTrailingSlash
             ?? ""
     }
+    /// What this account asks of routing, and nothing more: a value it does not
+    /// state is left to the logical model rather than filled in from the kind,
+    /// so a provider only ever loosens a timeout on purpose.
+    public var statedTimeouts: AccountTimeouts {
+        AccountTimeouts(requestSeconds: requestTimeoutSeconds.flatMap { $0 > 0 ? $0 : nil },
+                        firstTokenSeconds: firstTokenTimeoutSeconds.flatMap { $0 > 0 ? $0 : nil })
+    }
+
+    /// A concrete duration for work that is not a routed attempt — discovery,
+    /// health checks, connection tests — which have no logical model to consult.
+    public var outOfBandTimeoutSeconds: Double {
+        requestTimeoutSeconds ?? kind.defaultTimeouts.requestSeconds ?? 300
+    }
+
     public func model(id: UUID) -> PhysicalModel? { models.first { $0.id == id } }
     public func model(modelID: String) -> PhysicalModel? { models.first { $0.modelID == modelID } }
 }

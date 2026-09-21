@@ -197,6 +197,31 @@ can never be orphaned from their `tool` results — providers reject that shape 
 is never silent: `x_derby.compaction`, the `x-derby-compacted` header, the routing
 explanation and request history all carry it.
 
+### Timeouts
+
+Timeouts come from two scopes that mean different things, and are combined in exactly one
+place — `ResolvedTimeouts.resolve`, which the router calls per attempt. A logical model's
+`TimeoutConfig` is the **caller's patience**; a provider account's `AccountTimeouts` is the
+**endpoint's requirement**. They are not two ceilings on one quantity, so they are not
+`min`'d: an attempt gets the **longer** of the two. A `min` meant a provider setting could
+only ever make Derby stricter — an account raised to 600s changed nothing while its logical
+model still said 120s — and there was no account-level first-token setting at all, so a local
+server prefilling a long tool loop was declared stalled at the logical model's figure however
+the provider was configured.
+
+- **A provider that says nothing loosens nothing.** `ProviderAccount`'s timeouts are optional;
+  unset means the logical model decides alone and can be the stricter of the pair, which is
+  what keeps a `fast`-style policy able to fail over quickly.
+- **`overallSeconds` is the one ceiling nothing can raise.** Only the logical model sets it,
+  the resolver clamps to it and the executor clips every wait by what is left of it.
+- **A kind declares its own timing once**, in `ProviderKind.defaultTimeouts`, and
+  `ProviderFactory` seeds new accounts from it — so a provider kind added later is right from
+  creation with no `if kind == …` in routing, execution or the UI. Metered APIs declare
+  nothing; local servers and CLI-backed accounts, which prefill or spawn before they speak,
+  declare that they need minutes.
+- **The first-token wait is per attempt, not per plan** (`PlannedAttempt.firstTokenTimeout`),
+  because how long a server takes to say anything is a property of that server.
+
 ### Streaming
 
 Failover is only transparent *before* the first byte reaches the client. Once content has
@@ -312,7 +337,13 @@ base URL and quirk flags — do not add a new adapter for these.
   Swift dictionary's key order changes between instances, and the same tool schemas came out
   reordered on nearly every turn — and name the conversation with
   `CanonicalRequest.conversationID(scope:)`, never a per-request id. With neither, a 55-step
-  tool loop on ChatGPT had 0% of its input cached where the Codex CLI had 94%.
+  tool loop on ChatGPT had 0% of its input cached where the Codex CLI had 94%. The bytes rule is
+  every adapter's, not ChatGPT's: a local server keys its cache on the prompt alone, and its chat
+  template renders objects in the order their keys arrived. `OpenAIAdapter` kept a plain
+  `JSONEncoder` after ChatGPT's was fixed, and Qwen on vLLM never read more than 1,600 tokens of a
+  40K-token Hermes loop from its prefix cache. `AnthropicAdapter`, `GoogleAdapter` and
+  `BedrockAdapter` still encode that way. `PromptCacheTests` checks a *growing* loop, not only a
+  repeated request: each step must arrive as the step before plus what is new.
 - **The look lives in `Views/Glass.swift`, and no other file branches on macOS
   version.** Derby's surfaces are tinted glass stained with `Color.derbyAccent`
   (teal, `#008080`). macOS 26 renders them as real Liquid Glass (`glassEffect`,

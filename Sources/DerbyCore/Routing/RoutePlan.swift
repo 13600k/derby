@@ -7,6 +7,10 @@ public struct PlannedAttempt: Sendable {
     /// Ceiling for this attempt; the executor further caps it by the remaining
     /// overall budget.
     public var timeout: Double
+    /// How long this attempt's target may stay silent before its stream counts
+    /// as stalled. Per attempt, not per plan, because how long a server takes to
+    /// say anything is a property of that server.
+    public var firstTokenTimeout: Double
     public var maxRetries: Int
     public var score: Double
     public var rank: Int
@@ -19,6 +23,9 @@ public struct RoutePlan: Sendable {
     public var logicalModelName: String
     public var attempts: [PlannedAttempt]
     public var overallDeadlineSeconds: Double
+    /// The logical model's stated first-token wait. The executor reads
+    /// `PlannedAttempt.firstTokenTimeout` instead, which folds in what the
+    /// target's own endpoint needs; this is kept for display and explanation.
     public var firstTokenTimeoutSeconds: Double
     public var retry: RetryConfig
     public var failover: FailoverConfig
@@ -145,6 +152,8 @@ public struct RoutingDecision: Sendable {
         lines.append("")
         if let s = plan.attempts.first {
             lines.append("Selected: \(s.target.label)")
+            lines.append("Budget: overall \(plan.overallDeadlineSeconds.msString), "
+                         + "attempt \(s.timeout.msString), first token \(s.firstTokenTimeout.msString)")
         } else {
             lines.append("Selected: none")
         }

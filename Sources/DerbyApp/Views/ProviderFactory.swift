@@ -22,13 +22,13 @@ enum ProviderFactory {
         } else {
             account.auth = .apiKey(.new("provider.key"))
         }
-        if kind.isLocal { account.requestTimeoutSeconds = 600 }
-        if kind == .claudeCodeCLI {
-            // Spawning a process and running an agent turn is slower than one
-            // HTTP round trip.
-            account.requestTimeoutSeconds = 600
-            account.rateLimits.maxConcurrentRequests = 2
-        }
+        // Every kind declares its own timing in one place, so a kind added
+        // later is right from creation without another branch here. The numbers
+        // land in the account, where they are visible and editable rather than
+        // applied invisibly.
+        account.requestTimeoutSeconds = kind.defaultTimeouts.requestSeconds
+        account.firstTokenTimeoutSeconds = kind.defaultTimeouts.firstTokenSeconds
+        if kind == .claudeCodeCLI { account.rateLimits.maxConcurrentRequests = 2 }
         if kind.isSubscription { account.preferenceScore = 70 }
         // Seed the models a subscription backend is known to serve, since it
         // cannot be asked.

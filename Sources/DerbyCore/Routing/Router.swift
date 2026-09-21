@@ -335,13 +335,19 @@ public struct Router: Sendable {
         }
 
         // 8. Build the plan.
-        let attempts = ranked.enumerated().map { i, r in
-            PlannedAttempt(target: r.target,
-                           timeout: r.target.ref.timeoutOverrideSeconds
-                               ?? min(lm.timeouts.perAttemptSeconds, r.target.account.requestTimeoutSeconds),
-                           maxRetries: lm.retry.maxRetriesPerTarget,
-                           score: r.score,
-                           rank: i)
+        let attempts = ranked.enumerated().map { i, r -> PlannedAttempt in
+            // The caller's patience and the endpoint's requirement are joined in
+            // one place, so every target — including one from a provider kind
+            // added after this line was written — gets timing it can meet.
+            let timeouts = ResolvedTimeouts.resolve(logicalModel: lm.timeouts,
+                                                    account: r.target.account.statedTimeouts,
+                                                    targetOverrideSeconds: r.target.ref.timeoutOverrideSeconds)
+            return PlannedAttempt(target: r.target,
+                                  timeout: timeouts.attemptSeconds,
+                                  firstTokenTimeout: timeouts.firstTokenSeconds,
+                                  maxRetries: lm.retry.maxRetriesPerTarget,
+                                  score: r.score,
+                                  rank: i)
         }
         // A strict chain never runs targets in parallel.
         var hedging = lm.hedging

@@ -48,7 +48,7 @@ public struct ChatGPTCodexAdapter: ProviderAdapter {
         h["accept"] = "application/json"
         let response = try await ctx.transport.send(OutboundRequest(
             url: u, method: "GET", headers: h,
-            timeout: min(ctx.account.requestTimeoutSeconds, 30), allowInsecureTLS: false))
+            timeout: min(ctx.account.outOfBandTimeoutSeconds, 30), allowInsecureTLS: false))
         guard (200..<300).contains(response.status) else {
             throw classifyError(status: response.status, headers: response.headers,
                                 body: response.body, model: "")

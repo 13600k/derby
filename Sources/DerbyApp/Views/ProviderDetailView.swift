@@ -481,12 +481,19 @@ struct ProviderDetailView: View {
     }
 
     private func limitsCard(_ current: ProviderAccount) -> some View {
-        Card(title: "Limits & timeouts", subtitle: "Derby enforces these before contacting the provider",
+        Card(title: "Limits & timeouts",
+             subtitle: "How long this endpoint needs. A timeout set here lengthens what a logical model allows one attempt; its overall deadline still bounds the request",
              systemImage: "speedometer") {
             VStack(alignment: .leading, spacing: 8) {
                 AdaptiveGrid(minWidth: 210) {
-                    NumberField(label: "Request timeout (s)", value: binding(\.requestTimeoutSeconds),
-                                range: 5...1800, onCommit: save)
+                    OptionalDoubleField(label: "Request timeout (s)",
+                                        value: optionalDoubleBinding(\.requestTimeoutSeconds),
+                                        placeholder: Self.placeholder(current.kind.defaultTimeouts.requestSeconds),
+                                        onCommit: save)
+                    OptionalDoubleField(label: "First-token timeout (s)",
+                                        value: optionalDoubleBinding(\.firstTokenTimeoutSeconds),
+                                        placeholder: Self.placeholder(current.kind.defaultTimeouts.firstTokenSeconds),
+                                        onCommit: save)
                     NumberField(label: "Max concurrent requests",
                                 value: intBinding(\.rateLimits.maxConcurrentRequests),
                                 range: 1...64, onCommit: save)
@@ -562,6 +569,12 @@ struct ProviderDetailView: View {
     private func optionalIntBinding(_ keyPath: WritableKeyPath<ProviderAccount, Int?>) -> Binding<Int?> {
         Binding(get: { draft?[keyPath: keyPath] ?? nil }, set: { draft?[keyPath: keyPath] = $0 })
     }
+    /// Shows what a blank field means: the kind's suggestion, or that the
+    /// logical model decides alone.
+    private static func placeholder(_ seconds: Double?) -> String {
+        seconds.map { "\(Int($0))" } ?? "logical model decides"
+    }
+
     private func optionalDoubleBinding(_ keyPath: WritableKeyPath<ProviderAccount, Double?>) -> Binding<Double?> {
         Binding(get: { draft?[keyPath: keyPath] ?? nil }, set: { draft?[keyPath: keyPath] = $0 })
     }

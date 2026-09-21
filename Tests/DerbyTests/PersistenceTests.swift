@@ -109,7 +109,7 @@ func registerPersistenceTests() {
                             "allowedOrigins": []],
             ]
             let notes = ConfigMigrator.migrate(rawObject: &raw)
-            try expectEqual(raw["schemaVersion"] as? Int, 2)
+            try expectEqual(raw["schemaVersion"] as? Int, DerbyConfig.currentSchemaVersion)
             try expectEqual((raw["gateway"] as? [String: Any])?["requireAPIKey"] as? Bool, false)
             try expect(notes.contains { $0.contains("no longer need") })
         }
@@ -123,7 +123,7 @@ func registerPersistenceTests() {
                             "allowedOrigins": []],
             ]
             let notes = ConfigMigrator.migrate(rawObject: &raw)
-            try expectEqual(raw["schemaVersion"] as? Int, 2)
+            try expectEqual(raw["schemaVersion"] as? Int, DerbyConfig.currentSchemaVersion)
             try expectEqual((raw["gateway"] as? [String: Any])?["requireAPIKey"] as? Bool, true,
                             "a LAN-reachable gateway must not be opened up by a migration")
             try expect(notes.contains { $0.contains("left on") })

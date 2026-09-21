@@ -30,7 +30,7 @@ public struct GoogleAdapter: ProviderAdapter {
         let auth = try await authenticate(ctx)
         let u = try url(ctx, path: "models", auth: auth, extraQuery: ["pageSize": "200"])
         let req = OutboundRequest(url: u, method: "GET", headers: headers(ctx, auth: auth),
-                                  timeout: min(ctx.account.requestTimeoutSeconds, 30),
+                                  timeout: min(ctx.account.outOfBandTimeoutSeconds, 30),
                                   allowInsecureTLS: ctx.account.allowInsecureTLS)
         let resp = try await ctx.transport.send(req)
         guard (200..<300).contains(resp.status) else {

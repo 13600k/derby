@@ -602,8 +602,10 @@ public final class Executor: Sendable {
                                           modelCapabilities: target.capabilities)
                 // Opening the stream (headers + auth) is bounded by the
                 // first-token timeout; the body is bounded by the attempt timeout.
-                let events = try await withDeadline(min(plan.firstTokenTimeoutSeconds, timeout),
-                                                    message: "\(target.label) did not start streaming within \(plan.firstTokenTimeoutSeconds.msString)") {
+                // Both come from the attempt, not the plan: they already fold in
+                // what this target's endpoint needs.
+                let events = try await withDeadline(min(planned.firstTokenTimeout, timeout),
+                                                    message: "\(target.label) did not start streaming within \(planned.firstTokenTimeout.msString)") {
                     try await adapter.stream(outbound, model: target.modelID, ctx: ctx)
                 }
                 continuation.yield(.attemptStarted(target: target, attemptIndex: attemptIndex))
@@ -629,10 +631,10 @@ public final class Executor: Sendable {
                     if budget <= 0 { throw DerbyError.timeout("Request budget exhausted mid-stream.") }
                     // Until the first token arrives the tighter first-token
                     // timeout applies, so a silent provider fails over quickly.
-                    let waitFor = sawContent ? min(planned.timeout, budget) : min(plan.firstTokenTimeoutSeconds, budget)
+                    let waitFor = sawContent ? min(planned.timeout, budget) : min(planned.firstTokenTimeout, budget)
                     let stalled = sawContent
                     let label = target.label
-                    let firstTokenLimit = plan.firstTokenTimeoutSeconds
+                    let firstTokenLimit = planned.firstTokenTimeout
                     let next = try await channel.next(
                         timeout: waitFor,
                         timeoutMessage: stalled

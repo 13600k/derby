@@ -8,6 +8,7 @@ func registerAllTests() {
     registerRoutingTests()
     registerStrategyTests()
     registerExecutionTests()
+    registerTimeoutTests()
     registerReliabilityTests()
     registerProviderTests()
     registerAPIKeyTests()

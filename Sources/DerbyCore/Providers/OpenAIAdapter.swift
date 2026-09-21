@@ -203,7 +203,7 @@ public struct OpenAIAdapter: ProviderAdapter {
             let native = try await OllamaDiscovery.listModels(
                 baseURL: auth.baseURLOverride ?? ctx.account.baseURL,
                 transport: ctx.transport,
-                timeout: min(ctx.account.requestTimeoutSeconds, 30),
+                timeout: min(ctx.account.outOfBandTimeoutSeconds, 30),
                 allowInsecureTLS: ctx.account.allowInsecureTLS,
                 headers: headers(ctx, auth: auth))
             // Complete anything the server did not state from the bundled catalog.
@@ -218,7 +218,7 @@ public struct OpenAIAdapter: ProviderAdapter {
 
         let u = try url(ctx, path: q.listModelsPath, auth: auth)
         let req = OutboundRequest(url: u, method: "GET", headers: headers(ctx, auth: auth),
-                                  timeout: min(ctx.account.requestTimeoutSeconds, 30),
+                                  timeout: min(ctx.account.outOfBandTimeoutSeconds, 30),
                                   allowInsecureTLS: ctx.account.allowInsecureTLS)
         let resp = try await ctx.transport.send(req)
         guard (200..<300).contains(resp.status) else {
@@ -239,7 +239,7 @@ public struct OpenAIAdapter: ProviderAdapter {
                 guard let propsURL = components?.url,
                       let response = try? await ctx.transport.send(OutboundRequest(
                         url: propsURL, method: "GET", headers: headers(ctx, auth: auth),
-                        timeout: min(ctx.account.requestTimeoutSeconds, 30),
+                        timeout: min(ctx.account.outOfBandTimeoutSeconds, 30),
                         allowInsecureTLS: ctx.account.allowInsecureTLS)),
                       (200..<300).contains(response.status), let props = response.bodyJSON
                 else { continue }
@@ -833,8 +833,11 @@ public struct OpenAIAdapter: ProviderAdapter {
         }
     }
 
+    /// Byte-stable: a vLLM or llama.cpp chat template renders objects in the key
+    /// order they arrived in, so a reordered key is a different prompt and
+    /// nothing after it is served from the server's prefix cache.
     private func encode(_ v: JSONValue) throws -> Data {
-        try JSONEncoder().encode(v)
+        try v.stableJSONData()
     }
 
     func buildChatBody(_ r: CanonicalRequest, model: String, quirks q: OpenAIQuirks, stream: Bool,
