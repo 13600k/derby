@@ -12,8 +12,7 @@ public struct GoogleAdapter: ProviderAdapter {
         case .apiKey(let ref):
             auth.headers["x-goog-api-key"] = try requireSecret(ref, ctx: ctx, label: "API key")
         case .cli(let source, let allowRefresh):
-            let cred = try await ctx.credentials.credential(for: source, allowRefresh: allowRefresh,
-                                                             home: ctx.account.credentialHomeURL)
+            let cred = try await ctx.cliCredential(source, allowRefresh: allowRefresh)
             auth.headers["authorization"] = "Bearer \(cred.accessToken)"
         case .customHeader(let name, let ref, let prefix):
             let v = try requireSecret(ref, ctx: ctx, label: "credential")

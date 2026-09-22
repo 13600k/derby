@@ -16,8 +16,7 @@ public struct ChatGPTCodexAdapter: ProviderAdapter {
             throw DerbyError(kind: .authentication,
                              message: "\(ctx.account.name) must be linked to the Codex CLI. Run `codex login`, then re-test the connection.")
         }
-        let cred = try await ctx.credentials.credential(for: source, allowRefresh: allowRefresh,
-                                                             home: ctx.account.credentialHomeURL)
+        let cred = try await ctx.cliCredential(source, allowRefresh: allowRefresh)
         guard let accountID = cred.accountID, !accountID.isEmpty else {
             throw DerbyError(kind: .authentication,
                              message: "The Codex credentials do not contain a ChatGPT account id. Run `codex login` again.")

@@ -54,6 +54,17 @@ public struct OpenAIQuirks: Sendable {
         case llamaCppProps
     }
     public var propsStyle: PropsStyle = .unreported
+    /// Where the account's allowance can be read with the key it infers with.
+    /// Most metered APIs publish nothing an inference key may read; their
+    /// meters sit behind an admin key or a signed-in console.
+    public enum UsageStyle: Sendable {
+        case unreported
+        /// OpenRouter's `/key`: the key's credit limit and what it has spent.
+        case openRouterKey
+        /// DeepSeek's `/user/balance`.
+        case deepSeekBalance
+    }
+    public var usageStyle: UsageStyle = .unreported
     /// Whether Derby may learn a model's capabilities by *asking* the server —
     /// one tiny request per feature, at discovery time only.
     ///
@@ -90,10 +101,13 @@ public struct OpenAIQuirks: Sendable {
             q.defaultHeaders = ["http-referer": "https://github.com/derby-gateway",
                                 "x-title": "Derby"]
             q.supportsReasoningEffort = true
+            q.usageStyle = .openRouterKey
         case .groq:
             q.supportsPenalties = true
             q.supportsJSONSchema = true
-        case .mistral, .deepseek, .together, .fireworks, .xai:
+        case .deepseek:
+            q.usageStyle = .deepSeekBalance
+        case .mistral, .together, .fireworks, .xai:
             break
         case .qwen:
             q.supportsParallelToolCalls = false
@@ -151,7 +165,7 @@ public struct OpenAIAdapter: ProviderAdapter {
     public let family: AdapterFamily = .openai
     public init() {}
 
-    private func quirks(_ ctx: ProviderContext) -> OpenAIQuirks {
+    func quirks(_ ctx: ProviderContext) -> OpenAIQuirks {
         OpenAIQuirks.forKind(ctx.account.kind, account: ctx.account)
     }
 
@@ -177,8 +191,7 @@ public struct OpenAIAdapter: ProviderAdapter {
             auth.headers[name.lowercased()] = prefix.isEmpty ? key : "\(prefix)\(key)"
         case .cli(let source, let allowRefresh):
             // Qwen's OAuth flow yields an OpenAI-compatible endpoint + bearer token.
-            let cred = try await ctx.credentials.credential(for: source, allowRefresh: allowRefresh,
-                                                             home: ctx.account.credentialHomeURL)
+            let cred = try await ctx.cliCredential(source, allowRefresh: allowRefresh)
             auth.headers["authorization"] = "Bearer \(cred.accessToken)"
             if let r = cred.resourceURL, ctx.account.baseURLOverride == nil {
                 auth.baseURLOverride = r.hasSuffix("/v1") ? r : r.trimmedTrailingSlash + "/v1"

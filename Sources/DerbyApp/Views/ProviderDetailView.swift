@@ -516,7 +516,45 @@ struct ProviderDetailView: View {
                         .font(.caption).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
+                if showsPlanLimits(current) { planLimits }
             }
+        }
+    }
+
+    /// A plan's allowance, for a provider that meters one but will not report
+    /// it. Hidden once the provider is reporting its own meter, since Derby's
+    /// count would never be shown against these.
+    private func showsPlanLimits(_ current: ProviderAccount) -> Bool {
+        !current.kind.isLocal && model.providerUsage[current.id]?.usage?.source != .provider
+    }
+
+    private var planLimits: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Divider().padding(.vertical, 4)
+            Text("Plan allowance").font(.callout.weight(.medium))
+            AdaptiveGrid(minWidth: 210) {
+                OptionalNumberField(label: "Requests / 5 hours",
+                                    value: optionalIntBinding(\.rateLimits.planRequestsPer5Hours),
+                                    onCommit: savePlanLimits)
+                OptionalNumberField(label: "Requests / week",
+                                    value: optionalIntBinding(\.rateLimits.planRequestsPerWeek),
+                                    onCommit: savePlanLimits)
+                OptionalNumberField(label: "Requests / month",
+                                    value: optionalIntBinding(\.rateLimits.planRequestsPerMonth),
+                                    onCommit: savePlanLimits)
+            }
+            Text("For plans that meter requests but do not report them to an API key, such as Qwen Cloud's Coding Plan. The Overview shows the successful requests Derby sent this account in the last 5 hours, 7 days and 30 days against these figures. Requests sent from outside Derby are not counted. Routing does not use these fields.")
+                .font(.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    /// The dashboard's count is recomputed against the new figures once they
+    /// have landed, rather than at the next poll.
+    private func savePlanLimits() {
+        Task {
+            await saveNow()
+            await model.refreshProviderUsage()
         }
     }
 

@@ -13,23 +13,36 @@ public struct ProviderContext: Sendable {
     /// Resolved metadata for the model being called, so an adapter can omit a
     /// parameter this model would reject rather than sending it and failing.
     public let modelCapabilities: ModelCapabilities?
+    /// False for work nobody asked for — a background poll — which must not
+    /// put a Keychain dialog in front of the user. See `CredentialCache`.
+    public let mayPromptForCredentials: Bool
 
     public init(account: ProviderAccount, transport: any HTTPTransport,
                 secrets: any SecretStore, credentials: CredentialCache,
                 attemptTimeout: Double = 120,
-                modelCapabilities: ModelCapabilities? = nil) {
+                modelCapabilities: ModelCapabilities? = nil,
+                mayPromptForCredentials: Bool = true) {
         self.account = account
         self.transport = transport
         self.secrets = secrets
         self.credentials = credentials
         self.attemptTimeout = attemptTimeout
         self.modelCapabilities = modelCapabilities
+        self.mayPromptForCredentials = mayPromptForCredentials
     }
 
     public func with(timeout: Double) -> ProviderContext {
         ProviderContext(account: account, transport: transport, secrets: secrets,
                         credentials: credentials, attemptTimeout: timeout,
-                        modelCapabilities: modelCapabilities)
+                        modelCapabilities: modelCapabilities,
+                        mayPromptForCredentials: mayPromptForCredentials)
+    }
+
+    /// The account's CLI login, read the way this context allows.
+    public func cliCredential(_ source: CLICredentialSource, allowRefresh: Bool) async throws -> CLICredential {
+        try await credentials.credential(for: source, allowRefresh: allowRefresh,
+                                         home: account.credentialHomeURL,
+                                         allowKeychain: mayPromptForCredentials)
     }
 
     /// Whether a parameter may be sent to this model. Unknown models allow
@@ -140,6 +153,11 @@ public protocol ProviderAdapter: Sendable {
 
     /// Extract rate-limit state from response headers, when the provider sends it.
     func rateLimitSnapshot(from headers: [String: String]) -> RateLimitSnapshot?
+
+    /// The account's plan meter — five-hour and weekly windows, balances — as
+    /// the provider reports it. Nil when this provider publishes none, which
+    /// is not an error: Derby then shows its own count instead.
+    func usage(_ ctx: ProviderContext) async throws -> ProviderUsage?
 }
 
 // MARK: - Shared defaults
@@ -166,6 +184,8 @@ extension ProviderAdapter {
     public func loadedModels(_ ctx: ProviderContext) async throws -> Set<String>? { nil }
 
     public func occupancy(_ ctx: ProviderContext) async throws -> ServerOccupancy? { nil }
+
+    public func usage(_ ctx: ProviderContext) async throws -> ProviderUsage? { nil }
 
     /// Default health check: list models, which exercises both connectivity and
     /// credentials without spending tokens.
@@ -267,9 +287,24 @@ public actor CredentialCache {
 
     public init() {}
 
+    /// `allowKeychain: false` is for background work nobody asked for: a login
+    /// kept in the Keychain is then taken only from what an earlier read left
+    /// here, or from the CLI's file copy, and never refreshed — refreshing from
+    /// a stale copy would rotate the token out from under the CLI. It is
+    /// checked before any read in flight, which may itself be waiting on a
+    /// dialog.
     public func credential(for source: CLICredentialSource, allowRefresh: Bool,
-                           home: URL? = nil) async throws -> CLICredential {
+                           home: URL? = nil, allowKeychain: Bool = true) async throws -> CLICredential {
         let key = Key(source: source, home: home?.standardizedFileURL.path)
+        if !allowKeychain && CLICredentialReader.usesKeychain(source, home: home) {
+            if let e = entries[key], !e.credential.isExpired() { return e.credential }
+            if let file = try? CLICredentialReader.read(source, home: home, allowKeychain: false),
+               !file.isExpired() {
+                return file
+            }
+            throw DerbyError(kind: .authentication,
+                             message: "Derby has not read the \(source.displayName) login yet. It is kept in the Keychain, which Derby opens only to serve a request or when you press Refresh on the Overview.")
+        }
         if let existing = inFlight[key] { return try await existing.value }
 
         if let e = entries[key],

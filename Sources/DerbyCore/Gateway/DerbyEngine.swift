@@ -36,8 +36,12 @@ public actor DerbyEngine {
     public nonisolated let residency = ResidencyRegistry()
     /// Who wrote each answer, shared by the gateway and the executor.
     public nonisolated let handoffLedger = HandoffLedger()
+    /// Each cloud account's plan meter, for the dashboard. Polled only once
+    /// `startUsagePolling` is called, so an engine a test boots stays quiet.
+    public nonisolated let usageMonitor: UsageMonitor
     private let adapters: AdapterRegistry
     private var residencyTask: Task<Void, Never>?
+    private var usageTask: Task<Void, Never>?
 
     private let state: ControlPlaneState
     private var server = HTTPServer()
@@ -68,9 +72,25 @@ public actor DerbyEngine {
 
         if loaded.isFirstRun { config.app.hasCompletedOnboarding = false }
 
-        self.state = ControlPlaneState(config: config)
-        self.telemetry = telemetry ?? TelemetryStore(settings: config.logging)
+        let state = ControlPlaneState(config: config)
+        let telemetry = telemetry ?? TelemetryStore(settings: config.logging)
+        self.state = state
+        self.telemetry = telemetry
         self.healthRegistry = HealthRegistry(settings: config.health)
+
+        let transport = self.transport, secrets = self.secrets, credentials = self.credentials
+        self.usageMonitor = UsageMonitor(
+            accounts: { await state.currentConfig().providers },
+            fetch: { account, interactive in
+                let ctx = ProviderContext(account: account, transport: transport, secrets: secrets,
+                                          credentials: credentials, attemptTimeout: 20,
+                                          mayPromptForCredentials: interactive)
+                return try await adapters.adapter(for: account.kind).usage(ctx)
+            },
+            tallies: { since in await telemetry.requestTallies(since: since) },
+            log: { level, message in
+                await telemetry.log(LogEntry(level: level, category: "usage", message: message))
+            })
     }
 
     public func bootstrap() async {
@@ -235,6 +255,32 @@ public actor DerbyEngine {
                 }
             }
         }
+    }
+
+    // MARK: - Plan usage
+
+    /// Keeps `usageMonitor` current for as long as the app runs, gateway or
+    /// not: a plan's meter is worth seeing while nothing is being routed.
+    public func startUsagePolling() {
+        usageTask?.cancel()
+        let monitor = usageMonitor
+        usageTask = Task.detached(priority: .utility) {
+            while !Task.isCancelled {
+                await monitor.refresh()
+                try? await Task.sleep(nanoseconds: UInt64(UsageMonitor.tickInterval * 1_000_000_000))
+            }
+        }
+    }
+
+    /// Reads every meter now, unless it was read in the last half minute.
+    /// Something the user asked for, so a login kept in the Keychain may be
+    /// read — and the system may ask first.
+    public func refreshProviderUsage() async {
+        await usageMonitor.refresh(force: true)
+    }
+
+    public func providerUsage() async -> [UUID: ProviderUsageStatus] {
+        await usageMonitor.snapshot()
     }
 
     /// The local key, generating and storing one on first use. Only call this

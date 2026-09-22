@@ -31,8 +31,7 @@ public struct AnthropicAdapter: ProviderAdapter {
 
         switch ctx.account.auth {
         case .cli(let source, let allowRefresh):
-            let cred = try await ctx.credentials.credential(for: source, allowRefresh: allowRefresh,
-                                                             home: ctx.account.credentialHomeURL)
+            let cred = try await ctx.cliCredential(source, allowRefresh: allowRefresh)
             auth.headers["authorization"] = "Bearer \(cred.accessToken)"
             // The bearer token is only half of it: Anthropic reads the betas,
             // the user-agent and `x-app` to decide *which client* is calling.

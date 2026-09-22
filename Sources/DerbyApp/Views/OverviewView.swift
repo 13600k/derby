@@ -8,7 +8,10 @@ struct OverviewView: View {
     var body: some View {
         Page(title: "Overview", subtitle: "One endpoint outward. Many providers inward.") {
             Button {
-                Task { await model.refreshAll() }
+                Task {
+                    await model.refreshAll()
+                    await model.refreshProviderUsage()
+                }
             } label: {
                 Label("Refresh", systemImage: "arrow.clockwise")
             }
@@ -197,7 +200,7 @@ struct OverviewView: View {
     // MARK: - Providers
 
     private var providerHealthCard: some View {
-        Card(title: "Provider health", subtitle: "Live target state", systemImage: "server.rack") {
+        Card(title: "Provider health", subtitle: "Live target state and plan usage", systemImage: "server.rack") {
             if model.config.providers.isEmpty {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("No providers configured yet.")
@@ -209,16 +212,26 @@ struct OverviewView: View {
                 VStack(spacing: 6) {
                     ForEach(model.providerHealthSummaries) { summary in
                         Button { selection = .providers } label: {
-                            HStack(spacing: 10) {
-                                Image(systemName: summary.worstState.symbol)
-                                    .foregroundStyle(summary.account.enabled ? summary.worstState.tint : .secondary)
-                                VStack(alignment: .leading, spacing: 1) {
-                                    Text(summary.account.name).font(.callout.weight(.medium))
-                                    Text(summary.account.kind.displayName)
-                                        .font(.caption).foregroundStyle(.secondary)
+                            VStack(alignment: .leading, spacing: 8) {
+                                HStack(spacing: 10) {
+                                    Image(systemName: summary.worstState.symbol)
+                                        .foregroundStyle(summary.account.enabled ? summary.worstState.tint : .secondary)
+                                        .frame(width: 16)
+                                    VStack(alignment: .leading, spacing: 1) {
+                                        Text(summary.account.name).font(.callout.weight(.medium))
+                                        Text(summary.account.kind.displayName)
+                                            .font(.caption).foregroundStyle(.secondary)
+                                    }
+                                    Spacer()
+                                    if summary.usage?.usage?.isLimited == true {
+                                        StatusPill(text: "LIMIT REACHED", tint: .red)
+                                    }
+                                    Text(summary.detail).font(.caption).foregroundStyle(.secondary)
                                 }
-                                Spacer()
-                                Text(summary.detail).font(.caption).foregroundStyle(.secondary)
+                                if let usage = summary.usage {
+                                    PlanUsageView(status: usage)
+                                        .padding(.leading, 26)
+                                }
                             }
                             .rowStyle()
                         }

@@ -21,7 +21,7 @@ Pure SwiftPM, **no third-party dependencies**. Only the Command Line Tools are r
 ```bash
 swift build                        # debug build of DerbyCore + DerbyApp
 swift build -c release             # release build
-swift run DerbyTests               # all 453 tests (~5s, no network)
+swift run DerbyTests               # all 592 tests (~7s, no network)
 swift run DerbyTests Routing       # filter by suite or test name
 DERBY_LIVE=1 swift run DerbyTests Live   # opt-in: this machine's real providers
 
@@ -180,6 +180,35 @@ Three rules keep it honest:
   page 1. `refresh` walks the pages and caches them as one document, stopping early if a
   page repeats what is already held (a server ignoring `page`) so a per-request quota is not
   spent re-reading it.
+
+### Plan usage
+
+The Overview's provider rows show each cloud account's plan meter — five-hour and weekly
+windows, per-model caps, balances. `ProviderAdapter.usage` reads it (nil means the provider
+publishes none; OpenAI-compatible kinds declare theirs as `OpenAIQuirks.UsageStyle`), and
+`UsageMonitor` polls it every five minutes. Display only: the router never reads it.
+
+- **A poll never opens the Keychain.** A background read runs with
+  `ProviderContext.mayPromptForCredentials == false`, so the default Claude login comes only
+  from what a request already cached or the CLI's file; only the Overview's Refresh button may
+  prompt. The first version read it at launch and put a Keychain dialog up the moment a rebuilt
+  app started — and because `withDeadline`'s task group waits for its child, a read blocked on
+  that dialog held back every other account's meter too. Meter reads go through
+  `withAbandoningDeadline`, which returns at the deadline and leaves the stuck read behind.
+- **One login, one read.** Accounts on the same CLI login (the Claude Code CLI and the
+  direct-API path) spend one allowance; the monitor reads it once and gives both the answer.
+  Anthropic's `/api/oauth/usage` answers bursts with 429s, and without Claude Code's
+  `user-agent` it answers almost everything with one.
+- **Windows are named by length, never by slot.** The ChatGPT backend puts a weekly-only
+  plan's single window in the slot a five-hour window usually fills. Claude's utilization is a
+  percentage (`1.0` is 1%), and its per-model weekly caps moved from `seven_day_<model>` keys
+  into `limits[]`; both forms are read.
+- **No meter means Derby's own count, labelled as such.** Qwen Cloud's Coding Plan meters
+  requests per five hours, week and month but answers its quota endpoint only to a signed-in
+  console, never an API key, and sends no rate-limit headers. For a provider like that the
+  dashboard shows successful requests Derby routed there over rolling windows, against the
+  limits the user typed into `RateLimitConfig.planRequestsPer*`. It never passes for the
+  provider's figure, because it cannot see traffic sent from anywhere else.
 
 ### Context compaction
 

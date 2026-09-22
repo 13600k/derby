@@ -120,9 +120,19 @@ public enum CLICredentialReader {
         (try? read(source, home: home)) != nil
     }
 
-    public static func read(_ source: CLICredentialSource, home: URL? = nil) throws -> CLICredential {
+    /// Whether reading this login can reach the Keychain, and so raise a
+    /// system dialog that blocks until someone answers it. Only the default
+    /// Claude Code login lives there; every other store is a file.
+    public static func usesKeychain(_ source: CLICredentialSource, home: URL?) -> Bool {
+        source == .claudeCode && home == nil
+    }
+
+    /// `allowKeychain: false` reads only what a file holds, for callers that
+    /// must never put a dialog in front of the user.
+    public static func read(_ source: CLICredentialSource, home: URL? = nil,
+                            allowKeychain: Bool = true) throws -> CLICredential {
         switch source {
-        case .claudeCode: return try readClaudeCode(home: home)
+        case .claudeCode: return try readClaudeCode(home: home, allowKeychain: allowKeychain)
         case .codexCLI:   return try readCodex(home: home)
         case .geminiCLI:  return try readGemini(home: home)
         case .qwenCLI:    return try readQwen(home: home)
@@ -155,7 +165,7 @@ public enum CLICredentialReader {
     /// token, which the server rejects with HTTP 400.
     ///
     /// Both stores are read and the one that expires latest wins.
-    private static func readClaudeCode(home: URL?) throws -> CLICredential {
+    private static func readClaudeCode(home: URL?, allowKeychain: Bool = true) throws -> CLICredential {
         var candidates: [CLICredential] = []
 
         let path = credentialPath(for: .claudeCode, home: home)
@@ -165,7 +175,7 @@ public enum CLICredentialReader {
         // The Keychain holds a single item for the default install. An account
         // pointed at its own config directory must not fall back to it, or two
         // separate logins would collapse into the same credential.
-        if home == nil,
+        if home == nil, allowKeychain,
            let raw = KeychainSecretStore.readForeignGenericPassword(service: claudeCodeKeychainService),
            let data = raw.data(using: .utf8),
            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],

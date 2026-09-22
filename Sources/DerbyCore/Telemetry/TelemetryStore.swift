@@ -449,6 +449,29 @@ public actor TelemetryStore: TelemetrySink {
         return count
     }
 
+    /// Successful requests and their tokens per account since a moment — what
+    /// Derby shows as a plan's usage when the provider will not report it.
+    /// Keyed by the account that answered; a request that failed over counts
+    /// only against the account that served it.
+    public func requestTallies(since: Date) -> [UUID: ProviderUsage.Tally] {
+        var out: [UUID: ProviderUsage.Tally] = [:]
+        let sql = """
+        SELECT final_provider_id, COUNT(*), SUM(input_tokens + output_tokens)
+        FROM requests
+        WHERE created_at >= ? AND succeeded = 1 AND final_provider_id IS NOT NULL
+        GROUP BY final_provider_id;
+        """
+        withStatement(sql, since: since.timeIntervalSince1970) { stmt in
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                guard let raw = sqlite3_column_text(stmt, 0),
+                      let id = UUID(uuidString: String(cString: raw)) else { continue }
+                out[id] = ProviderUsage.Tally(requests: Int(sqlite3_column_int64(stmt, 1)),
+                                              tokens: Int(sqlite3_column_int64(stmt, 2)))
+            }
+        }
+        return out
+    }
+
     /// Everything needed for the diagnostics export.
     public func exportDiagnostics(limit: Int = 200) -> String {
         var q = RequestQuery()

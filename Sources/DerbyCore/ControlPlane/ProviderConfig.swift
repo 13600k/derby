@@ -405,16 +405,28 @@ public struct RateLimitConfig: Codable, Sendable, Hashable {
     /// as soon as a request would wait. Only servers that report their
     /// occupancy are judged by it.
     public var maxQueuedRequests: Int?
+    /// A plan's request allowance per rolling window, as the user read it off
+    /// the plan — for providers that meter one but will not report it (Qwen
+    /// Cloud's Coding Plan). Only gives Derby's own count on the dashboard
+    /// something to be a fraction of; routing does not read them.
+    public var planRequestsPer5Hours: Int?
+    public var planRequestsPerWeek: Int?
+    public var planRequestsPerMonth: Int?
 
     public init(requestsPerMinute: Int? = nil, tokensPerMinute: Int? = nil,
                 maxConcurrentRequests: Int = 8, dailyRequestQuota: Int? = nil,
-                monthlyCostBudgetUSD: Double? = nil, maxQueuedRequests: Int? = nil) {
+                monthlyCostBudgetUSD: Double? = nil, maxQueuedRequests: Int? = nil,
+                planRequestsPer5Hours: Int? = nil, planRequestsPerWeek: Int? = nil,
+                planRequestsPerMonth: Int? = nil) {
         self.requestsPerMinute = requestsPerMinute
         self.tokensPerMinute = tokensPerMinute
         self.maxConcurrentRequests = maxConcurrentRequests
         self.dailyRequestQuota = dailyRequestQuota
         self.monthlyCostBudgetUSD = monthlyCostBudgetUSD
         self.maxQueuedRequests = maxQueuedRequests
+        self.planRequestsPer5Hours = planRequestsPer5Hours
+        self.planRequestsPerWeek = planRequestsPerWeek
+        self.planRequestsPerMonth = planRequestsPerMonth
     }
 
     /// `maxQueuedRequests` with its default applied.

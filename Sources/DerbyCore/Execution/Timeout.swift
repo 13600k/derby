@@ -20,6 +20,50 @@ public func withDeadline<T: Sendable>(_ seconds: Double,
     }
 }
 
+/// `withDeadline` for work that may not answer cancellation: it returns at the
+/// deadline even while the operation is still stuck, and leaves the operation
+/// to finish on its own with its result discarded.
+///
+/// `withDeadline` cannot do that — a task group waits for every child before
+/// it returns, so a child blocked in a synchronous call (a Keychain read
+/// waiting on a dialog nobody has answered) holds it past any deadline. Only
+/// for work whose late completion is harmless. Both paths resolve the *same*
+/// continuation, exactly once, which is the pattern that avoided two hangs
+/// elsewhere.
+public func withAbandoningDeadline<T: Sendable>(_ seconds: Double,
+                                                message: @autoclosure @escaping @Sendable () -> String,
+                                                operation: @escaping @Sendable () async throws -> T) async throws -> T {
+    guard seconds > 0 else { throw DerbyError.timeout(message()) }
+    return try await withCheckedThrowingContinuation { continuation in
+        let once = ResumeOnce(continuation)
+        let work = Task {
+            do { once.resume(.success(try await operation())) }
+            catch { once.resume(.failure(error)) }
+        }
+        Task {
+            try? await Task.sleep(nanoseconds: UInt64(min(seconds, 86_400) * 1_000_000_000))
+            if once.resume(.failure(DerbyError.timeout(message()))) { work.cancel() }
+        }
+    }
+}
+
+/// Resumes a continuation at most once, from whichever caller gets there first.
+private final class ResumeOnce<T: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<T, Error>?
+    init(_ continuation: CheckedContinuation<T, Error>) { self.continuation = continuation }
+
+    @discardableResult
+    func resume(_ result: Result<T, Error>) -> Bool {
+        lock.lock()
+        let pending = continuation
+        continuation = nil
+        lock.unlock()
+        pending?.resume(with: result)
+        return pending != nil
+    }
+}
+
 /// Sleeps, translating cancellation into Derby's taxonomy.
 public func backoffSleep(_ seconds: Double) async throws {
     guard seconds > 0 else { return }

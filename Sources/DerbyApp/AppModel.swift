@@ -19,6 +19,8 @@ final class AppModel: ObservableObject {
     @Published private(set) var requests: [RequestRecord] = []
     @Published private(set) var logs: [LogEntry] = []
     @Published private(set) var routingPaused = false
+    /// Each cloud account's plan meter, keyed by account id.
+    @Published private(set) var providerUsage: [UUID: ProviderUsageStatus] = [:]
     @Published var startupWarnings: [String] = []
 
     @Published var banner: Banner?
@@ -63,6 +65,7 @@ final class AppModel: ObservableObject {
         showOnboarding = !config.app.hasCompletedOnboarding
         if config.app.autoDiscoverLocalServers { await scanForLocalServers() }
         startPolling()
+        await engine.startUsagePolling()
     }
 
     private func startPolling() {
@@ -87,6 +90,8 @@ final class AppModel: ObservableObject {
         snapshot = await engine.snapshot()
         endpoint = await engine.endpointURL
         routingPaused = await engine.isRoutingPaused()
+        let usage = await engine.providerUsage()
+        if usage != providerUsage { providerUsage = usage }
     }
 
     /// Full refresh, including database queries.
@@ -108,6 +113,12 @@ final class AppModel: ObservableObject {
 
     func refreshUsage() async {
         usage = await engine.telemetry.usage(window: usageWindow)
+    }
+
+    /// Reads every provider's plan meter now, rather than at the next poll.
+    func refreshProviderUsage() async {
+        await engine.refreshProviderUsage()
+        providerUsage = await engine.providerUsage()
     }
 
     func refreshRequests() async {
@@ -229,7 +240,8 @@ final class AppModel: ObservableObject {
             let states = account.models.filter(\.enabled).map {
                 snapshot.health(for: TargetKey(providerID: account.id, modelID: $0.modelID))
             }
-            return ProviderHealthSummary(account: account, targets: states)
+            return ProviderHealthSummary(account: account, targets: states,
+                                         usage: providerUsage[account.id])
         }
     }
 
@@ -270,6 +282,7 @@ final class AppModel: ObservableObject {
 struct ProviderHealthSummary: Identifiable {
     var account: ProviderAccount
     var targets: [TargetHealth]
+    var usage: ProviderUsageStatus?
     var id: UUID { account.id }
 
     var openCircuits: Int { targets.filter { $0.circuit == .open }.count }
