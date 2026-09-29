@@ -23,6 +23,7 @@ func registerAllTests() {
     registerRemoteCatalogTests()
     registerBenchmarkTests()
     registerParameterSupportTests()
+    registerReasoningLevelTests()
     registerClaudeCLITests()
     registerRuntimeMetadataTests()
     registerCompactionTests()

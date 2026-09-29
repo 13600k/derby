@@ -211,6 +211,23 @@ public struct ModelCapabilities: Codable, Sendable, Hashable {
         return levels.first
     }
 
+    /// The levels a client can ask this model for and get, weakest first, in
+    /// the vocabulary Derby's API parses — which is what a client reading them
+    /// will send back.
+    ///
+    /// Nil when nothing enumerates them: such a model is sent whatever was
+    /// asked, so it promises nothing. Empty when it is known to take none. A
+    /// provider's `none` is what `minimal` reaches (see `clampEffort`), and a
+    /// level Derby cannot parse is left out — advertising one invites a request
+    /// whose effort is silently dropped on arrival.
+    public var acceptedReasoningEfforts: [ReasoningEffort]? {
+        guard allows(.reasoningEffort) else { return [] }
+        guard let levels = supportedReasoningEfforts, !levels.isEmpty else { return nil }
+        var accepted = Set(levels.compactMap(ReasoningEffort.init(rawValue:)))
+        if levels.contains("none") { accepted.insert(.minimal) }
+        return accepted.sorted()
+    }
+
     // Decoded field by field, every one optional.
     //
     // This type is persisted inside every configured model, so adding a

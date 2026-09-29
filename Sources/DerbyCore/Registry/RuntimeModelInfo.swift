@@ -25,6 +25,9 @@ public struct RuntimeModelInfo: Codable, Sendable, Hashable {
     public var contextWindow: Int?
     public var maxOutputTokens: Int?
     public var capabilities: CapabilityFlags
+    /// Reasoning levels this model accepts, in Derby's vocabulary; nil when
+    /// nothing enumerates them. Optional because request records persist this.
+    public var reasoningEfforts: [ReasoningEffort]?
     /// Where the numbers above came from, so a client can tell measured
     /// metadata from Derby's conservative guess for an unknown model.
     public var capabilitySource: CapabilitySource
@@ -37,7 +40,8 @@ public struct RuntimeModelInfo: Codable, Sendable, Hashable {
     public init(modelID: String, displayName: String, providerID: UUID? = nil,
                 providerName: String, providerKind: String, providerLabel: String,
                 contextWindow: Int? = nil, maxOutputTokens: Int? = nil,
-                capabilities: CapabilityFlags = [], capabilitySource: CapabilitySource = .unknown,
+                capabilities: CapabilityFlags = [], reasoningEfforts: [ReasoningEffort]? = nil,
+                capabilitySource: CapabilitySource = .unknown,
                 pricing: Pricing? = nil, quality: Double = 0,
                 isLocal: Bool = false, isSubscription: Bool = false) {
         self.modelID = modelID
@@ -49,6 +53,7 @@ public struct RuntimeModelInfo: Codable, Sendable, Hashable {
         self.contextWindow = contextWindow
         self.maxOutputTokens = maxOutputTokens
         self.capabilities = capabilities
+        self.reasoningEfforts = reasoningEfforts
         self.capabilitySource = capabilitySource
         self.pricing = pricing
         self.quality = quality
@@ -66,6 +71,7 @@ public struct RuntimeModelInfo: Codable, Sendable, Hashable {
                   contextWindow: target.capabilities.contextWindow,
                   maxOutputTokens: target.capabilities.maxOutputTokens,
                   capabilities: target.capabilities.flags,
+                  reasoningEfforts: target.capabilities.acceptedReasoningEfforts,
                   capabilitySource: target.capabilities.source,
                   pricing: target.pricing,
                   quality: target.quality,

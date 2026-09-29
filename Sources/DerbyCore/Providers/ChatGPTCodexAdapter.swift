@@ -111,8 +111,15 @@ public struct ChatGPTCodexAdapter: ProviderAdapter {
         // The catalog states the real window. Reporting it beats leaving the
         // field empty for Derby's pattern-matched catalog to guess at from the
         // model's name, which for these internal slugs is guesswork.
+        //
+        // Its reasoning levels are stated for the same reason: left empty, they
+        // were filled from the OpenAI *API*'s row for the same slug, a different
+        // service — `none` through `max` where this backend takes `low` through
+        // `ultra` — and that is what `/v1/models` advertised.
         return ModelCapabilities(flags: flags,
                                  contextWindow: entry.maxContextWindow ?? entry.contextWindow,
+                                 supportedReasoningEfforts: entry.supportedEfforts.isEmpty
+                                    ? nil : entry.supportedEfforts,
                                  source: .discovered)
     }
 

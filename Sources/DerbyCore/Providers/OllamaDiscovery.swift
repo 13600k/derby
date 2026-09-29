@@ -54,7 +54,40 @@ public enum OllamaDiscovery {
                              message: "Ollama did not return a model list (HTTP \(response.status)).",
                              providerStatus: response.status)
         }
-        return (json["models"]?.arrayValue ?? []).compactMap { parse($0) }
+        var models = (json["models"]?.arrayValue ?? []).compactMap { parse($0) }
+        // `/api/tags` states capabilities but not the template, and the
+        // template is the only thing that says which reasoning levels a model
+        // takes and whether it can make several tool calls in one turn.
+        // Best effort: a model `/api/show` cannot describe keeps what it had.
+        for index in models.indices where models[index].capabilities?.flags.contains(.text) == true {
+            guard let showURL = URL(string: nativeBase(from: baseURL) + "/api/show"),
+                  let shown = try? await transport.send(OutboundRequest(
+                    url: showURL, method: "POST",
+                    headers: headers.merging(["content-type": "application/json"]) { a, _ in a },
+                    body: try? JSONValue.object(["model": .string(models[index].id)]).stableJSONData(),
+                    timeout: timeout, allowInsecureTLS: allowInsecureTLS)),
+                  (200..<300).contains(shown.status),
+                  let template = shown.bodyJSON?["template"]?.stringValue
+            else { continue }
+            models[index] = applyingTemplate(template, to: models[index])
+        }
+        return models
+    }
+
+    /// Folds what a model's chat template states into what `/api/tags` said.
+    /// Only ever adds to a capability Ollama already reported: levels to a
+    /// model that thinks, parallel calls to one that calls tools.
+    static func applyingTemplate(_ template: String, to model: DiscoveredModel) -> DiscoveredModel {
+        guard var caps = model.capabilities else { return model }
+        if caps.flags.contains(.tools), ChatTemplateFacts.rendersParallelToolCalls(template) {
+            caps.flags.insert(.parallelTools)
+        }
+        if caps.flags.contains(.reasoning), let levels = ChatTemplateFacts.reasoningEfforts(in: template) {
+            caps.supportedReasoningEfforts = levels
+        }
+        var enriched = model
+        enriched.capabilities = caps
+        return enriched
     }
 
     static func parse(_ item: JSONValue) -> DiscoveredModel? {

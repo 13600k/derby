@@ -119,8 +119,13 @@ public enum OpenAIResponseWriter {
         ]
         if let c = m.contextWindow { o["context_window"] = .number(Double(c)) }
         if let mo = m.maxOutputTokens { o["max_output_tokens"] = .number(Double(mo)) }
+        if let e = m.reasoningEfforts { o["reasoning_efforts"] = effortsJSON(e) }
         if let p = m.pricing, p.isKnown { o["pricing"] = pricingJSON(p) }
         return .object(o)
+    }
+
+    static func effortsJSON(_ efforts: [ReasoningEffort]) -> JSONValue {
+        .array(efforts.map { .string($0.rawValue) })
     }
 
     static func pricingJSON(_ p: Pricing) -> JSONValue {
@@ -440,13 +445,7 @@ public enum OpenAIResponseWriter {
             if !rejected.isEmpty {
                 derby["unsupported_parameters"] = .array(rejected.names.map { .string($0) })
             }
-            let efforts = usable.compactMap { $0.capabilities.supportedReasoningEfforts }
-            if let shared = efforts.first, efforts.count == usable.count {
-                let common = efforts.dropFirst().reduce(Set(shared)) { $0.intersection(Set($1)) }
-                if !common.isEmpty {
-                    derby["reasoning_efforts"] = .array(shared.filter { common.contains($0) }.map { .string($0) })
-                }
-            }
+            if let efforts = summary.reasoningEfforts { derby["reasoning_efforts"] = effortsJSON(efforts) }
             if let out = summary.guaranteedMaxOutputTokens {
                 derby["min_max_output_tokens"] = .number(Double(out))
             }
@@ -476,6 +475,11 @@ public enum OpenAIResponseWriter {
             // size that still fits *every* target, i.e. with full failover intact.
             if let ceiling = summary.maxContextWindow { item["context_window"] = .number(Double(ceiling)) }
             if let out = summary.maxOutputTokens { item["max_output_tokens"] = .number(Double(out)) }
+            // Unlike the window, this is the *shared* set, not the widest. A
+            // level only some targets accept is never refused — each clamps to
+            // the nearest it has — so the widest would be a level the next
+            // request may quietly not get. Absent when a target's are unknown.
+            if let efforts = summary.reasoningEfforts { item["reasoning_efforts"] = effortsJSON(efforts) }
             items.append(.object(item))
         }
         return .object(["object": .string("list"), "data": .array(items)])

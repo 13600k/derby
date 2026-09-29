@@ -23,6 +23,11 @@ public struct LogicalModelCapabilitySummary: Sendable, Hashable {
     public var guaranteedMaxOutputTokens: Int?
     public var maxOutputTokens: Int?
     public var embeddingDimensions: Int?
+    /// Reasoning levels **every** target accepts, weakest first. A level only
+    /// some accept is not an error elsewhere — each target clamps to the
+    /// nearest it has — but it is not the level that was asked for. Nil when
+    /// any target's levels are unknown, since those could exclude any of them.
+    public var reasoningEfforts: [ReasoningEffort]?
     public var targetCount: Int
     /// Targets that cannot serve this group's request shape at all.
     public var incompatible: [Incompatibility]
@@ -57,6 +62,7 @@ public struct LogicalModelCapabilitySummary: Sendable, Hashable {
                 guaranteedContextWindow: Int? = nil, maxContextWindow: Int? = nil,
                 guaranteedMaxOutputTokens: Int? = nil, maxOutputTokens: Int? = nil,
                 embeddingDimensions: Int? = nil,
+                reasoningEfforts: [ReasoningEffort]? = nil,
                 targetCount: Int, incompatible: [Incompatibility],
                 unconstrained: CapabilityFlags? = nil) {
         self.guaranteed = guaranteed
@@ -66,6 +72,7 @@ public struct LogicalModelCapabilitySummary: Sendable, Hashable {
         self.guaranteedMaxOutputTokens = guaranteedMaxOutputTokens
         self.maxOutputTokens = maxOutputTokens
         self.embeddingDimensions = embeddingDimensions
+        self.reasoningEfforts = reasoningEfforts
         self.targetCount = targetCount
         self.incompatible = incompatible
         self.unconstrained = unconstrained
@@ -119,8 +126,10 @@ public struct LogicalModelCapabilitySummary: Sendable, Hashable {
         var guaranteedOutput: Int?
         var maxOutput: Int?
         var dimensions: Int?
+        var sharedEfforts = Set(ReasoningEffort.allCases)
         var everyTargetStatesContext = true
         var everyTargetStatesOutput = true
+        var everyTargetStatesEfforts = true
 
         for target in participating {
             let caps = target.capabilities
@@ -141,6 +150,11 @@ public struct LogicalModelCapabilitySummary: Sendable, Hashable {
                 everyTargetStatesOutput = false
             }
             if dimensions == nil { dimensions = caps.embeddingDimensions }
+            if let efforts = caps.acceptedReasoningEfforts {
+                sharedEfforts.formIntersection(efforts)
+            } else {
+                everyTargetStatesEfforts = false
+            }
         }
 
         // The group's declared contract narrows what the targets can do. It can
@@ -148,6 +162,10 @@ public struct LogicalModelCapabilitySummary: Sendable, Hashable {
         // have, but checking one they lack would be a promise Derby cannot keep.
         let constraints = model.definition.constraints ?? LogicalModelConstraints()
         let rawAvailable = available
+        // A group that withholds reasoning offers no level of it, whatever its
+        // targets would accept.
+        var efforts = everyTargetStatesEfforts ? sharedEfforts.sorted() : nil
+        if constraints.narrowing(.reasoning).isEmpty { efforts = [] }
 
         return LogicalModelCapabilitySummary(
             guaranteed: constraints.narrowing(guaranteed),
@@ -159,6 +177,7 @@ public struct LogicalModelCapabilitySummary: Sendable, Hashable {
                 output: everyTargetStatesOutput ? guaranteedOutput : nil),
             maxOutputTokens: constraints.capping(output: maxOutput),
             embeddingDimensions: dimensions,
+            reasoningEfforts: efforts,
             targetCount: participating.count,
             incompatible: incompatible,
             unconstrained: constraints.isEmpty ? nil : rawAvailable)

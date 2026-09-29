@@ -454,10 +454,15 @@ public struct OpenAIAdapter: ProviderAdapter {
             // llama.cpp enforces `response_format` with a grammar, whatever the model.
             caps.flags.formUnion([.jsonMode, .jsonSchema])
         }
-        if let template = props["chat_template"]?.stringValue,
-           ["<think>", "enable_thinking", "reasoning_content"].contains(where: template.contains) {
-            caps.flags.insert(.reasoning)
-            learnedSomething = true
+        if let template = props["chat_template"]?.stringValue {
+            if ["<think>", "enable_thinking", "reasoning_content"].contains(where: template.contains) {
+                caps.flags.insert(.reasoning)
+                learnedSomething = true
+            }
+            if caps.flags.contains(.reasoning), let levels = ChatTemplateFacts.reasoningEfforts(in: template) {
+                caps.supportedReasoningEfforts = levels
+                learnedSomething = true
+            }
         }
         if let modalities = props["modalities"], modalities.objectValue != nil {
             // The server's word on modalities is final; a catalog guess is not.
@@ -868,9 +873,20 @@ public struct OpenAIAdapter: ProviderAdapter {
         ]
         // A hybrid model's thinking is a template switch on self-hosted servers,
         // so a reasoning request that does not flip it is silently ignored.
-        if q.supportsChatTemplateKwargs, let effort = r.reasoning?.effort,
-           let flag = LineageTraits.for(ModelLineage.parse(model)).thinkingTemplateSwitch {
-            body["chat_template_kwargs"] = .object([flag: .bool(effort != .minimal)])
+        if q.supportsChatTemplateKwargs, let effort = r.reasoning?.effort {
+            var kwargs: [String: JSONValue] = [:]
+            if let flag = LineageTraits.for(ModelLineage.parse(model)).thinkingTemplateSwitch {
+                kwargs[flag] = .bool(effort != .minimal)
+            }
+            // The level itself, when the template names the ones it takes —
+            // the only source a local model's levels come from. Without it every
+            // level but off ran at the template's default, which for Qwen 3.8 is
+            // `xhigh`. Clamped, because the template raises on any other value.
+            if effort != .minimal, capabilities?.supportedReasoningEfforts?.isEmpty == false,
+               let level = capabilities?.clampEffort(effort), level != "none" {
+                kwargs["reasoning_effort"] = .string(level)
+            }
+            if !kwargs.isEmpty { body["chat_template_kwargs"] = .object(kwargs) }
         }
         if stream {
             body["stream"] = .bool(true)

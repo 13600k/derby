@@ -21,7 +21,7 @@ Pure SwiftPM, **no third-party dependencies**. Only the Command Line Tools are r
 ```bash
 swift build                        # debug build of DerbyCore + DerbyApp
 swift build -c release             # release build
-swift run DerbyTests               # all 592 tests (~7s, no network)
+swift run DerbyTests               # all 606 tests (~7s, no network)
 swift run DerbyTests Routing       # filter by suite or test name
 DERBY_LIVE=1 swift run DerbyTests Live   # opt-in: this machine's real providers
 
@@ -97,6 +97,24 @@ the request path does, so it never advertises something the next request will no
 Streaming headers are `x-derby-planned-*`, since they are flushed before a target has run.
 Physical model ids stay unroutable and are never listed as models — clients read the model,
 they do not pick it, or routing and failover would be bypassed (`docs/CLIENTS.md`).
+
+Reasoning levels are advertised as the set **every** target accepts
+(`LogicalModelCapabilitySummary.reasoningEfforts`), top-level and per target, in the
+vocabulary the request parser reads (`ModelCapabilities.acceptedReasoningEfforts`: a
+provider's `none` is listed as `minimal`, which is what reaches it). A level outside the
+shared set is never refused, since each target clamps, so the widest set would quietly promise
+levels the next request may not get. Like a max output, a level list is the serving policy of
+whoever published it: the ChatGPT backend states its own (`low`…`ultra`). Left unstated, it was
+filled from the OpenAI API's row for the same slug (`none`…`max`), and that is what the
+listing advertised.
+
+A local server's levels come only from the chat template it publishes (llama.cpp `/props`,
+Ollama `/api/show`, read by `ChatTemplateFacts`), never from another host's row: Qwen 3.8's
+template takes `low`, `medium` and `xhigh` and raises on anything else, while the index lists
+those weights with anything from `low, medium` to nothing. The same template says whether the
+model can make several tool calls in one turn, which Ollama does not report. The level is
+sent to the template as `chat_template_kwargs.reasoning_effort`, clamped to what it names.
+The thinking switch alone ran every level but off at the template's default.
 
 Inbound auth is **off by default**: a client needs the port and nothing else. What keeps
 Derby off the network is the loopback `bindAddress`, not a key, and a gateway anything

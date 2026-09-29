@@ -187,6 +187,26 @@ target — the number that is safe for every request to that alias. It is omitte
 when any target's window is unknown, because an unknown one could be smaller than all of
 them; treat its absence as "ask per response".
 
+### Reasoning levels: `reasoning_efforts`
+
+The levels **every** usable target accepts, weakest first, both at the top level and under
+`derby`. Each target (and `active_model`) lists its own under the same name:
+
+```jsonc
+"reasoning_efforts": ["low", "medium", "high", "xhigh", "max"],
+"derby": { "targets": [ { "id": "gpt-5.6-sol", "reasoning_efforts": ["low", "…", "ultra"] }, … ] }
+```
+
+Send one of these as `reasoning_effort` (or `reasoning.effort`) and whichever target answers
+runs at that level. A level outside the shared set is still accepted, but each target
+clamps it to the nearest it has, so a spreading strategy can give you different levels on
+consecutive requests. The values are Derby's vocabulary, the one the request parser reads:
+a provider's `none` is listed as `minimal`, because that is what reaches it.
+
+It is omitted when any target's levels are unknown, since those could exclude any level.
+An empty array means the levels are known and none is common to all of them, or the
+logical model withholds reasoning.
+
 ### Trusting the numbers
 
 `metadata_source` says where a target's capability flags came from:

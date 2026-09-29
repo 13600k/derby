@@ -173,6 +173,12 @@ public enum ModelCatalog {
         // excludes a target) and is corrected by one field in the UI. Inheriting
         // a stranger's turned a machine that imposes no cap at all into a 16k
         // model, because a single aggregator's row happened to answer first.
+        //
+        // Reasoning levels are the same kind of fact. Qwen 3.8's template takes
+        // `low`, `medium` and `xhigh`; the index lists those weights with
+        // anything from `low, medium` to nothing, so an Ollama copy borrowing
+        // one lost the `xhigh` its own template defaults to. A local server's
+        // levels come from the template it publishes, read during discovery.
         let believeServingLimits = !kind.isLocal && (live?.matchedOwnProvider ?? true)
 
         if let live {
@@ -184,7 +190,10 @@ public enum ModelCatalog {
                                             maxOutputTokens: believeServingLimits ? fallback.maxOutput : nil,
                                             source: .builtin))
             }
-            if !believeServingLimits { capabilities.maxOutputTokens = nil }
+            if !believeServingLimits {
+                capabilities.maxOutputTokens = nil
+                capabilities.supportedReasoningEfforts = nil
+            }
             // Local and subscription targets have no marginal per-token cost,
             // whatever the vendor's list price is.
             let pricing: Pricing? = (kind.isLocal || kind.isSubscription) ? .free : live.pricing
