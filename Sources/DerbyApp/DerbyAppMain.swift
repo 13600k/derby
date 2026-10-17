@@ -5,7 +5,7 @@ import DerbyCore
 @main
 struct DerbyApplication: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-    @StateObject private var model = AppModel()
+    @StateObject private var model = AppModel.shared
 
     var body: some Scene {
         WindowGroup("Derby") {
@@ -16,7 +16,6 @@ struct DerbyApplication: App {
                 .tint(.derbyAccent)
                 .frame(minWidth: 1000, minHeight: 640)
                 .task { await model.bootstrap() }
-                .onAppear { appDelegate.model = model }
         }
         .defaultSize(width: 1180, height: 760)
         .commands {
@@ -60,8 +59,12 @@ struct DerbyApplication: App {
 
 /// Keeps the gateway alive when the last window closes (the whole point of a
 /// local gateway is that it keeps serving), unless the user opted out.
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    weak var model: AppModel?
+    /// Always set, even when no window ever appears. It used to be assigned in
+    /// the window's `onAppear`, so on a windowless login-item launch it stayed
+    /// nil and the app quit as soon as any transient window closed.
+    var model: AppModel { AppModel.shared }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // A destination missing from `groups` would be silently unreachable —
@@ -70,10 +73,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                "Every SidebarItem must appear in the sidebar groups or it is unreachable.")
         assert(SidebarItem.allGrouped.count == SidebarItem.allCases.count,
                "A SidebarItem appears in more than one sidebar group.")
+        // Start the gateway whether or not a window is shown. A login item is
+        // usually launched hidden, which means the WindowGroup's `.task` never
+        // runs. Before this, a reboot left the gateway "Stopped" with autoStart on.
+        Task { @MainActor in await AppModel.shared.bootstrap() }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        guard let model else { return true }
         return !(model.config.app.keepRunningWhenWindowClosed && model.config.app.showMenuBarExtra)
     }
 
@@ -86,7 +92,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        guard let model else { return }
+        let model = self.model
         // Give the listener a moment to close cleanly so the port is released.
         let semaphore = DispatchSemaphore(value: 0)
         Task { @MainActor in

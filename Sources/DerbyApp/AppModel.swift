@@ -51,6 +51,13 @@ final class AppModel: ObservableObject {
         var onlyFailovers = false
     }
 
+    /// The app's one model. It is shared rather than owned by a window, because
+    /// Derby often launches with no window at all (a login item, or a restored
+    /// session that had the window closed). The gateway must still come up.
+    static let shared = AppModel()
+
+    private var didBootstrap = false
+
     init(engine: DerbyEngine = DerbyEngine()) {
         self.engine = engine
         self.config = DerbyConfig.seeded()
@@ -58,7 +65,13 @@ final class AppModel: ObservableObject {
 
     // MARK: - Lifecycle
 
+    /// Idempotent: called from `applicationDidFinishLaunching` (windowless
+    /// launches) and from the main window's `.task`. Only the first call does
+    /// anything. The flag is set before the first `await`, so two callers on
+    /// the main actor cannot both get through.
     func bootstrap() async {
+        guard !didBootstrap else { return }
+        didBootstrap = true
         await engine.bootstrap()
         await refreshAll()
         startupWarnings = await engine.startupWarnings
