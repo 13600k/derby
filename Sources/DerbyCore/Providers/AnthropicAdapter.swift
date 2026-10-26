@@ -8,15 +8,18 @@ import Foundation
 ///   alongside the rest of the CLI's wire identity: the beta flags, the
 ///   `user-agent` and `x-app` headers, and a first system block naming Claude
 ///   Code, without which the token is rejected. `ClaudeCodeIdentity` owns that
-///   set; this adapter applies the headers in `authenticate` and the system
-///   block in `buildBody`.
+///   set; this adapter applies the headers in `authenticate`, and the system
+///   block, the tool names and the account's prompt rewrites in `buildBody`.
+///   `ClaudePlanGuard` checks every answer was paid for by the plan.
 public struct AnthropicAdapter: ProviderAdapter {
     public let family: AdapterFamily
     private let oauthMode: Bool
+    private let planGuard: ClaudePlanGuard
 
-    public init(oauth: Bool = false) {
+    public init(oauth: Bool = false, planGuard: ClaudePlanGuard = .shared) {
         self.oauthMode = oauth
         self.family = oauth ? .anthropicOAuth : .anthropic
+        self.planGuard = planGuard
     }
 
     public static let anthropicVersion = "2023-06-01"
@@ -55,6 +58,24 @@ public struct AnthropicAdapter: ProviderAdapter {
 
     private var usesOAuth: Bool { oauthMode }
 
+    /// A subscription login is held to its plan unless the account says otherwise.
+    private func guardsPlan(_ ctx: ProviderContext) -> Bool {
+        usesOAuth && ctx.account.allowExtraUsage != true
+    }
+
+    /// Fails at once while the account is held, before any credential is read.
+    private func requirePlan(_ ctx: ProviderContext) async throws {
+        guard guardsPlan(ctx), let hold = await planGuard.hold(for: ctx.account.id) else { return }
+        throw ClaudePlanGuard.error(for: hold)
+    }
+
+    /// How this request's tool names go on the wire. A subscription login
+    /// sends them the way Claude Code would; an API key sends them as they are.
+    func toolNames(for r: CanonicalRequest) -> ClaudeCodeIdentity.ToolNames {
+        guard usesOAuth else { return .unchanged }
+        return ClaudeCodeIdentity.ToolNames(r.tools.map(\.name) + r.messages.flatMap { $0.toolCalls.map(\.name) })
+    }
+
     public func listModels(_ ctx: ProviderContext) async throws -> [DiscoveredModel] {
         let auth = try await authenticate(ctx)
         let u = try url(ctx, path: "models", auth: auth, extraQuery: ["limit": "100"])
@@ -92,6 +113,7 @@ public struct AnthropicAdapter: ProviderAdapter {
     // MARK: - Execute
 
     public func execute(_ request: CanonicalRequest, model: String, ctx: ProviderContext) async throws -> CanonicalResponse {
+        try await requirePlan(ctx)
         let auth = try await authenticate(ctx)
         let body = try buildBody(request, model: model, ctx: ctx, stream: false)
         let u = try url(ctx, path: "messages", auth: auth)
@@ -102,15 +124,19 @@ public struct AnthropicAdapter: ProviderAdapter {
         guard (200..<300).contains(resp.status) else {
             throw classifyError(status: resp.status, headers: resp.headers, body: resp.body, model: model)
         }
+        // Already generated and paid for, so it is still returned; the hold
+        // keeps the next request off this account.
+        if guardsPlan(ctx) { await planGuard.observe(resp.headers, account: ctx.account) }
         guard let json = resp.bodyJSON else {
             throw DerbyError(kind: .transient, message: "Anthropic returned a non-JSON response.",
                              providerStatus: resp.status)
         }
-        return try parseResponse(json, fallbackModel: model)
+        return try parseResponse(json, fallbackModel: model, toolNames: toolNames(for: request))
     }
 
     public func stream(_ request: CanonicalRequest, model: String, ctx: ProviderContext) async throws
         -> AsyncThrowingStream<CanonicalStreamEvent, Error> {
+        try await requirePlan(ctx)
         let auth = try await authenticate(ctx)
         let body = try buildBody(request, model: model, ctx: ctx, stream: true)
         let u = try url(ctx, path: "messages", auth: auth)
@@ -124,6 +150,12 @@ public struct AnthropicAdapter: ProviderAdapter {
             throw classifyError(status: start.status, headers: start.headers,
                                 body: start.errorBody ?? Data(), model: model)
         }
+        // Read before a byte of the answer: dropping `start` here cancels the
+        // stream, and nothing has reached the client, so failover is clean.
+        if guardsPlan(ctx), let hold = await planGuard.observe(start.headers, account: ctx.account) {
+            throw ClaudePlanGuard.error(for: hold)
+        }
+        let toolNames = toolNames(for: request)
 
         return AsyncThrowingStream { continuation in
             let task = Task {
@@ -155,7 +187,7 @@ public struct AnthropicAdapter: ProviderAdapter {
                                 toolIndexForBlock[blockIndex] = idx
                                 continuation.yield(.toolCallStart(index: idx,
                                                                   id: block["id"]?.stringValue ?? "",
-                                                                  name: block["name"]?.stringValue ?? ""))
+                                                                  name: toolNames.client(block["name"]?.stringValue ?? "")))
                             case "thinking":
                                 thinkingForBlock[blockIndex] = block["thinking"]?.stringValue ?? ""
                                 if let sig = block["signature"]?.stringValue, !sig.isEmpty { signatureForBlock[blockIndex] = sig }
@@ -235,12 +267,15 @@ public struct AnthropicAdapter: ProviderAdapter {
         if usesOAuth {
             systemBlocks.append(.object(["type": .string("text"), "text": .string(Self.claudeCodeIdentity)]))
         }
+        let toolNames = toolNames(for: r)
+        let rewrites = usesOAuth ? ctx.account.effectivePromptRewrites : []
+        var rewritten = 0
         var messages: [JSONValue] = []
 
         for m in r.messages {
             switch m.role {
             case .system, .developer:
-                let text = m.joinedText
+                let text = Self.rewrite(m.joinedText, with: rewrites, count: &rewritten)
                 if !text.isEmpty {
                     systemBlocks.append(.object(["type": .string("text"), "text": .string(text)]))
                 }
@@ -287,7 +322,7 @@ public struct AnthropicAdapter: ProviderAdapter {
                 for tc in m.toolCalls {
                     blocks.append(.object(["type": .string("tool_use"),
                                            "id": .string(tc.id),
-                                           "name": .string(tc.name),
+                                           "name": .string(toolNames.wire(tc.name)),
                                            "input": tc.argumentsValue]))
                 }
                 if blocks.isEmpty { blocks.append(.object(["type": .string("text"), "text": .string("")])) }
@@ -313,6 +348,9 @@ public struct AnthropicAdapter: ProviderAdapter {
             "messages": .array(messages),
         ]
         if !systemBlocks.isEmpty { body["system"] = .array(systemBlocks) }
+        if rewritten > 0 {
+            DerbyLog.info("anthropic", "Replaced \(rewritten) name\(rewritten == 1 ? "" : "s") in the system prompt for \(ctx.account.name), from its prompt rewrites.")
+        }
         if stream { body["stream"] = .bool(true) }
         // Newer Claude models reject sampling parameters; sending one returns a
         // deprecation error rather than being ignored.
@@ -323,7 +361,7 @@ public struct AnthropicAdapter: ProviderAdapter {
 
         if !r.tools.isEmpty {
             body["tools"] = .array(r.tools.map { t in
-                var o: [String: JSONValue] = ["name": .string(t.name), "input_schema": t.parameters]
+                var o: [String: JSONValue] = ["name": .string(toolNames.wire(t.name)), "input_schema": t.parameters]
                 if let d = t.description { o["description"] = .string(d) }
                 return .object(o)
             })
@@ -335,7 +373,7 @@ public struct AnthropicAdapter: ProviderAdapter {
                     body["tool_choice"] = .object(o)
                 case .none: body["tool_choice"] = .object(["type": .string("none")])
                 case .required: body["tool_choice"] = .object(["type": .string("any")])
-                case .function(let n): body["tool_choice"] = .object(["type": .string("tool"), "name": .string(n)])
+                case .function(let n): body["tool_choice"] = .object(["type": .string("tool"), "name": .string(toolNames.wire(n))])
                 }
             }
         }
@@ -384,6 +422,17 @@ public struct AnthropicAdapter: ProviderAdapter {
         var result = JSONValue.object(body)
         if let ext = r.providerExtensions["anthropic"] { result = result.merging(ext) }
         return result
+    }
+
+    /// Applies each pair in order, counting what it replaced. Only the system
+    /// prompt goes through this; the conversation itself is never rewritten.
+    static func rewrite(_ text: String, with rewrites: [PromptRewrite], count: inout Int) -> String {
+        var out = text
+        for pair in rewrites where !pair.find.isEmpty && out.contains(pair.find) {
+            count += out.components(separatedBy: pair.find).count - 1
+            out = out.replacingOccurrences(of: pair.find, with: pair.replace)
+        }
+        return out
     }
 
     enum ThinkingMode { case adaptive, manual }
@@ -450,7 +499,8 @@ public struct AnthropicAdapter: ProviderAdapter {
 
     // MARK: - Parsing
 
-    func parseResponse(_ json: JSONValue, fallbackModel: String) throws -> CanonicalResponse {
+    func parseResponse(_ json: JSONValue, fallbackModel: String,
+                       toolNames: ClaudeCodeIdentity.ToolNames = .unchanged) throws -> CanonicalResponse {
         if json["type"]?.stringValue == "error" {
             throw classifyError(status: 400, headers: [:], body: Data(json.compactJSONString.utf8), model: fallbackModel)
         }
@@ -474,7 +524,7 @@ public struct AnthropicAdapter: ProviderAdapter {
                 }
             case "tool_use":
                 toolCalls.append(CanonicalToolCall(id: block["id"]?.stringValue ?? "",
-                                                   name: block["name"]?.stringValue ?? "",
+                                                   name: toolNames.client(block["name"]?.stringValue ?? ""),
                                                    argumentsJSON: (block["input"] ?? .object([:])).compactJSONString))
             default: break
             }
@@ -623,7 +673,7 @@ public struct AnthropicAdapter: ProviderAdapter {
             friendly += " — run `claude` and sign in again, or enable managed token refresh for this account."
         }
         if kind == .quotaExhausted, usesOAuth {
-            friendly += " — Anthropic is billing this path as a third-party app. The Claude Code (plan limits) provider runs the CLI instead, which draws on the plan itself."
+            friendly += " — either the plan's window is spent, or Anthropic billed this as a third-party app. Check that extra usage is off at claude.ai/settings/usage so nothing is charged past the plan; the Claude Code (plan limits) provider runs the CLI instead if this persists."
         }
         var err = DerbyError(kind: kind, message: friendly, providerStatus: status, providerCode: code)
         if let ra = headers["retry-after"].flatMap({ RateLimitSnapshot.parseDuration($0) }) { err.retryAfter = ra }

@@ -43,9 +43,12 @@ The direct API path is the uncertain one. **The classification is not made on th
 is made on the identity the request presents, and the token is only part of that. Derby sends
 the whole set the CLI does (see `ClaudeCodeIdentity`): the `oauth-2025-04-20` and
 `claude-code-20250219` betas, a `user-agent` naming the installed CLI version, `x-app: cli`, and
-the Claude Code system block. Which lane that lands in has been reported both ways and appears
-to depend on the account, so Derby does not claim an answer for yours — **read the response
-headers and find out**:
+the Claude Code system block. That alone was not enough: Anthropic also reads the **tool
+names** and the **system prompt**. Hermes Agent, which reaches Claude the same way, found that
+a bare tool name (`read_file`) or a single-underscore one (`mcp_read_file`) flips a request
+into extra usage while `mcp__read_file` stays on the plan, and it replaces its own product
+names in its prompt. Derby now does both on this path (below), and checks every answer's
+headers rather than trusting either:
 
 | Response headers | Lane |
 | --- | --- |
@@ -57,9 +60,10 @@ Derby offers both transports:
 | Provider kind | Transport | Billing |
 | --- | --- | --- |
 | **Claude Code (plan limits)** | Spawns the `claude` CLI | Your subscription's plan limits |
-| **Claude subscription (direct API)** | `POST /v1/messages` with the OAuth token | Account-dependent — verify with the headers above |
+| **Claude subscription (direct API)** | `POST /v1/messages` with the OAuth token | Plan limits, held to them by `ClaudePlanGuard` |
 
-The CLI path is what discovery now offers. Its cost:
+Discovery offers the direct-API path, since it passes tools, images and sampling through. The
+CLI path can still be added by hand. Its cost:
 
 - **No tool calling and no images.** The CLI runs its own agent loop and accepts no
   caller-supplied tool schemas, so this provider does not advertise those capabilities and
@@ -111,9 +115,35 @@ up after 20 seconds and says exactly that rather than hanging for the request de
   This is what keeps a hand-off to Claude from re-reading the whole conversation on every
   turn — the difference the hand-off itself makes is then GPT's thinking, which no other
   vendor can verify, and nothing else. **Not yet verified live.**
-- **Not done:** rewriting the caller's own system prompt. Other gateways substitute their
-  product name out of it to avoid being fingerprinted; that silently alters what the client
-  sent, which Derby does not do to a conversation anywhere else.
+- **Tool names.** Every tool goes out as `mcp__<name>` — `mcp__x` stays, `mcp_x` and a bare
+  `x` both become `mcp__x` — and is mapped back before the client sees it
+  (`ClaudeCodeIdentity.ToolNames`). The map is built from the request's own tools, so it is
+  exact both ways; two names that would collide stay distinct, a name past Anthropic's 64
+  characters is shortened with a stable hash, and the same tools go out the same bytes on
+  every turn, so the prompt cache still matches.
+- **System prompt rewrites.** Each account carries find→replace pairs applied to the system
+  blocks only — never to messages or tool results. The default list is Hermes's own
+  (`Hermes Agent`/`Hermes agent` → `Claude Code`, `hermes-agent` → `claude-code`,
+  `Nous Research` → `Anthropic`), since Hermes reaches Claude through Derby. It is editable in
+  the provider's Advanced card, an empty list turns it off, and each rewrite is logged. This is
+  the only place Derby changes what a client sent, and only because the alternative is the
+  request being billed past the plan.
+- **Plan guard.** Every answer carries `anthropic-ratelimit-unified-*` headers. Read the way
+  the CLI (2.1.310) reads them, `overage-in-use: true`, or `status: rejected` with
+  `overage-status` `allowed`/`allowed_warning`, means extra usage paid. The first such answer —
+  or one with no unified headers, which cannot be shown to be on the plan — holds the account
+  out of routing until the plan's reset (an hour when none is named). A stream is judged on
+  its headers before any of it is read and dropped, so failover is still clean; a
+  non-streamed answer is already paid for and is returned. Requests to a held account fail
+  at once as `QUOTA_EXHAUSTED` and fail over. `allowExtraUsage` on the account turns this off.
+- **The hard guarantee is the account's own setting.** With extra usage off at
+  claude.ai/settings/usage, Anthropic refuses what it would otherwise bill past the plan. The
+  meter (`/api/oauth/usage`, `extra_usage.is_enabled`) says which it is, and the provider page
+  shows it. `DERBY_LIVE=1 swift run DerbyTests Live` sends one Hermes-shaped request with a
+  tool and checks the plan paid for it — and sends nothing unless the meter confirms extra
+  usage is off.
+- **Not mirrored:** Claude Code's `x-anthropic-billing-header` system block. Hermes does not
+  send it either; it is the next thing to try if the live check ever reports another lane.
 - **Verified live** during development: a real completion returned `200` with usage.
 - Later in the same session the token expired, and Derby classified it as `AUTHENTICATION`
   in 1 ms and failed over to a local model — which is exactly the intended behaviour, and

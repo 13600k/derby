@@ -8,9 +8,9 @@ import Foundation
 /// on the plan the user already pays for. The CLI reports `provider: firstParty`
 /// for these calls, which is how that is confirmed rather than assumed.
 ///
-/// `AnthropicAdapter` in OAuth mode presents the same identity over HTTP and may
-/// well land in the same lane, but that is account-dependent and unproven; this
-/// path is the one that does not have to be verified.
+/// `AnthropicAdapter` in OAuth mode presents the same identity over HTTP, tool
+/// names included, and `ClaudePlanGuard` checks each answer was paid for by the
+/// plan; this path is the one that never needs that check.
 ///
 /// The trade-off is that the CLI is a turn-based agent, not a chat endpoint:
 /// tool definitions cannot be passed through, so this provider advertises no

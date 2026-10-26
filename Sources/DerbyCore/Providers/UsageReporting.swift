@@ -79,10 +79,11 @@ enum ClaudePlanUsage {
     static func parse(_ json: JSONValue, now: Date = Date()) -> ProviderUsage {
         var windows: [ProviderUsage.Window] = []
 
-        func add(_ id: String, _ label: String, _ node: JSONValue?, duration: Double?) {
+        func add(_ id: String, _ label: String, _ node: JSONValue?, duration: Double?, scope: String? = nil) {
             guard let node, !node.isNull, let percent = node["utilization"]?.doubleValue else { return }
             windows.append(.init(id: id, label: label, usedFraction: percent / 100,
-                                 duration: duration, resetsAt: UsageTime.date(node["resets_at"])))
+                                 duration: duration, resetsAt: UsageTime.date(node["resets_at"]),
+                                 scope: scope))
         }
 
         add("five_hour", "5-hour", json["five_hour"], duration: ProviderUsage.fiveHours)
@@ -92,7 +93,8 @@ enum ClaudePlanUsage {
         for (key, node) in (json.objectValue ?? [:]).sorted(by: { $0.key < $1.key })
         where key.hasPrefix("seven_day_") {
             let scope = String(key.dropFirst("seven_day_".count))
-            add("seven_day.\(scope)", "Weekly · \(prettyScope(scope))", node, duration: ProviderUsage.week)
+            add("seven_day.\(scope)", "Weekly · \(prettyScope(scope))", node, duration: ProviderUsage.week,
+                scope: scope)
         }
 
         // The newer form: every limit in one list, per-model caps included.
@@ -101,6 +103,7 @@ enum ClaudePlanUsage {
             let active = entry["is_active"]?.boolValue == true
             let resets = UsageTime.date(entry["resets_at"])
             let id: String, label: String, duration: Double
+            var scope: String?
             switch entry["kind"]?.stringValue {
             case "session":
                 (id, label, duration) = ("five_hour", "5-hour", ProviderUsage.fiveHours)
@@ -110,6 +113,7 @@ enum ClaudePlanUsage {
                 let model = entry["scope"]?["model"]
                 let name = model?["display_name"]?.stringValue ?? model?["id"]?.stringValue ?? "one model"
                 (id, label, duration) = ("weekly_scoped.\(name.lowercased())", "Weekly · \(name)", ProviderUsage.week)
+                scope = name
             default:
                 continue
             }
@@ -121,7 +125,7 @@ enum ClaudePlanUsage {
                 continue
             }
             windows.append(.init(id: id, label: label, usedFraction: percent / 100,
-                                 duration: duration, resetsAt: resets, isLimiting: active))
+                                 duration: duration, resetsAt: resets, isLimiting: active, scope: scope))
         }
 
         if let extra = json["extra_usage"], extra["is_enabled"]?.boolValue == true,
@@ -131,6 +135,7 @@ enum ClaudePlanUsage {
 
         return ProviderUsage(source: .provider, windows: windows,
                              providerSaysLimited: windows.contains(where: \.isLimiting),
+                             extraUsageEnabled: json["extra_usage"]?["is_enabled"]?.boolValue,
                              observedAt: now)
     }
 
@@ -217,7 +222,8 @@ extension ChatGPTCodexAdapter {
                 var label = seconds.map(ProviderUsage.label(forWindowSeconds:)) ?? "Usage"
                 if let suffix { label += " · \(suffix)" }
                 return .init(id: "\(idPrefix).\(slot)", label: label, usedFraction: percent / 100,
-                             duration: seconds, resetsAt: resets, isLimiting: reached && percent >= 100)
+                             duration: seconds, resetsAt: resets, isLimiting: reached && percent >= 100,
+                             scope: suffix)
             }
             .sorted { ($0.duration ?? .infinity) < ($1.duration ?? .infinity) }
         }

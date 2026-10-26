@@ -43,14 +43,19 @@ public struct ProviderUsage: Sendable, Hashable {
         public var resetsAt: Date?
         /// The provider says this window is what is blocking requests now.
         public var isLimiting: Bool
+        /// The model or feature this window meters on its own, or nil when it
+        /// meters the whole account. A per-model cap can be spent or idle
+        /// independently of the account's own windows.
+        public var scope: String?
 
         public init(id: String, label: String, usedFraction: Double? = nil, used: Double? = nil,
                     limit: Double? = nil, unit: Unit? = nil, duration: Double? = nil,
-                    resetsAt: Date? = nil, isLimiting: Bool = false) {
+                    resetsAt: Date? = nil, isLimiting: Bool = false, scope: String? = nil) {
             self.id = id; self.label = label
             self.usedFraction = usedFraction.map { min(1, max(0, $0)) }
             self.used = used; self.limit = limit; self.unit = unit
             self.duration = duration; self.resetsAt = resetsAt; self.isLimiting = isLimiting
+            self.scope = scope
         }
 
         public var isExhausted: Bool { isLimiting || (usedFraction ?? 0) >= 1 }
@@ -75,12 +80,17 @@ public struct ProviderUsage: Sendable, Hashable {
     /// The provider's own verdict, which can be stated without any window
     /// being full (a balance that ran dry, a model-level cap).
     public var providerSaysLimited: Bool
+    /// Whether the account can be billed past its plan — Claude's "extra
+    /// usage". Nil when the meter does not say.
+    public var extraUsageEnabled: Bool?
     public var observedAt: Date
 
     public init(source: Source = .provider, plan: String? = nil, windows: [Window] = [],
-                amounts: [Amount] = [], providerSaysLimited: Bool = false, observedAt: Date = Date()) {
+                amounts: [Amount] = [], providerSaysLimited: Bool = false,
+                extraUsageEnabled: Bool? = nil, observedAt: Date = Date()) {
         self.source = source; self.plan = plan; self.windows = windows; self.amounts = amounts
-        self.providerSaysLimited = providerSaysLimited; self.observedAt = observedAt
+        self.providerSaysLimited = providerSaysLimited; self.extraUsageEnabled = extraUsageEnabled
+        self.observedAt = observedAt
     }
 
     public var isEmpty: Bool { windows.isEmpty && amounts.isEmpty && plan == nil }
@@ -184,8 +194,15 @@ public struct ProviderUsageStatus: Sendable, Hashable {
     /// report (or Derby's count, if the provider never answered).
     public var error: String?
     public var attemptedAt: Date?
+    /// When Derby started the window that is running now, so the dashboard
+    /// can say who started it (`PlanWarmUp`). Nil when it did not.
+    public var warmedAt: Date?
+    /// Why the latest attempt to start the window failed.
+    public var warmError: String?
 
-    public init(usage: ProviderUsage? = nil, error: String? = nil, attemptedAt: Date? = nil) {
+    public init(usage: ProviderUsage? = nil, error: String? = nil, attemptedAt: Date? = nil,
+                warmedAt: Date? = nil, warmError: String? = nil) {
         self.usage = usage; self.error = error; self.attemptedAt = attemptedAt
+        self.warmedAt = warmedAt; self.warmError = warmError
     }
 }

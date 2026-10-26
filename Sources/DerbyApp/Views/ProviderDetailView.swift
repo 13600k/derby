@@ -517,7 +517,39 @@ struct ProviderDetailView: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 if showsPlanLimits(current) { planLimits }
+                if let window = sessionWindow(current) { planWindowKeeper(current, window: window) }
+                if current.kind.billsExtraUsage { extraUsageGuard(current) }
             }
+        }
+    }
+
+    /// Whether this login can be billed past its plan, and what Derby does
+    /// about a request that is.
+    private func extraUsageGuard(_ current: ProviderAccount) -> some View {
+        let enabled = model.providerUsage[current.id]?.usage?.extraUsageEnabled
+        return VStack(alignment: .leading, spacing: 8) {
+            Divider().padding(.vertical, 4)
+            Text("Extra usage").font(.callout.weight(.medium))
+            switch enabled {
+            case .some(false):
+                Label("Off for this account — Anthropic cannot bill it past the plan.",
+                      systemImage: "checkmark.shield")
+                    .font(.caption).foregroundStyle(.secondary)
+            case .some(true):
+                Label("On for this account — Anthropic can bill it past the plan. Derby stops at the first request billed that way; turning extra usage off at claude.ai/settings/usage is the only hard guarantee.",
+                      systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption).foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            case nil:
+                Text("Not read yet — refresh the Overview's meter to see whether it is on.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Toggle("Keep sending after a request is billed to extra usage", isOn: Binding(
+                get: { draft?.allowExtraUsage == true },
+                set: { draft?.allowExtraUsage = $0 ? true : nil; save() }))
+            Text("Off by default. When Anthropic answers from extra usage instead of the plan, or does not show the plan paying, Derby sends nothing more to this account until the plan's window resets and routes to the next target. A streamed answer is dropped before any of it reaches the client.")
+                .font(.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
@@ -546,6 +578,86 @@ struct ProviderDetailView: View {
             Text("For plans that meter requests but do not report them to an API key, such as Qwen Cloud's Coding Plan. The Overview shows the successful requests Derby sent this account in the last 5 hours, 7 days and 30 days against these figures. Requests sent from outside Derby are not counted. Routing does not use these fields.")
                 .font(.caption).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    /// The provider's own short window, when its meter reports one — the only
+    /// thing a warm-up can start, so the switch is shown only beside one.
+    private func sessionWindow(_ current: ProviderAccount) -> ProviderUsage.Window? {
+        model.providerUsage[current.id]?.usage.flatMap(PlanWarmUp.sessionWindow)
+    }
+
+    /// The other enabled accounts on this account's CLI login, which share its
+    /// window and therefore its switch.
+    private func loginSiblings(_ current: ProviderAccount) -> [ProviderAccount] {
+        let login = UsageMonitor.loginIdentity(current)
+        return model.config.providers.filter {
+            $0.id != current.id && $0.enabled && UsageMonitor.loginIdentity($0) == login
+        }
+    }
+
+    private func planWindowKeeper(_ current: ProviderAccount, window: ProviderUsage.Window) -> some View {
+        let siblings = loginSiblings(current)
+        let enabledModels = current.models.filter(\.enabled)
+        let status = model.providerUsage[current.id]
+        return VStack(alignment: .leading, spacing: 8) {
+            Divider().padding(.vertical, 4)
+            Toggle("Keep the \(window.label) window running", isOn: Binding(
+                get: { UsageMonitor.keepsWarm([current] + siblings) },
+                set: { setKeepWarm($0) }))
+            Text("When this plan's \(window.label) window is idle, Derby starts it with one tiny request, so it is always counting down and resets sooner once you start working. That is one request each time the window resets — about five a day.")
+                .font(.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if !siblings.isEmpty {
+                Text("Shared with \(siblings.map(\.name).joined(separator: ", ")), which use the same login and the same window. This switch applies to all of them, and the warm-up goes through whichever one actually starts the window.")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if !enabledModels.isEmpty {
+                Picker("Warm-up model", selection: Binding(
+                    get: { draft?.warmUpModelID ?? "" },
+                    set: { newValue in
+                        draft?.warmUpModelID = newValue.isEmpty ? nil : newValue
+                        save()
+                    })) {
+                    Text("First model (\(enabledModels[0].label))").tag("")
+                    ForEach(enabledModels) { m in Text(m.label).tag(m.modelID) }
+                    if let chosen = draft?.warmUpModelID, !enabledModels.contains(where: { $0.modelID == chosen }) {
+                        Text("\(chosen) — unavailable, the first model is used").tag(chosen)
+                    }
+                }
+                .frame(maxWidth: 420)
+            }
+            if let since = status?.warmedAt {
+                Text("Derby started the current window at \(since.formatted(date: .omitted, time: .shortened)).")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            if let error = status?.warmError {
+                Label(error, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption).foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    /// Written to every account on the login: they share one window, and a
+    /// switch that left a sibling sending would turn nothing off.
+    private func setKeepWarm(_ on: Bool) {
+        guard var updated = draft else { return }
+        updated.keepPlanWindowRunning = on
+        draft = updated
+        let saved = updated
+        let login = UsageMonitor.loginIdentity(saved)
+        Task {
+            await model.mutate { config in
+                for index in config.providers.indices {
+                    if config.providers[index].id == saved.id {
+                        config.providers[index] = saved
+                    } else if UsageMonitor.loginIdentity(config.providers[index]) == login {
+                        config.providers[index].keepPlanWindowRunning = on
+                    }
+                }
+            }
         }
     }
 
@@ -578,6 +690,13 @@ struct ProviderDetailView: View {
                         .font(.caption).foregroundStyle(.orange)
                 }
                 HeaderEditor(headers: binding(\.extraHeaders), onCommit: save)
+                if !current.kind.defaultPromptRewrites.isEmpty {
+                    PromptRewriteEditor(rewrites: Binding(get: { draft?.effectivePromptRewrites ?? [] },
+                                                          set: { draft?.promptRewrites = $0 }),
+                                        isDefault: current.promptRewrites == nil,
+                                        onCommit: save,
+                                        onRestore: { draft?.promptRewrites = nil; save() })
+                }
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Notes").font(.callout)
                     TextEditor(text: binding(\.notes))

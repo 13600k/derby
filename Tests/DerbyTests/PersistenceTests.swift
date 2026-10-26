@@ -400,6 +400,8 @@ func registerForwardCompatibilityTests() {
             try expectEqual(account.models.count, 1)
             try expectEqual(account.models[0].modelID, "claude-sonnet-5")
             try expectNil(account.credentialHomeOverride)
+            try expectNil(account.keepPlanWindowRunning, "unset, which keeps the plan's window running")
+            try expectEqual(account.warmUpModel?.modelID, "claude-sonnet-5")
             try expectNil(account.models[0].profile)
         }
 

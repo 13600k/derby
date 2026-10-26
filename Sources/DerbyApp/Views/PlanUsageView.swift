@@ -41,11 +41,17 @@ struct PlanUsageView: View {
                         .joined(separator: " · "))
                         .font(.caption).monospacedDigit()
                 }
-                Text(Self.provenance(usage, failed: status.error != nil))
+                Text(Self.provenance(usage, failed: status.error != nil, warmedAt: status.warmedAt))
                     .font(.caption2).foregroundStyle(.secondary)
             }
             if let error = status.error {
                 Label(error, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption2).foregroundStyle(.orange)
+                    .lineLimit(2)
+                    .help(error)
+            }
+            if let error = status.warmError {
+                Label("Could not start the window: \(error)", systemImage: "exclamationmark.triangle.fill")
                     .font(.caption2).foregroundStyle(.orange)
                     .lineLimit(2)
                     .help(error)
@@ -95,13 +101,16 @@ struct PlanUsageView: View {
         return "resets \(m)m"
     }
 
-    static func provenance(_ usage: ProviderUsage, failed: Bool) -> String {
+    static func provenance(_ usage: ProviderUsage, failed: Bool, warmedAt: Date? = nil) -> String {
         var parts: [String] = []
         switch usage.source {
         case .provider:
             if let plan = usage.plan { parts.append(plan) }
             parts.append(failed ? "last read \(Format.relative(usage.observedAt))"
                                 : "reported by the provider \(Format.relative(usage.observedAt))")
+            if let warmedAt {
+                parts.append("kept running by Derby, started \(warmedAt.formatted(date: .omitted, time: .shortened))")
+            }
         case .counted:
             parts.append("Counted by Derby: successful requests it routed here, rolling windows")
         }

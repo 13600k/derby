@@ -132,6 +132,63 @@ struct HeaderEditor: View {
     }
 }
 
+/// The find-and-replace pairs an account applies to the system prompt, in the
+/// order they run.
+struct PromptRewriteEditor: View {
+    @Binding var rewrites: [PromptRewrite]
+    /// Whether the account follows its kind's list rather than its own.
+    var isDefault: Bool
+    var onCommit: () -> Void
+    var onRestore: () -> Void
+    @State private var newFind = ""
+    @State private var newReplace = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("System prompt rewrites").font(.callout)
+            ForEach(Array(rewrites.enumerated()), id: \.offset) { index, pair in
+                HStack(spacing: 6) {
+                    Text(pair.find)
+                        .font(.system(size: 11, design: .monospaced))
+                        .frame(width: 150, alignment: .leading)
+                    Image(systemName: "arrow.right").font(.caption2).foregroundStyle(.secondary)
+                    Text(pair.replace)
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                    Spacer()
+                    Button {
+                        rewrites.remove(at: index)
+                        onCommit()
+                    } label: { Image(systemName: "minus.circle") }
+                    .buttonStyle(.borderless)
+                }
+            }
+            HStack(spacing: 6) {
+                TextField("Find", text: $newFind)
+                    .textFieldStyle(.roundedBorder).frame(width: 150)
+                TextField("Replace with", text: $newReplace)
+                    .textFieldStyle(.roundedBorder)
+                Button("Add") {
+                    guard !newFind.isEmpty else { return }
+                    rewrites.append(PromptRewrite(find: newFind, replace: newReplace))
+                    newFind = ""; newReplace = ""
+                    onCommit()
+                }
+                .disabled(newFind.isEmpty)
+            }
+            if !isDefault {
+                Button("Restore the default list", action: onRestore)
+                    .buttonStyle(.borderless)
+                    .font(.caption)
+            }
+            Text("Applied to the system prompt only, before it is sent, so a client's own product name does not mark the request as a third-party app — which Anthropic bills to extra usage instead of the plan. Plain, case-sensitive text. Remove every pair to send the prompt unchanged.")
+                .font(.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
 /// One row in a provider's model list, with inline capability and pricing edits.
 struct ModelRow: View {
     var account: ProviderAccount

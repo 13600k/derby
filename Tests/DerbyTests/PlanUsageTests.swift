@@ -487,4 +487,327 @@ func registerPlanUsageTests() {
             try expectEqual(try await withAbandoningDeadline(5, message: "quick") { 7 }, 7)
         }
     }
+
+    suite("Plan usage / keep-warm") {
+        let t0 = Date(timeIntervalSince1970: 1_800_000_000)
+        let fiveHours = ProviderUsage.fiveHours
+
+        /// A plan meter with a five-hour window in the given state, read at `now`.
+        func meter(_ used: Double, resets: Date?, at now: Date, weekly: Double = 0.4) -> ProviderUsage {
+            ProviderUsage(windows: [
+                .init(id: "five_hour", label: "5-hour", usedFraction: used,
+                      duration: fiveHours, resetsAt: resets),
+                .init(id: "seven_day", label: "Weekly", usedFraction: weekly,
+                      duration: ProviderUsage.week, resetsAt: now.addingTimeInterval(3 * 86_400)),
+            ], observedAt: now)
+        }
+
+        func claude(_ name: String, kind: ProviderKind, keep: Bool? = nil) -> ProviderAccount {
+            ProviderAccount(name: name, kind: kind, auth: .cli(source: .claudeCode, allowRefresh: false),
+                            models: [PhysicalModel(modelID: "lead"), PhysicalModel(modelID: "side")],
+                            keepPlanWindowRunning: keep)
+        }
+
+        /// A monitor over `accounts` whose meter answers `reading` and whose
+        /// warm-ups are recorded (and fail when `failure` is set).
+        func monitor(_ accounts: [ProviderAccount], reading: Locked<ProviderUsage?>,
+                     sent: Locked<[String]>, logs: Locked<[String]>,
+                     failure: Locked<DerbyError?> = Locked(nil)) -> UsageMonitor {
+            UsageMonitor(
+                accounts: { accounts },
+                fetch: { account, _ in account.kind.isSubscription ? reading.value : nil },
+                tallies: { _ in [:] },
+                warm: { account in
+                    sent.mutate { $0.append(account.name) }
+                    if let error = failure.value { throw error }
+                    return PlanWarmUp.Receipt(model: account.warmUpModel?.modelID ?? "",
+                                              usage: CanonicalUsage(inputTokens: 14, outputTokens: 1))
+                },
+                log: { level, message in logs.mutate { $0.append("\(level.rawValue): \(message)") } })
+        }
+
+        func refresh(_ monitor: UsageMonitor, at now: Date) async {
+            await monitor.refresh(now: now)
+            await monitor.settleWarmUps()
+        }
+
+        test("the session window is the account's own, shortest window under a day") {
+            let codex = ChatGPTCodexAdapter.parsePlanUsage(try expectNotNil(JSONValue.parse("""
+            {"rate_limit":{"primary_window":{"used_percent":0,"limit_window_seconds":18000},
+                           "secondary_window":{"used_percent":12,"limit_window_seconds":604800}},
+             "additional_rate_limits":[{"limit_name":"Spark","rate_limit":{
+                "primary_window":{"used_percent":0,"limit_window_seconds":3600}}}]}
+            """)))
+            try expectEqual(PlanWarmUp.sessionWindow(codex)?.id, "codex.primary_window",
+                            "a model's own shorter window is not the account's")
+            try expectEqual(codex.windows.first { $0.id.hasPrefix("extra.") }?.scope, "Spark")
+
+            let claude = ClaudePlanUsage.parse(try expectNotNil(JSONValue.parse("""
+            {"five_hour":{"utilization":0.0,"resets_at":null},
+             "seven_day":{"utilization":20.0,"resets_at":"2026-09-21T19:59:59Z"},
+             "seven_day_opus":{"utilization":0.0,"resets_at":null}}
+            """)))
+            try expectEqual(PlanWarmUp.sessionWindow(claude)?.id, "five_hour")
+            try expectEqual(claude.windows.first { $0.id == "seven_day.opus" }?.scope, "opus")
+
+            let weeklyOnly = ChatGPTCodexAdapter.parsePlanUsage(try expectNotNil(JSONValue.parse("""
+            {"rate_limit":{"primary_window":{"used_percent":0,"limit_window_seconds":604800}}}
+            """)))
+            try expectNil(PlanWarmUp.sessionWindow(weeklyOnly), "nothing to keep running")
+
+            var limits = RateLimitConfig()
+            limits.planRequestsPer5Hours = 100
+            let counted = try expectNotNil(ProviderUsage.counted(tallies: [:], limits: limits))
+            try expectNil(PlanWarmUp.sessionWindow(counted), "Derby's own count cannot see the provider's clock")
+        }
+
+        test("idle means the clock is not running, not that nothing is used") {
+            func idle(_ used: Double, _ resets: Date?) -> Bool {
+                PlanWarmUp.isIdle(try! expectNotNil(PlanWarmUp.sessionWindow(meter(used, resets: resets, at: t0))),
+                                  observedAt: t0)
+            }
+            try expect(idle(0, nil), "no reset: nothing started")
+            try expect(idle(0, t0.addingTimeInterval(-60)), "a reset already passed")
+            try expect(idle(0, t0.addingTimeInterval(fiveHours)), "a reset a full window away moves with the clock")
+            try expect(!idle(0, t0.addingTimeInterval(fiveHours - 120)), "a warm-up two minutes ago reads 0% and runs")
+            try expect(!idle(0, t0.addingTimeInterval(2 * 3600)))
+            try expect(!idle(0.03, nil), "anything used means something started it")
+
+            let usage = meter(0, resets: nil, at: t0)
+            try expect(PlanWarmUp.shouldWarm(usage, lastWarmedAt: nil, now: t0))
+            try expect(!PlanWarmUp.shouldWarm(usage, lastWarmedAt: t0.addingTimeInterval(-3600), now: t0),
+                       "the window Derby started an hour ago still runs, whatever the meter says")
+            try expect(PlanWarmUp.shouldWarm(usage, lastWarmedAt: t0.addingTimeInterval(-fiveHours), now: t0))
+            try expect(!PlanWarmUp.shouldWarm(meter(0, resets: nil, at: t0, weekly: 1), lastWarmedAt: nil, now: t0),
+                       "no point starting a window the weekly limit will refuse")
+
+            let request = PlanWarmUp.request(modelID: "lead")
+            try expectEqual(request.maxOutputTokens, 16)
+            try expectNil(request.reasoning)
+            try expectNil(request.temperature, "a background request sends nothing a model might reject")
+        }
+
+        test("an idle window is started once, and not again while the window it started runs") {
+            let account = claude("Claude", kind: .anthropicSubscription)
+            let reading = Locked<ProviderUsage?>(meter(0, resets: nil, at: t0))
+            let sent = Locked<[String]>([]), logs = Locked<[String]>([])
+            let monitor = monitor([account], reading: reading, sent: sent, logs: logs)
+
+            await refresh(monitor, at: t0)
+            try expectEqual(sent.value, ["Claude"])
+            try expectEqual(await monitor.snapshot()[account.id]?.warmedAt, t0)
+            try expect(logs.value.contains { $0.hasPrefix("info: Started the 5-hour window") && $0.contains("lead") })
+
+            // The next tick checks it: running now.
+            let verify = t0.addingTimeInterval(UsageMonitor.tickInterval)
+            reading.value = meter(0, resets: t0.addingTimeInterval(fiveHours), at: verify)
+            await refresh(monitor, at: verify)
+            // A meter that reads idle again later changes nothing while it runs.
+            let later = verify.addingTimeInterval(UsageMonitor.pollInterval)
+            reading.value = meter(0, resets: nil, at: later)
+            await refresh(monitor, at: later)
+            try expectEqual(sent.value.count, 1)
+            try expect(!logs.value.contains { $0.hasPrefix("warn") }, "\(logs.value)")
+
+            // Once it has run its course, the next one starts.
+            let next = t0.addingTimeInterval(fiveHours + 1)
+            reading.value = meter(0, resets: t0.addingTimeInterval(fiveHours), at: next)
+            await refresh(monitor, at: next)
+            try expectEqual(sent.value.count, 2)
+        }
+
+        test("a window that resets is started again within a tick, not at the next poll") {
+            let account = claude("Claude", kind: .anthropicSubscription)
+            let resets = t0.addingTimeInterval(100)
+            let reading = Locked<ProviderUsage?>(meter(0.4, resets: resets, at: t0))
+            let sent = Locked<[String]>([]), logs = Locked<[String]>([])
+            let monitor = monitor([account], reading: reading, sent: sent, logs: logs)
+            await refresh(monitor, at: t0)
+            try expectEqual(sent.value, [], "a running window is left alone")
+
+            let tick = t0.addingTimeInterval(2 * UsageMonitor.tickInterval)
+            reading.value = meter(0, resets: nil, at: tick)
+            await refresh(monitor, at: tick)
+            try expectEqual(sent.value, ["Claude"])
+        }
+
+        test("one account saying no stops the whole login") {
+            let sent = Locked<[String]>([]), logs = Locked<[String]>([])
+            let accounts = [claude("Claude direct", kind: .anthropicSubscription),
+                            claude("Claude Code", kind: .claudeCodeCLI, keep: false)]
+            let monitor = monitor(accounts, reading: Locked(meter(0, resets: nil, at: t0)), sent: sent, logs: logs)
+            await refresh(monitor, at: t0)
+            try expectEqual(sent.value, [])
+            try expect(!UsageMonitor.keepsWarm(accounts))
+            try expect(UsageMonitor.keepsWarm([accounts[0]]), "unset means on")
+        }
+
+        test("a login sends one warm-up, and one that does not start the window hands over") {
+            let direct = claude("Claude direct", kind: .anthropicSubscription)
+            let cli = claude("Claude Code", kind: .claudeCodeCLI)
+            let reading = Locked<ProviderUsage?>(meter(0, resets: nil, at: t0))
+            let sent = Locked<[String]>([]), logs = Locked<[String]>([])
+            let monitor = monitor([direct, cli], reading: reading, sent: sent, logs: logs)
+
+            await refresh(monitor, at: t0)
+            try expectEqual(sent.value, ["Claude direct"], "one login, one request")
+
+            // It answered but landed outside the plan: still idle a tick later.
+            let verify = t0.addingTimeInterval(UsageMonitor.tickInterval)
+            reading.value = meter(0, resets: nil, at: verify)
+            await refresh(monitor, at: verify)
+            try expectEqual(sent.value, ["Claude direct", "Claude Code"])
+            try expect(logs.value.contains { $0.hasPrefix("warn") && $0.contains("trying Claude Code") })
+            try expectEqual(await monitor.snapshot()[cli.id]?.warmedAt, verify,
+                            "credited to the request that started it, not the one that did nothing")
+
+            let confirm = verify.addingTimeInterval(UsageMonitor.tickInterval)
+            reading.value = meter(0, resets: verify.addingTimeInterval(fiveHours), at: confirm)
+            await refresh(monitor, at: confirm)
+            try expectEqual(sent.value.count, 2)
+            try expectEqual(await monitor.snapshot()[direct.id]?.warmedAt, verify, "shared by the login")
+
+            // The account that worked goes first next time.
+            let next = verify.addingTimeInterval(fiveHours + 1)
+            reading.value = meter(0, resets: verify.addingTimeInterval(fiveHours), at: next)
+            await refresh(monitor, at: next)
+            try expectEqual(sent.value.last, "Claude Code")
+        }
+
+        test("when no account starts the window, Derby says so once and waits it out") {
+            let account = claude("Claude", kind: .anthropicSubscription)
+            let reading = Locked<ProviderUsage?>(meter(0, resets: nil, at: t0))
+            let sent = Locked<[String]>([]), logs = Locked<[String]>([])
+            let monitor = monitor([account], reading: reading, sent: sent, logs: logs)
+            await refresh(monitor, at: t0)
+            for step in 1...4 {
+                let now = t0.addingTimeInterval(Double(step) * UsageMonitor.pollInterval / 4 + 1)
+                reading.value = meter(0, resets: nil, at: now)
+                await refresh(monitor, at: now)
+            }
+            try expectEqual(sent.value.count, 1)
+            try expectEqual(logs.value.filter { $0.contains("did not start") }.count, 1, "\(logs.value)")
+            try expectNil(await monitor.snapshot()[account.id]?.warmedAt)
+
+            let next = t0.addingTimeInterval(fiveHours + 1)
+            reading.value = meter(0, resets: nil, at: next)
+            await refresh(monitor, at: next)
+            try expectEqual(sent.value.count, 2, "a new round once the window would have ended")
+        }
+
+        test("a failed warm-up is retried at the next poll and logged once") {
+            let account = claude("Claude", kind: .anthropicSubscription)
+            let reading = Locked<ProviderUsage?>(meter(0, resets: nil, at: t0))
+            let sent = Locked<[String]>([]), logs = Locked<[String]>([])
+            let failure = Locked<DerbyError?>(DerbyError(kind: .authentication, message: "not signed in"))
+            let monitor = monitor([account], reading: reading, sent: sent, logs: logs, failure: failure)
+            await refresh(monitor, at: t0)
+            await refresh(monitor, at: t0.addingTimeInterval(UsageMonitor.tickInterval))
+            try expectEqual(sent.value.count, 1, "a failure does not make the meter due at the next tick")
+            let poll = t0.addingTimeInterval(UsageMonitor.pollInterval)
+            reading.value = meter(0, resets: nil, at: poll)
+            await refresh(monitor, at: poll)
+            try expectEqual(sent.value.count, 2)
+            try expectEqual(logs.value.filter { $0.contains("not signed in") }.count, 1)
+            try expectContains(try expectNotNil(await monitor.snapshot()[account.id]?.warmError), "not signed in")
+        }
+
+        test("nothing is started while paused, from Derby's own count, or when the plan is spent") {
+            let sent = Locked<[String]>([]), logs = Locked<[String]>([])
+            let paused = monitor([claude("Claude", kind: .anthropicSubscription)],
+                                 reading: Locked(meter(0, resets: nil, at: t0)), sent: sent, logs: logs)
+            await paused.setWarmingSuspended(true)
+            await refresh(paused, at: t0)
+
+            let spent = monitor([claude("Claude", kind: .anthropicSubscription)],
+                                reading: Locked(meter(0, resets: nil, at: t0, weekly: 1)), sent: sent, logs: logs)
+            await refresh(spent, at: t0)
+
+            var limits = RateLimitConfig()
+            limits.planRequestsPer5Hours = 100
+            let qwen = ProviderAccount(name: "Qwen Cloud", kind: .qwen, auth: .apiKey(SecretRef(account: "q")),
+                                       rateLimits: limits, models: [PhysicalModel(modelID: "qwen")])
+            let counted = monitor([qwen], reading: Locked(nil), sent: sent, logs: logs)
+            await refresh(counted, at: t0)
+            try expectEqual(await counted.snapshot()[qwen.id]?.usage?.source, .counted)
+
+            try expectEqual(sent.value, [])
+        }
+
+        test("the engine sends a warm-up straight through the adapter, without prompting") {
+            let adapter = WarmUpRecorder()
+            let account = ProviderAccount(name: "ChatGPT", kind: .chatgptSubscription,
+                                          auth: .cli(source: .codexCLI, allowRefresh: false),
+                                          models: [PhysicalModel(modelID: "gpt-lead"),
+                                                   PhysicalModel(modelID: "gpt-side")])
+            let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+                .appendingPathComponent("derby-warm-\(UUID().uuidString)", isDirectory: true)
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: dir) }
+            let store = ConfigStore(url: dir.appendingPathComponent("config.json"))
+            try store.save(DerbyConfig(providers: [account], logicalModels: []))
+            let telemetry = TelemetryStore(path: dir.appendingPathComponent("t.sqlite3").path)
+            try await telemetry.open()
+            let engine = DerbyEngine(configStore: store, secrets: InMemorySecretStore(), transport: MockTransport(),
+                                     adapters: AdapterRegistry.default.overriding(.chatgptCodex, with: adapter),
+                                     telemetry: telemetry)
+            let start = Date()
+
+            await engine.setRoutingPaused(true)
+            await engine.usageMonitor.refresh(now: start)
+            await engine.usageMonitor.settleWarmUps()
+            try expectEqual(adapter.sent.count, 0, "paused means nothing is sent")
+
+            await engine.setRoutingPaused(false)
+            await engine.usageMonitor.refresh(now: start.addingTimeInterval(UsageMonitor.pollInterval))
+            await engine.usageMonitor.settleWarmUps()
+            let sent = try expectNotNil(adapter.sent.first)
+            try expectEqual(sent.model, "gpt-lead", "the account's first model")
+            try expectEqual(sent.request.maxOutputTokens, 16)
+            try expect(!sent.mayPrompt, "background work never opens the Keychain")
+            try expectEqual(await telemetry.requestTallies(since: start.addingTimeInterval(-60)).count, 0,
+                            "a warm-up is not a routed request")
+            await telemetry.close()
+        }
+    }
+}
+
+/// A value several closures in a test share.
+final class Locked<T>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _value: T
+    init(_ value: T) { _value = value }
+    var value: T {
+        get { lock.lock(); defer { lock.unlock() }; return _value }
+        set { lock.lock(); _value = newValue; lock.unlock() }
+    }
+    func mutate(_ body: (inout T) -> Void) { lock.lock(); body(&_value); lock.unlock() }
+}
+
+/// A subscription whose meter always reads idle, recording each warm-up.
+final class WarmUpRecorder: ProviderAdapter, @unchecked Sendable {
+    let family: AdapterFamily = .chatgptCodex
+    private let lock = NSLock()
+    private var _sent: [(model: String, request: CanonicalRequest, mayPrompt: Bool)] = []
+    var sent: [(model: String, request: CanonicalRequest, mayPrompt: Bool)] {
+        lock.lock(); defer { lock.unlock() }; return _sent
+    }
+
+    func authenticate(_ ctx: ProviderContext) async throws -> ResolvedAuth { ResolvedAuth() }
+    func usage(_ ctx: ProviderContext) async throws -> ProviderUsage? {
+        ProviderUsage(windows: [.init(id: "codex.primary_window", label: "5-hour", usedFraction: 0,
+                                      duration: ProviderUsage.fiveHours)])
+    }
+    func execute(_ request: CanonicalRequest, model: String, ctx: ProviderContext) async throws -> CanonicalResponse {
+        lock.withLock { _sent.append((model, request, ctx.mayPromptForCredentials)) }
+        return CanonicalResponse(id: "warm", model: model, message: .assistant("ok"),
+                                 usage: CanonicalUsage(inputTokens: 12, outputTokens: 1))
+    }
+    func stream(_ request: CanonicalRequest, model: String, ctx: ProviderContext) async throws
+        -> AsyncThrowingStream<CanonicalStreamEvent, Error> {
+        throw DerbyError(kind: .transient, message: "not streamed")
+    }
+    func classifyError(status: Int, headers: [String: String], body: Data, model: String) -> DerbyError {
+        DerbyError(kind: .transient, message: "mock", providerStatus: status)
+    }
 }

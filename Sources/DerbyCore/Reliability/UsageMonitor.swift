@@ -13,6 +13,13 @@ import Foundation
 /// kept there is read from what a request already loaded, and only a manual
 /// refresh — something the user did — may raise the system's dialog.
 ///
+/// It also keeps each login's short window running (`PlanWarmUp`): a fresh
+/// reading that shows the window idle starts it with one tiny request through
+/// a member of that login, and the next tick reads the meter again to see that
+/// it did. A member whose request fails or leaves the window idle is passed
+/// over for the next, so the account that lands in the plan's lane is found
+/// without anything here knowing which provider it is.
+///
 /// Nothing here is on the request path, and the router never reads it.
 public actor UsageMonitor {
     /// How often a provider's meter is read.
@@ -23,12 +30,18 @@ public actor UsageMonitor {
     /// button pressed repeatedly cannot turn into a burst against a meter.
     public static let minimumRefreshInterval: Double = 30
     static let fetchDeadline: Double = 25
+    /// How long a warm-up may take: long enough for a CLI-backed account to
+    /// start its process and answer.
+    public static let warmDeadline: Double = 60
 
     public typealias Accounts = @Sendable () async -> [ProviderAccount]
     /// `interactive` is true only for a manual refresh, and is the only case
     /// in which reading a login may prompt.
     public typealias Fetch = @Sendable (_ account: ProviderAccount, _ interactive: Bool) async throws -> ProviderUsage?
     public typealias Tallies = @Sendable (_ since: Date) async -> [UUID: ProviderUsage.Tally]
+    /// Sends one warm-up through `account`. Always background work, so it
+    /// must not prompt for a login either.
+    public typealias Warm = @Sendable (_ account: ProviderAccount) async throws -> PlanWarmUp.Receipt
     public typealias Log = @Sendable (LogLevel, String) async -> Void
 
     private enum Outcome: Sendable {
@@ -47,21 +60,60 @@ public actor UsageMonitor {
         var lastGood: ProviderUsage?
     }
 
+    /// One login's warm-ups.
+    private struct WarmState {
+        /// When Derby last started the window. Holds off the next warm-up for
+        /// one window length, whatever the meter says.
+        var warmedAt: Date?
+        /// What the dashboard says Derby started; cleared when the window
+        /// turned out not to have started.
+        var shownSince: Date?
+        var duration: Double = ProviderUsage.fiveHours
+        var sender: UUID?
+        /// Set by a warm-up that answered: the next tick reads the meter
+        /// again to see whether the window is running.
+        var verifying = false
+        /// Members whose warm-up failed or left the window idle. Passed over
+        /// until every member has been tried.
+        var passedOver: Set<UUID> = []
+        var error: String?
+        /// The last complaint per member, so a repeated one is logged once.
+        var lastErrors: [UUID: String] = [:]
+    }
+
+    private typealias Login = (key: String, members: [ProviderAccount])
+
     private let accounts: Accounts
     private let fetch: Fetch
     private let tallies: Tallies
+    private let warm: Warm?
     private let log: Log
 
     private var readings: [String: Reading] = [:]
     private var statuses: [UUID: ProviderUsageStatus] = [:]
     private var inFlight: Task<Void, Never>?
+    private var warming: [String: WarmState] = [:]
+    private var warmTasks: [String: Task<Void, Never>] = [:]
+    private var warmingSuspended = false
 
+    /// `warm` nil means windows are never started, which keeps a monitor a
+    /// test builds from sending anything.
     public init(accounts: @escaping Accounts, fetch: @escaping Fetch, tallies: @escaping Tallies,
-                log: @escaping Log = { _, _ in }) {
+                warm: Warm? = nil, log: @escaping Log = { _, _ in }) {
         self.accounts = accounts
         self.fetch = fetch
         self.tallies = tallies
+        self.warm = warm
         self.log = log
+    }
+
+    /// Stops warm-ups while routing is paused: paused means nothing is sent
+    /// to a provider, and a warm-up is something sent.
+    public func setWarmingSuspended(_ suspended: Bool) { warmingSuspended = suspended }
+
+    /// Waits for warm-ups already sent to finish. For tests.
+    func settleWarmUps() async {
+        while let task = warmTasks.values.first { await task.value }
     }
 
     /// The latest status of every account that has something to show.
@@ -83,7 +135,7 @@ public actor UsageMonitor {
 
     /// Accounts reading the same CLI login share one allowance and one
     /// reading. Anything else is its own.
-    static func loginIdentity(_ account: ProviderAccount) -> String {
+    public static func loginIdentity(_ account: ProviderAccount) -> String {
         if case .cli(let source, _) = account.auth {
             return "cli.\(source.rawValue).\(account.credentialHomeURL?.standardizedFileURL.path ?? "")"
         }
@@ -99,7 +151,7 @@ public actor UsageMonitor {
         statuses = statuses.filter { live.contains($0.key) }
 
         // Group by login, keeping configuration order within each group.
-        var groups: [(key: String, members: [ProviderAccount])] = []
+        var groups: [Login] = []
         for account in cloud {
             let key = Self.loginIdentity(account)
             if let i = groups.firstIndex(where: { $0.key == key }) { groups[i].members.append(account) }
@@ -107,9 +159,17 @@ public actor UsageMonitor {
         }
         let liveKeys = Set(groups.map(\.key))
         readings = readings.filter { liveKeys.contains($0.key) }
+        warming = warming.filter { liveKeys.contains($0.key) }
 
         let due = groups.filter { group in
             guard let reading = readings[group.key] else { return true }
+            // A warm-up is checked at the next tick, and a window that has
+            // just reset is started again within one, not at the next poll.
+            if warm != nil, Self.keepsWarm(group.members) {
+                if warming[group.key]?.verifying == true { return true }
+                if let resets = reading.lastGood.flatMap(PlanWarmUp.sessionWindow)?.resetsAt,
+                   resets > reading.attemptedAt, resets <= now { return true }
+            }
             let interval: Double
             if force { interval = Self.minimumRefreshInterval }
             else if case .failed(_, local: true) = reading.outcome { interval = Self.tickInterval }
@@ -155,6 +215,14 @@ public actor UsageMonitor {
             await logTransition(names, from: previous?.outcome, to: outcome)
         }
 
+        // Only a reading just taken decides a warm-up: a stale one says
+        // nothing about whether the clock is running now.
+        for group in groups {
+            if case .reported(let usage)? = results[group.key] {
+                await considerWarming(group, usage: usage, now: now)
+            }
+        }
+
         // Derby's own count, only for accounts that have nothing better.
         let needsCount = cloud.filter { account in
             switch readings[Self.loginIdentity(account)]?.outcome {
@@ -176,7 +244,7 @@ public actor UsageMonitor {
             guard let reading = readings[Self.loginIdentity(account)] else { continue }
             let counted = { ProviderUsage.counted(tallies: counts[account.id] ?? [:],
                                                   limits: account.rateLimits, now: now) }
-            let status: ProviderUsageStatus
+            var status: ProviderUsageStatus
             switch reading.outcome {
             case .reported(let usage):
                 status = ProviderUsageStatus(usage: usage, attemptedAt: reading.attemptedAt)
@@ -186,12 +254,127 @@ public actor UsageMonitor {
                 status = ProviderUsageStatus(usage: reading.lastGood ?? counted(), error: message,
                                              attemptedAt: reading.attemptedAt)
             }
+            (status.warmedAt, status.warmError) = warmFields(Self.loginIdentity(account), now: now)
             if status.usage == nil && status.error == nil {
                 statuses[account.id] = nil
             } else {
                 statuses[account.id] = status
             }
         }
+    }
+
+    // MARK: - Keeping the window running
+
+    /// A login is kept warm unless one of its accounts says otherwise: they
+    /// share one window, so one "off" has to mean off.
+    public static func keepsWarm(_ members: [ProviderAccount]) -> Bool {
+        !members.contains { $0.keepPlanWindowRunning == false }
+    }
+
+    private func warmFields(_ key: String, now: Date) -> (Date?, String?) {
+        guard let state = warming[key] else { return (nil, nil) }
+        let since = state.shownSince.flatMap { now.timeIntervalSince($0) < state.duration ? $0 : nil }
+        return (since, state.error)
+    }
+
+    /// Checks the last warm-up against a fresh reading, then starts the
+    /// window if it is idle. The request itself runs off the pass, so neither
+    /// the poll loop nor a manual refresh waits for a CLI to answer.
+    private func considerWarming(_ group: Login, usage: ProviderUsage, now: Date) async {
+        guard let warm, warmTasks[group.key] == nil else { return }
+        var state = warming[group.key] ?? WarmState()
+        var messages: [(LogLevel, String)] = []
+        let names = group.members.map(\.name).joined(separator: ", ")
+        let window = PlanWarmUp.sessionWindow(usage)
+        let label = window?.label ?? "5-hour"
+        if let duration = window?.duration { state.duration = duration }
+        // Only accounts with a model to ask can send one.
+        let eligible = group.members.filter { $0.warmUpModel != nil }
+
+        if state.verifying {
+            state.verifying = false
+            let idle = window.map { PlanWarmUp.isIdle($0, observedAt: usage.observedAt) } ?? false
+            if idle, let sender = state.sender {
+                // It answered without starting the window — most likely it
+                // landed outside the plan. The next account tries now.
+                state.passedOver.insert(sender)
+                state.shownSince = nil
+                let senderName = group.members.first { $0.id == sender }?.name ?? "one account"
+                if let next = eligible.first(where: { !state.passedOver.contains($0.id) }) {
+                    state.warmedAt = nil
+                    messages.append((.warn, "A request through \(senderName) did not start the \(label) window for \(names); trying \(next.name)."))
+                } else {
+                    let retry = (state.warmedAt ?? now).addingTimeInterval(state.duration)
+                    messages.append((.warn, "Requests through \(names) did not start the \(label) window. Derby tries again after \(retry.formatted(date: .omitted, time: .shortened))."))
+                }
+            }
+        }
+
+        var sender: ProviderAccount?
+        if !warmingSuspended, Self.keepsWarm(group.members),
+           PlanWarmUp.shouldWarm(usage, lastWarmedAt: state.warmedAt, now: now) {
+            var remaining = eligible.filter { !state.passedOver.contains($0.id) }
+            if remaining.isEmpty {
+                // Every account has had its turn; start the round again.
+                state.passedOver = []
+                remaining = eligible
+            }
+            sender = remaining.first
+        }
+        warming[group.key] = state
+
+        if let sender {
+            let memberIDs = Set(group.members.map(\.id))
+            warmTasks[group.key] = Task {
+                let result: Result<PlanWarmUp.Receipt, Error>
+                do {
+                    result = .success(try await withAbandoningDeadline(
+                        Self.warmDeadline, message: "\(sender.name) did not answer its warm-up in time") {
+                        try await warm(sender)
+                    })
+                } catch {
+                    result = .failure(error)
+                }
+                await self.finishWarm(group.key, sender: sender, memberIDs: memberIDs, names: names,
+                                      label: label, result: result, now: now)
+            }
+        }
+        for (level, message) in messages { await log(level, message) }
+    }
+
+    private func finishWarm(_ key: String, sender: ProviderAccount, memberIDs: Set<UUID>, names: String,
+                            label: String, result: Result<PlanWarmUp.Receipt, Error>, now: Date) async {
+        warmTasks[key] = nil
+        var state = warming[key] ?? WarmState()
+        var message: (LogLevel, String)?
+        switch result {
+        case .success(let receipt):
+            state.warmedAt = now
+            state.shownSince = now
+            state.sender = sender.id
+            state.verifying = true
+            state.error = nil
+            state.lastErrors[sender.id] = nil
+            let through = names == sender.name ? "" : " through \(sender.name)"
+            message = (.info, "Started the \(label) window for \(names) with one request to \(receipt.model)\(through) (\(receipt.usage.inputTokens) in / \(receipt.usage.outputTokens) out).")
+        case .failure(let error):
+            let text = (error as? DerbyError)?.message ?? error.localizedDescription
+            // The next reading tries the next account on this login.
+            state.passedOver.insert(sender.id)
+            state.error = "\(sender.name): \(text)"
+            if state.lastErrors[sender.id] != text {
+                state.lastErrors[sender.id] = text
+                message = (.warn, "Could not start the \(label) window through \(sender.name): \(text)")
+            }
+        }
+        warming[key] = state
+        // Shown now rather than at the next pass.
+        let (since, error) = warmFields(key, now: now)
+        for id in memberIDs where statuses[id] != nil {
+            statuses[id]?.warmedAt = since
+            statuses[id]?.warmError = error
+        }
+        if let message { await log(message.0, message.1) }
     }
 
     /// Says when a meter starts answering, stops, or changes its complaint —

@@ -25,6 +25,7 @@ func registerAllTests() {
     registerParameterSupportTests()
     registerReasoningLevelTests()
     registerClaudeCLITests()
+    registerClaudePlanTests()
     registerRuntimeMetadataTests()
     registerCompactionTests()
     registerHandoffTests()

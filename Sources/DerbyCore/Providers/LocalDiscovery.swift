@@ -110,22 +110,23 @@ public enum LocalDiscovery {
 
     public static func scanSubscriptions() -> [SubscriptionFinding] {
         let pairs: [(CLICredentialSource, ProviderKind)] = [
-            // The CLI path draws on plan limits unconditionally; the direct-API
-            // path may bill as extra usage depending on the account, so this is
-            // the one to offer by default.
-            (.claudeCode, .claudeCodeCLI),
+            // The direct-API path presents Claude Code's whole identity, tool
+            // names included, so the plan pays for it — with tools and images,
+            // which the CLI path cannot pass through — and `ClaudePlanGuard`
+            // stops it at the first answer the plan did not pay for.
+            (.claudeCode, .anthropicSubscription),
             (.codexCLI, .chatgptSubscription),
             (.geminiCLI, .geminiSubscription),
             (.qwenCLI, .qwenSubscription),
         ]
         return pairs.map { source, kind in
-            // The CLI-backed path needs only the executable: Derby never reads
-            // that credential, and probing the Keychain here would raise an
-            // authorization dialog on every scan.
-            if kind == .claudeCodeCLI {
+            // Claude Code's login lives in the Keychain, and probing it here
+            // would raise an authorization dialog on every scan; the CLI being
+            // installed is the finding, and the login is read on first use.
+            if source == .claudeCode {
                 if let binary = ProcessRunner.locate("claude") {
                     return SubscriptionFinding(source: source, kind: kind, available: true,
-                                               detail: "Claude Code found at \(binary.path) — uses your plan limits.")
+                                               detail: "Claude Code found at \(binary.path) — plan limits, with tools and images.")
                 }
                 return SubscriptionFinding(source: source, kind: kind, available: false,
                                            detail: "Claude Code CLI not found. Install it, then rescan.")

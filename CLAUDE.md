@@ -21,7 +21,7 @@ Pure SwiftPM, **no third-party dependencies**. Only the Command Line Tools are r
 ```bash
 swift build                        # debug build of DerbyCore + DerbyApp
 swift build -c release             # release build
-swift run DerbyTests               # all 606 tests (~7s, no network)
+swift run DerbyTests               # all 629 tests (~7s, no network)
 swift run DerbyTests Routing       # filter by suite or test name
 DERBY_LIVE=1 swift run DerbyTests Live   # opt-in: this machine's real providers
 
@@ -227,6 +227,21 @@ publishes none; OpenAI-compatible kinds declare theirs as `OpenAIQuirks.UsageSty
   dashboard shows successful requests Derby routed there over rolling windows, against the
   limits the user typed into `RateLimitConfig.planRequestsPer*`. It never passes for the
   provider's figure, because it cannot see traffic sent from anywhere else.
+- **Keep-warm starts an idle short window; it is the one thing here that sends.** A plan's
+  five-hour window starts with its first request, so `UsageMonitor` starts it itself — one
+  "reply ok" request (`PlanWarmUp.request`) straight through the adapter, never recorded as a
+  request, never touching health or the ledger. **Idle means the clock is not running, not
+  "0% used"**: a warm-up rounds to 0%, and testing usage alone sent one every poll. A meter shows
+  an unstarted window as no reset, a past reset, or a reset a full window away that moves with
+  every read (`PlanWarmUp.isIdle`). Only the provider's account-wide window counts
+  (`Window.scope == nil`): a per-model cap can be idle while the account runs.
+- **A warm-up is checked, not trusted.** After one, nothing is sent for one window length
+  whatever the meter says, and the meter is read again next tick. A window still idle means the
+  request landed outside the plan (a direct-API call can bill as extra usage), so the next account
+  on the login sends instead — which is how the one that counts is found with no provider branch.
+  On by default (`ProviderAccount.keepPlanWindowRunning` nil means on); one `false` on any
+  account of a login turns it off for the login, since they share the window. Paused routing
+  sends nothing, warm-ups included.
 
 ### Context compaction
 
@@ -337,6 +352,26 @@ Verified live on this machine while building:
   `POST https://api.anthropic.com/v1/messages` with `authorization: Bearer <token>` plus
   `anthropic-beta: oauth-2025-04-20`. The first system block **must** identify the caller as
   Claude Code or the token is rejected; the adapter injects it.
+- **Which allowance pays is decided by what the request looks like, not by the token.** A
+  request Anthropic does not take for Claude Code is a "third-party app" and is billed to
+  extra usage — pay-as-you-go past the plan — or refused. Besides the headers and system block
+  (`ClaudeCodeIdentity`), it reads the **tool names**: a bare `read_file` or a
+  single-underscore `mcp_read_file` marks a third party, so every tool goes out as
+  `mcp__<name>` (`ClaudeCodeIdentity.ToolNames`, mapped back before the client sees it), as
+  Hermes Agent does. It reads the **system prompt** too, so the account's `PromptRewrite`
+  pairs (defaults from `ProviderKind.defaultPromptRewrites`: Hermes's own product names) are
+  applied to the system blocks — and only to them. This is the one place Derby rewrites what
+  a client sent; it is per account, editable, and logged.
+- **A subscription is held to its plan.** Every answer carries
+  `anthropic-ratelimit-unified-*` headers; `PlanLane` reads them the way the CLI does
+  (`overage-in-use`, or `status: rejected` with overage allowed, means extra usage paid).
+  `ClaudePlanGuard` holds an account out of routing until the plan resets at the first
+  answer the plan did not pay for — or that shows no unified headers at all, since failing
+  open there is what would bill — and a held account fails in a millisecond as
+  `QUOTA_EXHAUSTED`, which fails over. A stream is judged on its headers before a byte is
+  read. `ProviderAccount.allowExtraUsage` turns this off. The only hard guarantee is extra
+  usage turned off on the account itself, which the meter reports as
+  `ProviderUsage.extraUsageEnabled` and the provider page shows.
 - **ChatGPT subscription (Codex OAuth)** uses `~/.codex/auth.json` →
   `POST https://chatgpt.com/backend-api/codex/responses` with `chatgpt-account-id`. Endpoint
   and headers confirmed; the local token was expired, so end-to-end success is unverified.

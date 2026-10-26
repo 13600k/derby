@@ -88,6 +88,23 @@ public actor DerbyEngine {
                 return try await adapters.adapter(for: account.kind).usage(ctx)
             },
             tallies: { since in await telemetry.requestTallies(since: since) },
+            // Straight through the adapter, like a probe: a warm-up is not a
+            // routed request, so it never enters request history, health or
+            // the hand-off ledger.
+            warm: { account in
+                guard let model = account.warmUpModel else {
+                    throw DerbyError(kind: .modelUnavailable,
+                                     message: "\(account.name) has no enabled model to send a warm-up to.")
+                }
+                let ctx = DerbyEngine.providerContext(for: account, transport: transport, secrets: secrets,
+                                                      credentials: credentials,
+                                                      timeout: UsageMonitor.warmDeadline,
+                                                      modelID: model.modelID,
+                                                      mayPromptForCredentials: false)
+                let response = try await adapters.adapter(for: account.kind)
+                    .execute(PlanWarmUp.request(modelID: model.modelID), model: model.modelID, ctx: ctx)
+                return PlanWarmUp.Receipt(model: model.modelID, usage: response.usage)
+            },
             log: { level, message in
                 await telemetry.log(LogEntry(level: level, category: "usage", message: message))
             })
@@ -363,8 +380,9 @@ public actor DerbyEngine {
         try await startGateway()
     }
 
-    public func setRoutingPaused(_ paused: Bool) {
+    public func setRoutingPaused(_ paused: Bool) async {
         routingPaused = paused
+        await usageMonitor.setWarmingSuspended(paused)
     }
     public func isRoutingPaused() -> Bool { routingPaused }
 
@@ -384,6 +402,16 @@ public actor DerbyEngine {
 
     private func context(for account: ProviderAccount, timeout: Double = 30,
                          modelID: String? = nil) -> ProviderContext {
+        Self.providerContext(for: account, transport: transport, secrets: secrets, credentials: credentials,
+                             timeout: timeout, modelID: modelID)
+    }
+
+    /// A context for work outside the router — probes, warm-ups — which
+    /// shapes its request the way the executor would.
+    static func providerContext(for account: ProviderAccount, transport: any HTTPTransport,
+                                secrets: any SecretStore, credentials: CredentialCache,
+                                timeout: Double, modelID: String?,
+                                mayPromptForCredentials: Bool = true) -> ProviderContext {
         // Resolve the model's metadata when one is named, so a probe shapes its
         // request the same way the executor would — including omitting
         // parameters the model rejects.
@@ -398,7 +426,8 @@ public actor DerbyEngine {
         }
         return ProviderContext(account: account, transport: transport, secrets: secrets,
                                credentials: credentials, attemptTimeout: timeout,
-                               modelCapabilities: capabilities)
+                               modelCapabilities: capabilities,
+                               mayPromptForCredentials: mayPromptForCredentials)
     }
 
     public func testConnection(_ account: ProviderAccount) async -> ConnectionTestResult {
@@ -595,9 +624,7 @@ public actor DerbyEngine {
     /// Sends a single cheap completion to verify a specific model really works.
     public func probeModel(account: ProviderAccount, modelID: String) async -> ConnectionTestResult {
         let adapter = adapters.adapter(for: account.kind)
-        var request = CanonicalRequest(requestedModel: modelID)
-        request.messages = [.user("Reply with the single word: ok")]
-        request.maxOutputTokens = 16
+        var request = PlanWarmUp.request(modelID: modelID)
         // Deliberately set: the adapter drops it for a model that rejects
         // sampling parameters, so the probe also exercises that shaping.
         request.temperature = 0

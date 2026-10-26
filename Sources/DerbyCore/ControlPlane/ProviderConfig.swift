@@ -14,10 +14,13 @@ public enum ProviderKind: String, Codable, Sendable, CaseIterable, Hashable {
     case qwen                       // Alibaba DashScope compatible-mode
     // Subscription-backed consumer accounts
     /// Runs the `claude` CLI, which is unambiguously a first-party client and
-    /// therefore draws on the subscription's plan limits. The direct-API sibling
-    /// below presents the same identity over HTTP, but which lane Anthropic puts
-    /// that in is account-dependent — see `ClaudeCodeIdentity`.
+    /// therefore draws on the subscription's plan limits — but takes no tools,
+    /// images or sampling parameters.
     case claudeCodeCLI = "claude_code_cli"
+    /// The Messages API with the Claude Code login, presenting the CLI's whole
+    /// identity (`ClaudeCodeIdentity`) so the plan pays for it, with tools and
+    /// images. `ClaudePlanGuard` stops it at the first answer the plan did not
+    /// pay for.
     case anthropicSubscription = "anthropic_subscription"
     case chatgptSubscription = "chatgpt_subscription"
     case geminiSubscription = "gemini_subscription"
@@ -141,6 +144,35 @@ public enum ProviderKind: String, Codable, Sendable, CaseIterable, Hashable {
         case .claudeCodeCLI, .anthropicSubscription, .chatgptSubscription,
              .geminiSubscription, .qwenSubscription: return true
         default: return false
+        }
+    }
+
+    /// Whether the account can be billed past its plan — Claude's "extra
+    /// usage" — so Derby guards it (`ClaudePlanGuard`) and the UI says whether
+    /// the account has it turned on.
+    public var billsExtraUsage: Bool {
+        switch self {
+        case .anthropicSubscription: return true
+        default: return false
+        }
+    }
+
+    /// Names swapped out of the system prompt before it reaches this provider.
+    ///
+    /// Anthropic reads the prompt as well as the tool names when it decides
+    /// whether a subscription request comes from Claude Code or a third-party
+    /// app, and a third-party app is billed to extra usage. These are the pairs
+    /// Hermes Agent replaces on its own subscription path; Hermes reaches Claude
+    /// through Derby, so its prompt arrives here with them in it.
+    public var defaultPromptRewrites: [PromptRewrite] {
+        switch self {
+        case .anthropicSubscription:
+            return [PromptRewrite(find: "Hermes Agent", replace: "Claude Code"),
+                    PromptRewrite(find: "Hermes agent", replace: "Claude Code"),
+                    PromptRewrite(find: "hermes-agent", replace: "claude-code"),
+                    PromptRewrite(find: "Nous Research", replace: "Anthropic")]
+        default:
+            return []
         }
     }
 
@@ -482,6 +514,15 @@ public struct PhysicalModel: Codable, Sendable, Hashable, Identifiable {
     public var label: String { displayName ?? modelID }
 }
 
+/// One find-and-replace applied to the system prompt an account sends.
+/// Plain, case-sensitive text — never a pattern — so what it changes is exactly
+/// what it says.
+public struct PromptRewrite: Codable, Sendable, Hashable {
+    public var find: String
+    public var replace: String
+    public init(find: String, replace: String) { self.find = find; self.replace = replace }
+}
+
 /// One configured account/endpoint. The same `ProviderKind` may appear many
 /// times (OpenAI Personal, OpenAI Work, …); each is an independent routing
 /// target with its own credentials, health and limits.
@@ -522,6 +563,26 @@ public struct ProviderAccount: Codable, Sendable, Hashable, Identifiable {
     /// (`CODEX_HOME` / `CLAUDE_CONFIG_DIR`). Nil means the CLI's default home.
     /// This is what lets several accounts of the *same* service coexist.
     public var credentialHomeOverride: String?
+    /// Whether Derby keeps the plan's short usage window (five hours) running
+    /// by starting it when it is idle — see `PlanWarmUp`. Nil means on: only an
+    /// explicit `false` turns it off, and an account whose meter reports no
+    /// such window is never touched either way. Accounts on one CLI login share
+    /// one window, so a `false` on any of them stops it for the whole login.
+    public var keepPlanWindowRunning: Bool?
+    /// The model a warm-up asks. Nil, or a model no longer offered, means the
+    /// account's first enabled model — the provider's lead model, which counts
+    /// against the main window where a side model can be metered on its own.
+    public var warmUpModelID: String?
+    /// Whether Derby may keep sending through a login after Anthropic billed a
+    /// request to extra usage — pay-as-you-go past the plan. Nil means no: the
+    /// first such answer holds the account out of routing until the plan
+    /// resets (`ClaudePlanGuard`). Only kinds where `billsExtraUsage` is true
+    /// read it.
+    public var allowExtraUsage: Bool?
+    /// Find-and-replace pairs applied to the system prompt this account sends.
+    /// Nil means the kind's own list (`ProviderKind.defaultPromptRewrites`);
+    /// an empty list turns rewriting off.
+    public var promptRewrites: [PromptRewrite]?
 
     public init(id: UUID = UUID(), name: String, kind: ProviderKind, enabled: Bool = true,
                 baseURLOverride: String? = nil, auth: AuthConfig = .none,
@@ -537,7 +598,9 @@ public struct ProviderAccount: Codable, Sendable, Hashable, Identifiable {
                 allowInsecureTLS: Bool = false,
                 preferenceScore: Double = 50,
                 credentialHomeOverride: String? = nil,
-                executablePathOverride: String? = nil) {
+                executablePathOverride: String? = nil,
+                keepPlanWindowRunning: Bool? = nil,
+                warmUpModelID: String? = nil) {
         self.id = id; self.name = name; self.kind = kind; self.enabled = enabled
         self.baseURLOverride = baseURLOverride; self.auth = auth
         self.extraHeaders = extraHeaders
@@ -550,6 +613,8 @@ public struct ProviderAccount: Codable, Sendable, Hashable, Identifiable {
         self.preferenceScore = preferenceScore
         self.credentialHomeOverride = credentialHomeOverride
         self.executablePathOverride = executablePathOverride
+        self.keepPlanWindowRunning = keepPlanWindowRunning
+        self.warmUpModelID = warmUpModelID
     }
 
     /// Resolved credential home, or nil for the CLI default.
@@ -575,6 +640,19 @@ public struct ProviderAccount: Codable, Sendable, Hashable, Identifiable {
     /// health checks, connection tests — which have no logical model to consult.
     public var outOfBandTimeoutSeconds: Double {
         requestTimeoutSeconds ?? kind.defaultTimeouts.requestSeconds ?? 300
+    }
+
+    /// The rewrites this account applies: its own list, or the kind's.
+    public var effectivePromptRewrites: [PromptRewrite] {
+        promptRewrites ?? kind.defaultPromptRewrites
+    }
+
+    /// The model a warm-up is sent to: the chosen one while it is still
+    /// offered, otherwise the first enabled model.
+    public var warmUpModel: PhysicalModel? {
+        let enabled = models.filter(\.enabled)
+        if let id = warmUpModelID, let chosen = enabled.first(where: { $0.modelID == id }) { return chosen }
+        return enabled.first
     }
 
     public func model(id: UUID) -> PhysicalModel? { models.first { $0.id == id } }

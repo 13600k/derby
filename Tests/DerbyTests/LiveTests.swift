@@ -574,6 +574,104 @@ func registerLiveTests() {
                   + String(format: "%.1f", Date().timeIntervalSince(left)) + "s after the client left")
         }
     }
+
+    // MARK: - Plan windows
+
+    suite("Live / plan windows") {
+        /// Keep-warm rests on how a meter shows a window nobody has started:
+        /// no reset, one already past, or one a whole window away that moves
+        /// with the clock. Two reads a few seconds apart tell them apart.
+        test("each subscription's short window reads the way keep-warm expects") {
+            let meters = try await LiveGateway.shared.planMeters(gap: 5)
+            if meters.isEmpty { print("      (skipped: no subscription here reports a plan meter)") }
+            for meter in meters {
+                guard let window = PlanWarmUp.sessionWindow(meter.first) else {
+                    print("      \(meter.login): no short window (\(meter.first.summary))")
+                    continue
+                }
+                let idle = PlanWarmUp.isIdle(window, observedAt: meter.first.observedAt)
+                let resets = window.resetsAt.map {
+                    "resets in " + String(format: "%.0f", $0.timeIntervalSince(meter.first.observedAt)) + "s"
+                } ?? "no reset"
+                var moved = "second read failed"
+                if let later = meter.second.flatMap(PlanWarmUp.sessionWindow) {
+                    switch (window.resetsAt, later.resetsAt) {
+                    case (let a?, let b?):
+                        let delta = b.timeIntervalSince(a)
+                        moved = "reset moved " + String(format: "%.1f", delta) + "s between reads"
+                        if !idle {
+                            try expect(abs(delta) < 2, "\(meter.login): a running window's reset must stay put, "
+                                       + "or the cooldown and verification read it wrongly")
+                        }
+                    case (nil, nil): moved = "still no reset"
+                    default: moved = "reset appeared or vanished between reads"
+                    }
+                }
+                print("      \(meter.login): \(window.label) \(Int(((window.usedFraction ?? 0) * 100).rounded()))%, "
+                      + "\(resets), \(moved) → \(idle ? "idle, keep-warm would start it" : "running")")
+            }
+        }
+    }
+
+    // MARK: - Claude subscription
+
+    suite("Live / Claude subscription") {
+        /// One request shaped like Hermes's — its system prompt, a tool to call —
+        /// through the direct API with the Claude Code login, which must come
+        /// back paid for by the plan. Reads the login from a file only
+        /// (`DERBY_LIVE_CLAUDE_HOME`, default `~/.claude`), so no Keychain
+        /// dialog, and sends nothing unless the meter says extra usage is off:
+        /// a check of the plan must not be able to bill past it.
+        test("a Hermes-shaped request with tools is paid for by the plan") {
+            let home = ProcessInfo.processInfo.environment["DERBY_LIVE_CLAUDE_HOME"] ?? "~/.claude"
+            guard FileManager.default.fileExists(atPath: (home as NSString).expandingTildeInPath + "/.credentials.json") else {
+                print("      (skipped: no Claude Code login file in \(home))")
+                return
+            }
+            let tap = HeaderTap(inner: URLSessionTransport.shared)
+            let account = ProviderAccount(name: "Claude (live)", kind: .anthropicSubscription,
+                                          auth: .cli(source: .claudeCode, allowRefresh: false),
+                                          credentialHomeOverride: home)
+            let ctx = ProviderContext(account: account, transport: tap, secrets: InMemorySecretStore(),
+                                      credentials: CredentialCache(), attemptTimeout: 120)
+            let adapter = AnthropicAdapter(oauth: true, planGuard: ClaudePlanGuard())
+
+            let meter = try await adapter.usage(ctx)
+            print("      meter: \(meter?.summary ?? "none"); extra usage enabled: \(meter?.extraUsageEnabled.map(String.init) ?? "not reported")")
+            guard meter?.extraUsageEnabled == false else {
+                print("      (skipped: extra usage is not confirmed off — turn it off at claude.ai/settings/usage; nothing was sent)")
+                return
+            }
+
+            let model = ModelCatalog.presetModels(for: .anthropicSubscription).first { $0.contains("haiku") }
+                ?? "claude-haiku-4-5-20251001"
+            var request = CanonicalRequest(requestedModel: "planclaude", messages: [
+                .system("You are Hermes Agent, an intelligent AI assistant created by Nous Research."),
+                .user("What is the weather in Paris? Use the tool."),
+            ])
+            request.tools = [CanonicalTool(name: "get_weather", description: "Current weather for a city",
+                                           parameters: .object(["type": .string("object"),
+                                                                "properties": .object(["city": .object(["type": .string("string")])]),
+                                                                "required": .array([.string("city")])]))]
+            request.toolChoice = .required
+            request.maxOutputTokens = 200
+            request.stream = true
+
+            var answer = StreamAccumulator()
+            for try await event in try await adapter.stream(request, model: model, ctx: ctx) { answer.ingest(event) }
+            let response = answer.makeResponse(fallbackModel: model)
+            let lane = PlanLane.parse(tap.lastHeaders)
+            let sent = try expectNotNil(tap.lastBody)
+            print("      \(model): lane \(lane); wire tools \(sent["tools"]?.arrayValue?.compactMap { $0["name"]?.stringValue } ?? []); "
+                  + "tool call \(response.message.toolCalls.first?.name ?? "none")")
+            try expectNotNil(tap.lastHeaders["anthropic-ratelimit-unified-status"],
+                             "a subscription answer without unified headers cannot be shown to be on the plan")
+            guard case .plan = lane else { throw TestFailure(message: "billed outside the plan: \(lane)", file: #fileID, line: #line) }
+            try expectEqual(response.message.toolCalls.first?.name, "get_weather")
+            try expect(!(sent["system"]?.compactJSONString.contains("Hermes Agent") ?? true),
+                       "the client's product name must not reach Anthropic")
+        }
+    }
 }
 
 // MARK: - The live gateway
@@ -712,6 +810,33 @@ actor LiveGateway {
         return engine?.handoffLedger
     }
 
+    /// Reads each subscription login's plan meter twice, `gap` seconds apart,
+    /// through the real adapter — never opening the Keychain, as the monitor
+    /// does not.
+    func planMeters(gap: Double) async throws -> [(login: String, first: ProviderUsage, second: ProviderUsage?)] {
+        _ = try await start()
+        var seen: Set<String> = []
+        var out: [(login: String, first: ProviderUsage, second: ProviderUsage?)] = []
+        for account in accounts.values.sorted(by: { $0.name < $1.name })
+        where account.enabled && account.kind.isSubscription {
+            guard seen.insert(UsageMonitor.loginIdentity(account)).inserted else { continue }
+            let ctx = ProviderContext(account: account, transport: URLSessionTransport.shared,
+                                      secrets: InMemorySecretStore(), credentials: CredentialCache(),
+                                      attemptTimeout: 20, mayPromptForCredentials: false)
+            let adapter = AdapterRegistry.default.adapter(for: account.kind)
+            let first: ProviderUsage?
+            do { first = try await adapter.usage(ctx) } catch {
+                print("      \(account.name): could not read the meter: \((error as? DerbyError)?.message ?? "\(error)")")
+                continue
+            }
+            guard let first else { continue }
+            try await Task.sleep(nanoseconds: UInt64(gap * 1_000_000_000))
+            let second = try? await adapter.usage(ctx)
+            out.append((account.name, first, second ?? nil))
+        }
+        return out
+    }
+
     /// Asks a configured server what it has loaded, through the real adapter.
     func loadedModels(providerNamed name: String) async throws -> Set<String>? {
         guard let ctx = try await context(providerNamed: name) else { return nil }
@@ -822,5 +947,36 @@ final class SpyTransport: HTTPTransport, @unchecked Sendable {
     func streamRaw(_ request: OutboundRequest) async throws -> RawStreamStart {
         record(request)
         return try await inner.streamRaw(request)
+    }
+}
+
+/// Passes requests through and keeps what the last one sent and got back.
+final class HeaderTap: HTTPTransport, @unchecked Sendable {
+    private let inner: any HTTPTransport
+    private let lock = NSLock()
+    private var _headers: [String: String] = [:]
+    private var _body: JSONValue?
+    init(inner: any HTTPTransport) { self.inner = inner }
+
+    var lastHeaders: [String: String] { lock.lock(); defer { lock.unlock() }; return _headers }
+    var lastBody: JSONValue? { lock.lock(); defer { lock.unlock() }; return _body }
+
+    private func note(_ request: OutboundRequest, _ headers: [String: String]) {
+        lock.lock()
+        _headers = headers
+        _body = request.body.flatMap { try? JSONDecoder().decode(JSONValue.self, from: $0) }
+        lock.unlock()
+    }
+
+    func send(_ request: OutboundRequest) async throws -> OutboundResponse {
+        let response = try await inner.send(request)
+        note(request, response.headers)
+        return response
+    }
+
+    func stream(_ request: OutboundRequest) async throws -> StreamStart {
+        let start = try await inner.stream(request)
+        note(request, start.headers)
+        return start
     }
 }

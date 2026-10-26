@@ -19,6 +19,8 @@ final class MockTransport: HTTPTransport, @unchecked Sendable {
     private var _requests: [Recorded] = []
     var responses: [String: OutboundResponse] = [:]
     var streams: [String: [String]] = [:]
+    /// Headers every successful stream opens with.
+    var streamHeaders: [String: String] = [:]
     var defaultResponse: OutboundResponse?
     /// Consulted before the path stubs; return nil to fall through to them.
     var responder: (@Sendable (OutboundRequest) -> OutboundResponse?)?
@@ -72,7 +74,7 @@ final class MockTransport: HTTPTransport, @unchecked Sendable {
             throw DerbyError(kind: .providerDown, message: "No stream stub for \(request.url.path)")
         }
         let delay = artificialDelay
-        return StreamStart(status: 200, headers: [:], events: AsyncThrowingStream { c in
+        return StreamStart(status: 200, headers: streamHeaders, events: AsyncThrowingStream { c in
             Task {
                 for e in events {
                     if delay > 0 { try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) }
