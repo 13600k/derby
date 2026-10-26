@@ -7,8 +7,14 @@ struct DerbyApplication: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var model = AppModel.shared
 
+    /// The dashboard is opened by scene id, never found in `NSApp.windows`:
+    /// closing it destroys the window, so after a close (or a windowless launch)
+    /// there is nothing to bring forward. A `Window` scene, unlike a
+    /// `WindowGroup`, fronts the open window instead of adding a second one.
+    static let mainWindowID = "main"
+
     var body: some Scene {
-        WindowGroup("Derby") {
+        Window("Derby", id: Self.mainWindowID) {
             RootView()
                 .environmentObject(model)
                 // Derby's teal accent, so system controls match `.derbyAccent`
@@ -105,6 +111,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 struct MenuBarContent: View {
     @EnvironmentObject private var model: AppModel
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         Text("Derby: \(statusText)")
@@ -114,10 +121,9 @@ struct MenuBarContent: View {
         Divider()
 
         Button("Open Derby") {
+            // Recreates the window if it was closed; see `mainWindowID`.
+            openWindow(id: DerbyApplication.mainWindowID)
             NSApp.activate(ignoringOtherApps: true)
-            if let window = NSApp.windows.first(where: { $0.canBecomeMain }) {
-                window.makeKeyAndOrderFront(nil)
-            }
         }
         Button("Copy Endpoint") {
             model.copyToPasteboard(model.endpoint, label: "Endpoint")
