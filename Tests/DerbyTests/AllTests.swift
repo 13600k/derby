@@ -34,6 +34,7 @@ func registerAllTests() {
     registerContinuityTests()
     registerLoadTests()
     registerPlanUsageTests()
+    registerExpiringAllowanceTests()
     registerEndToEndTests()
     // Checks against this machine's real providers. Opt-in, because every other
     // suite must pass with no network at all: DERBY_LIVE=1 swift run DerbyTests Live
