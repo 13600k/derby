@@ -67,7 +67,11 @@ CLI path can still be added by hand. Its cost:
 
 - **No tool calling and no images.** The CLI runs its own agent loop and accepts no
   caller-supplied tool schemas, so this provider does not advertise those capabilities and
-  such requests route to another target.
+  such requests route to another target — or, with no other target, fail as
+  `CAPABILITY_MISMATCH`. That is enforced by `AdapterFamily.withheldCapabilities`, after
+  anything saved or overridden: the CLI's models used to be saved with the catalog's Claude
+  row, tools included, so Hermes's tool requests reached the CLI and were answered without
+  their tools.
 - **No sampling parameters.** `temperature` and friends are not exposed by the CLI.
 - **Process overhead.** Claude Code's own system prompt, tool schemas and project context cost
   about 27k tokens per call; `--tools "" --setting-sources "" --strict-mcp-config` with an

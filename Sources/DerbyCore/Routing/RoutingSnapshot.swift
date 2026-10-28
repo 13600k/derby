@@ -172,6 +172,9 @@ public struct RoutingSnapshot: Sendable {
                     caps = catalog.capabilities
                 }
                 caps = caps.overridden(by: model.capabilityOverrides)
+                // Last, so neither a row saved before this was known nor an
+                // override can claim what the adapter would silently drop.
+                caps.flags.subtract(account.kind.adapterFamily.withheldCapabilities)
 
                 let overrideKey = "\(account.id.uuidString)/\(model.modelID)"
                 var pricing = model.pricingOverride ?? catalog.pricing

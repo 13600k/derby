@@ -314,6 +314,21 @@ public enum AdapterFamily: String, Codable, Sendable, CaseIterable {
         }
     }
 
+    /// What this protocol cannot carry, whatever the model behind it can do.
+    ///
+    /// The Claude CLI takes a prompt, not tool schemas, images or a response
+    /// format, yet its accounts were saved with the catalog's Claude row —
+    /// tools included — so routing sent Hermes's tool requests there and the
+    /// CLI answered without them. These flags are removed from every answer
+    /// about such a target, a user's override included.
+    public var withheldCapabilities: CapabilityFlags {
+        switch self {
+        case .claudeCLI: return CapabilityFlags([.tools, .parallelTools, .jsonMode, .jsonSchema])
+                                    .union(.allModalities)
+        default: return []
+        }
+    }
+
     /// Whether a tool result may contain images on this protocol.
     public var toolResultsAcceptImages: Bool {
         self == .anthropic || self == .anthropicOAuth || self == .bedrock

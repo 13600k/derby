@@ -151,6 +151,15 @@ public enum ModelCatalog {
     /// answers, gaps are filled from the next one down rather than left blank.
     public static func metadata(for modelID: String, kind: ProviderKind)
         -> (capabilities: ModelCapabilities, pricing: Pricing?, quality: Double) {
+        var answer = modelMetadata(for: modelID, kind: kind)
+        // A model's row says what the weights can do; the protocol reaching them
+        // may carry less, and a row saved from here is what routing trusts.
+        answer.capabilities.flags.subtract(kind.adapterFamily.withheldCapabilities)
+        return answer
+    }
+
+    private static func modelMetadata(for modelID: String, kind: ProviderKind)
+        -> (capabilities: ModelCapabilities, pricing: Pricing?, quality: Double) {
 
         // An alias the provider resolves for itself describes whichever model it
         // currently runs, so answer for that model rather than for a name no

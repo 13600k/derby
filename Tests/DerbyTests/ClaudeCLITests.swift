@@ -134,6 +134,50 @@ func registerClaudeCLITests() {
             try expectEqual(decision.plan.attempts.count, 1)
             try expectEqual(decision.plan.attempts[0].target.providerName, "Other")
         }
+
+        // What the app actually saved for this account: the catalog's Claude
+        // row, tools included. Routing trusted it, and the CLI dropped Hermes's
+        // tools without a word.
+        func storedLikeTheApp(_ id: String) -> PhysicalModel {
+            Fixture.model(id, caps: [.text, .streaming, .tools, .parallelTools, .vision,
+                                     .jsonMode, .jsonSchema, .reasoning])
+        }
+
+        test("a CLI model saved with tools still routes a tool request elsewhere") {
+            let cli = Fixture.account("Claude Code", kind: .claudeCodeCLI, models: [storedLikeTheApp("opus")])
+            let api = Fixture.account("Other", models: [Fixture.model("m", caps: [.text, .streaming, .tools])])
+            let config = Fixture.config(accounts: [cli, api],
+                                        logicalModels: [Fixture.logical("cod", accounts: [cli, api])])
+            var request = CanonicalRequest(requestedModel: "cod")
+            request.tools = [CanonicalTool(name: "f")]
+            let decision = try Router().route(RoutingRequest(request), snapshot: Fixture.snapshot(config))
+            try expectEqual(decision.plan.attempts.map(\.target.providerName), ["Other"])
+        }
+
+        test("a tool request with only a CLI target is refused, not sent without its tools") {
+            let cli = Fixture.account("Claude Code", kind: .claudeCodeCLI, models: [storedLikeTheApp("opus")])
+            let config = Fixture.config(accounts: [cli],
+                                        logicalModels: [Fixture.logical("cod", accounts: [cli])])
+            var request = CanonicalRequest(requestedModel: "cod")
+            request.tools = [CanonicalTool(name: "f")]
+            _ = try await expectFailure(.capabilityMismatch) {
+                _ = try Router().route(RoutingRequest(request), snapshot: Fixture.snapshot(config))
+            }
+            // Without tools it still answers.
+            let plain = try Router().route(RoutingRequest(CanonicalRequest(requestedModel: "cod")),
+                                           snapshot: Fixture.snapshot(config))
+            try expectEqual(plain.plan.attempts.map(\.target.providerName), ["Claude Code"])
+        }
+
+        test("an override claiming tools on a CLI model is withheld too") {
+            var model = Fixture.model("opus", caps: [.text, .streaming])
+            model.capabilityOverrides = PartialCapabilities(flags: [.text, .streaming, .tools])
+            let cli = Fixture.account("Claude Code", kind: .claudeCodeCLI, models: [model])
+            let config = Fixture.config(accounts: [cli],
+                                        logicalModels: [Fixture.logical("cod", accounts: [cli])])
+            let target = try expectNotNil(Fixture.snapshot(config).logicalModels["cod"]?.targets.first)
+            try expect(!target.capabilities.flags.contains(.tools))
+        }
     }
 
     suite("Claude CLI / failure handling") {
@@ -320,6 +364,18 @@ func registerClaudeCLITests() {
                 try expect(!caps.flags.contains(.tools))
                 try expect(!caps.flags.contains(.vision))
                 try expect(caps.unsupportedParameters.contains(.temperature))
+            }
+        }
+
+        test("the catalog answers for the CLI without tools, so a new row is saved without them") {
+            try withCatalog {
+                let flags = ModelCatalog.metadata(for: "opus", kind: .claudeCodeCLI).capabilities.flags
+                try expect(flags.contains(.reasoning))
+                try expect(!flags.contains(.tools))
+                try expect(!flags.contains(.vision))
+                // The same model over the API keeps them.
+                try expect(ModelCatalog.metadata(for: "claude-opus-5", kind: .anthropicSubscription)
+                    .capabilities.flags.contains(.tools))
             }
         }
     }

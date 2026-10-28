@@ -21,7 +21,7 @@ Pure SwiftPM, **no third-party dependencies**. Only the Command Line Tools are r
 ```bash
 swift build                        # debug build of DerbyCore + DerbyApp
 swift build -c release             # release build
-swift run DerbyTests               # all 634 tests (~7s, no network)
+swift run DerbyTests               # all 638 tests (~7s, no network)
 swift run DerbyTests Routing       # filter by suite or test name
 DERBY_LIVE=1 swift run DerbyTests Live   # opt-in: this machine's real providers
 
@@ -385,6 +385,12 @@ Verified live on this machine while building:
   item had collected thirty Derby entries. Write-back after an opt-in refresh stays native:
   `security -i` splits its input at 4096 bytes, the item is ~5 KB, and as an argument the
   token would show in `ps`.
+- **The Claude Code CLI path carries no tools**, and `AdapterFamily.withheldCapabilities` says
+  so after everything else: the snapshot removes those flags from a saved row and from a
+  user's override alike. Its models had been saved from the catalog's Claude row, tools
+  included, so routing sent Hermes's tool requests to the CLI, which answered without them —
+  silently, since the request succeeded. A tool request now goes elsewhere, or fails as
+  `CAPABILITY_MISMATCH` when the CLI is the only target.
 - Derby reads CLI credential stores **read-only by default** ("linked" mode) so it can never
   invalidate the user's `claude`/`codex` login. Token refresh rotates the refresh token, so
   it is opt-in per account and writes the rotated tokens back to keep the CLI working.
