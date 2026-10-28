@@ -359,6 +359,16 @@ dispatches, which leaves the load version alone, and gives it back if it never d
 unreturned reservation expires after 15 seconds. The router never reserves anything itself,
 which is what keeps it pure.
 
+**Expiring allowance.** `expiring_allowance`, and the score dimension of the same name, rank
+subscription accounts by how fast their plan window's leftover would have to be spent to use
+it all before it resets — `unused ÷ time left`, from `PlanAllowance`. The reading is the
+dashboard's: `UsageMonitor` keeps each account's last good meter, and the gateway copies its
+`planAllowances()` into the snapshot beside residency, so the router reads a value and never a
+meter. Plans come first, then cloud targets with no plan window, then local models; a plan
+whose window is spent goes last until it resets. When the attempt cap would cut every local
+target, the last slot is kept for one, since local is this strategy's answer to every cloud
+target being down.
+
 **What the server itself says.** Derby's own counts see only Derby's traffic. A serving engine
 sees everyone's, and knows what actually runs out first: vLLM and SGLang publish requests
 running and waiting plus KV cache use as Prometheus gauges, and llama.cpp's `/slots` reports how

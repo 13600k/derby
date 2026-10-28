@@ -204,7 +204,19 @@ Three rules keep it honest:
 The Overview's provider rows show each cloud account's plan meter — five-hour and weekly
 windows, per-model caps, balances. `ProviderAdapter.usage` reads it (nil means the provider
 publishes none; OpenAI-compatible kinds declare theirs as `OpenAIQuirks.UsageStyle`), and
-`UsageMonitor` polls it every five minutes. Display only: the router never reads it.
+`UsageMonitor` polls it every five minutes. The router reads one thing from it, and only
+through the snapshot: each plan's `PlanAllowance`.
+
+- **`expiring_allowance` spends what would be lost soonest.** Allowance left when a window
+  resets is gone, so plans rank by `unused ÷ time left` (`PlanAllowance.expiryScore`, also a
+  score weight): 5% left with 20 minutes to go loses to 90% left with two hours, because the
+  first would only meet a 429. Cloud targets with no plan window come next, then local models.
+  An idle window, or one whose reset passed since it was read, counts as a fresh one: the
+  sliding reset an idle meter reports would make the ranking flap. A plan with any
+  account-wide window spent (the weekly cap too) goes behind local; per-model caps are
+  ignored, since their scope cannot be matched to a target. `keepsLocalFallback` gives a local
+  target the last slot when the attempt cap would cut it, or "fall back to local" never
+  happens behind four cloud targets.
 
 - **A poll never opens the Keychain.** A background read runs with
   `ProviderContext.mayPromptForCredentials == false`, so the default Claude login comes only

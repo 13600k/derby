@@ -188,4 +188,28 @@ func registerExpiringAllowanceTests() {
             try expectContains(fallback.explanation, "local fallback")
         }
     }
+
+    suite("Expiring allowance / local slot") {
+        let crowded = (1...5).map { cloud("C\($0)") } + [local()]
+
+        test("the last slot goes to local when the cap would cut it") {
+            let decision = try route(crowded, failover: FailoverConfig(maxAttempts: 4))
+            try expectEqual(providers(decision), ["C1", "C2", "C3", "Local"])
+            let c4 = try expectNotNil(decision.exclusions.first { $0.providerName == "C4" })
+            try expectEqual(c4.stage, .cap)
+            try expectContains(c4.reason, "local fallback")
+            try expectContains(try expectNotNil(decision.exclusions.first { $0.providerName == "C5" }).reason,
+                               "beyond the 4-attempt limit")
+        }
+
+        test("other strategies keep the plain cap") {
+            let decision = try route(crowded, strategy: .cloudFirst, failover: FailoverConfig(maxAttempts: 4))
+            try expect(!providers(decision).contains("Local"))
+        }
+
+        test("one attempt keeps the top target") {
+            let decision = try route(crowded, failover: FailoverConfig(enabled: false, maxAttempts: 4))
+            try expectEqual(providers(decision), ["C1"])
+        }
+    }
 }

@@ -329,14 +329,25 @@ public struct Router: Sendable {
         let limit = max(1, min(lm.policy.maxCandidates,
                                lm.failover.enabled ? lm.failover.maxAttempts : 1))
         if ranked.count > limit {
-            for dropped in ranked[limit...] {
+            var kept = Array(ranked[..<limit])
+            var displaced: RankedTarget?
+            // A strategy whose last resort is a local model keeps one in the
+            // plan, or "fall back to local" never happens behind enough cloud.
+            if lm.policy.strategy.keepsLocalFallback {
+                (kept, displaced) = Router.keepingLocalFallback(ranked, limit: limit)
+            }
+            let keptIDs = Set(kept.map(\.target.id))
+            for (index, dropped) in ranked.enumerated() where !keptIDs.contains(dropped.target.id) {
+                let reason = dropped.target.id == displaced?.target.id
+                    ? "gave its slot to the local fallback (\(kept[kept.count - 1].target.label))"
+                    : "ranked #\(index + 1), beyond the \(limit)-attempt limit"
                 exclusions.append(ExclusionRecord(targetLabel: dropped.target.label,
                                                   providerName: dropped.target.providerName,
                                                   modelID: dropped.target.modelID,
                                                   stage: .cap,
-                                                  reason: "ranked #\(ranked.firstIndex(where: { $0.target.id == dropped.target.id })! + 1), beyond the \(limit)-attempt limit"))
+                                                  reason: reason))
             }
-            ranked = Array(ranked[..<limit])
+            ranked = kept
         }
 
         // 8. Build the plan.
@@ -437,6 +448,19 @@ public struct Router: Sendable {
             }
         }
         return (out, firstMove)
+    }
+
+    /// The top `limit` targets, except that when none of them is local but a
+    /// lower-ranked one is, that local target takes the last slot. One attempt
+    /// keeps the top target: there is no fallback to make room for.
+    static func keepingLocalFallback(_ ranked: [RankedTarget], limit: Int)
+        -> (kept: [RankedTarget], displaced: RankedTarget?) {
+        var kept = Array(ranked.prefix(limit))
+        guard limit >= 2, !kept.contains(where: { $0.target.isLocal }),
+              let local = ranked.dropFirst(limit).first(where: { $0.target.isLocal }) else { return (kept, nil) }
+        let displaced = kept.removeLast()
+        kept.append(local)
+        return (kept, displaced)
     }
 
     /// Re-ranks the remaining attempts after a context-overflow failure so the
