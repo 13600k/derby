@@ -179,7 +179,8 @@ next request — *for order-sensitive strategies*. Read on.
 `priority`, `failover_chain`, `local_first` and `cloud_first` resolve to the same target
 every time while it stays healthy. `weighted_random` and `round_robin` deliberately do not:
 consecutive requests to the same alias land on different physical models, with different
-windows.
+windows. `expiring_allowance` moves too, only more slowly: it follows whichever subscription's
+allowance is closest to expiring unused, which changes as plan windows fill and reset.
 
 So `context_window` (the active target's) is the right thing to *display* and the wrong
 thing to *cache*. `derby.min_context_window` is the smallest window across every usable

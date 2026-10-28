@@ -18,16 +18,22 @@ public struct RoutingContext: Sendable {
     public var occupancy: [UUID: ServerOccupancy]
     /// Lineage of the model that wrote the conversation's latest answer.
     public var conversationLineage: ModelLineage?
+    /// Each target's plan window, by target id. Local and metered targets have none.
+    public var planAllowances: [UUID: PlanAllowance]
+    /// The moment the request is routed, which plan windows are measured against.
+    public var now: Date
 
     public init(policy: RoutingPolicy, health: [TargetKey: TargetHealth], promptTokens: Int,
                 scorer: TargetScorer = TargetScorer(), roundRobinCursor: Int = 0,
                 randomSeed: UInt64? = nil, loadUtilization: [UUID: Double] = [:],
                 warmth: [UUID: ModelWarmth] = [:], occupancy: [UUID: ServerOccupancy] = [:],
-                conversationLineage: ModelLineage? = nil) {
+                conversationLineage: ModelLineage? = nil,
+                planAllowances: [UUID: PlanAllowance] = [:], now: Date = Date()) {
         self.policy = policy; self.health = health; self.promptTokens = promptTokens
         self.scorer = scorer; self.roundRobinCursor = roundRobinCursor; self.randomSeed = randomSeed
         self.loadUtilization = loadUtilization; self.warmth = warmth; self.occupancy = occupancy
         self.conversationLineage = conversationLineage
+        self.planAllowances = planAllowances; self.now = now
     }
 
     public func health(for t: ResolvedTarget) -> TargetHealth {
@@ -36,6 +42,7 @@ public struct RoutingContext: Sendable {
     public func load(for t: ResolvedTarget) -> Double { loadUtilization[t.id] ?? 0 }
     public func warmth(for t: ResolvedTarget) -> ModelWarmth { warmth[t.id] ?? .unknown }
     public func occupancy(for t: ResolvedTarget) -> ServerOccupancy? { occupancy[t.id] }
+    public func planAllowance(for t: ResolvedTarget) -> PlanAllowance? { planAllowances[t.id] }
     public func continuity(for t: ResolvedTarget) -> LineageAffinity? {
         conversationLineage.map { $0.affinity(with: t.lineage) }
     }
@@ -367,6 +374,67 @@ public struct LeastLoadedStrategy: RoutingStrategy {
     }
 }
 
+// MARK: - Plan allowance
+
+/// Spends the plan allowance that would otherwise be lost soonest.
+///
+/// Plans come first, ranked by `PlanAllowance.expiryScore` — the share of the
+/// window left over the time left to spend it — so nearly spent and about to
+/// reset loses to plenty left with hours to go. Then cloud targets with no plan
+/// window, in the configured order; then local models, which answer only when
+/// every cloud target is down. A plan that is spent goes last: until it resets
+/// it can only answer with a 429, or bill past the plan.
+public struct ExpiringAllowanceStrategy: RoutingStrategy {
+    public let kind: RoutingStrategyKind = .expiringAllowance
+    public init() {}
+
+    private enum Tier: Int {
+        case plan, unmetered, local, spent
+
+        init(_ t: ResolvedTarget, context: RoutingContext) {
+            if t.isLocal { self = .local; return }
+            guard let allowance = context.planAllowance(for: t) else { self = .unmetered; return }
+            self = allowance.isSpent(now: context.now) ? .spent : .plan
+        }
+    }
+
+    public func rank(_ targets: [ResolvedTarget], context: RoutingContext) -> [RankedTarget] {
+        let now = context.now
+        return targets.map { t -> (ranked: RankedTarget, tier: Tier, key: Double) in
+            let tier = Tier(t, context: context)
+            let allowance = context.planAllowance(for: t)
+            switch tier {
+            case .plan:
+                let score = allowance?.expiryScore(now: now) ?? 0
+                return (RankedTarget(target: t, score: score, components: ["expiringAllowance": score],
+                                     note: allowance?.summary(now: now)), tier, -score)
+            case .unmetered:
+                return (RankedTarget(target: t, score: 0, note: "no plan meter"), tier, 0)
+            case .local:
+                return (RankedTarget(target: t, score: 0, note: "local fallback"), tier, 0)
+            case .spent:
+                return (RankedTarget(target: t, score: 0, note: allowance?.summary(now: now)), tier,
+                        allowance?.spentUntil?.timeIntervalSince(now) ?? 0)
+            }
+        }.sorted { a, b in
+            if a.tier != b.tier { return a.tier.rawValue < b.tier.rawValue }
+            if abs(a.key - b.key) > 1e-9 { return a.key < b.key }
+            return a.ranked.target.order < b.ranked.target.order
+        }.map(\.ranked)
+    }
+
+    public func explain(_ ranked: [RankedTarget], context: RoutingContext) -> String {
+        guard let top = ranked.first else { return "No eligible targets remained after filtering." }
+        let label = top.target.label
+        switch Tier(top.target, context: context) {
+        case .plan: return "\(label) has the most plan allowance about to expire (\(top.note ?? "")."
+        case .unmetered: return "No plan window had allowance to spend, so \(label) ranked first."
+        case .local: return "Every cloud target was unavailable, so \(label) was used as the local fallback."
+        case .spent: return "Only spent plans remained; \(label) is tried first (\(top.note ?? ""))."
+        }
+    }
+}
+
 // MARK: - Registry
 
 public enum StrategyRegistry {
@@ -384,6 +452,7 @@ public enum StrategyRegistry {
         case .localFirst: return LocalFirstStrategy()
         case .cloudFirst: return CloudFirstStrategy()
         case .leastLoaded: return LeastLoadedStrategy()
+        case .expiringAllowance: return ExpiringAllowanceStrategy()
         }
     }
 }

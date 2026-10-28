@@ -103,4 +103,89 @@ func registerExpiringAllowanceTests() {
             try expectNil(snapshot.planAllowance(for: target))
         }
     }
+
+    func route(_ accounts: [ProviderAccount], strategy: RoutingStrategyKind = .expiringAllowance,
+               allowances: [UUID: PlanAllowance] = [:], health: [TargetKey: TargetHealth] = [:],
+               failover: FailoverConfig = FailoverConfig(maxAttempts: 8),
+               weights: ScoreWeights = .balanced) throws -> RoutingDecision {
+        var lm = Fixture.logical("x", accounts: accounts, strategy: strategy, weights: weights, failover: failover)
+        lm.policy.maxCandidates = 8
+        var snapshot = Fixture.snapshot(Fixture.config(accounts: accounts, logicalModels: [lm]), health: health)
+        snapshot.planAllowances = allowances
+        return try Router().route(RoutingRequest(logicalModelName: "x",
+                                                 requirements: CapabilityRequirements(required: [.text]),
+                                                 promptTokens: 1000),
+                                  snapshot: snapshot)
+    }
+    func providers(_ decision: RoutingDecision) -> [String] { decision.plan.attempts.map(\.target.providerName) }
+    func plan(_ name: String) -> ProviderAccount {
+        Fixture.account(name, kind: .chatgptSubscription, models: [Fixture.model(name.lowercased())])
+    }
+    func cloud(_ name: String) -> ProviderAccount { Fixture.account(name, models: [Fixture.model(name.lowercased())]) }
+    func local(_ name: String = "Local") -> ProviderAccount {
+        Fixture.account(name, kind: .ollama, models: [Fixture.model(name.lowercased())])
+    }
+    func running(_ used: Double, left: Double) -> PlanAllowance {
+        PlanAllowance(usedFraction: used, resetsAt: Date().addingTimeInterval(left))
+    }
+
+    suite("Expiring allowance / strategy") {
+        test("most allowance at risk wins: 5% left in 20 min loses to 90% left in 2 h") {
+            let a = plan("A"), b = plan("B")
+            let order = providers(try route([a, b], allowances: [a.id: running(0.95, left: 1200),
+                                                                 b.id: running(0.10, left: 7200)]))
+            try expectEqual(order, ["B", "A"])
+        }
+
+        test("half left in 20 min beats 90% left in 2 h") {
+            let a = plan("A"), b = plan("B")
+            let order = providers(try route([b, a], allowances: [a.id: running(0.50, left: 1200),
+                                                                 b.id: running(0.10, left: 7200)]))
+            try expectEqual(order.first, "A")
+        }
+
+        test("a running window beats an idle one with the same allowance") {
+            let idle = plan("Idle"), started = plan("Running")
+            let order = providers(try route([idle, started],
+                                            allowances: [idle.id: PlanAllowance(usedFraction: 0, resetsAt: nil),
+                                                         started.id: running(0, left: 16_200)]))
+            try expectEqual(order.first, "Running")
+        }
+
+        test("tier order: plans, then unmetered cloud, then local, then spent plans") {
+            let spent = plan("Spent"), box = local(), metered = cloud("Metered"), live = plan("Plan")
+            let now = Date()
+            let order = providers(try route([spent, box, metered, live], allowances: [
+                spent.id: PlanAllowance(usedFraction: 0.2, resetsAt: now.addingTimeInterval(3600),
+                                        spentUntil: now.addingTimeInterval(86_400)),
+                live.id: running(0.5, left: 3600),
+            ]))
+            try expectEqual(order, ["Plan", "Metered", "Local", "Spent"])
+        }
+
+        test("no meter data falls back to configured order then local") {
+            try expectEqual(providers(try route([local(), cloud("C1"), cloud("C2")])), ["C1", "C2", "Local"])
+        }
+
+        test("equal allowance keeps the configured order") {
+            let account = Fixture.account("Plan", kind: .chatgptSubscription,
+                                          models: [Fixture.model("zeta"), Fixture.model("alpha")])
+            let decision = try route([account], allowances: [account.id: running(0.4, left: 3600)])
+            try expectEqual(decision.plan.attempts.map(\.target.modelID), ["zeta", "alpha"])
+        }
+
+        test("explanation and notes say why") {
+            let a = plan("A")
+            let decision = try route([a, local()], allowances: [a.id: running(0.4, left: 3600)])
+            try expectContains(try expectNotNil(decision.evaluations.first?.note), "left, resets in")
+            try expectContains(decision.explanation, "about to expire")
+
+            let c1 = cloud("C1")
+            var down = TargetHealth(key: TargetKey(providerID: c1.id, modelID: "c1"))
+            down.circuit = .open
+            let fallback = try route([c1, local()], health: [down.key: down])
+            try expectEqual(providers(fallback), ["Local"])
+            try expectContains(fallback.explanation, "local fallback")
+        }
+    }
 }

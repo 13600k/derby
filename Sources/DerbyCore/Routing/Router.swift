@@ -277,10 +277,13 @@ public struct Router: Sendable {
         var loadUtilization: [UUID: Double] = [:]
         var warmth: [UUID: ModelWarmth] = [:]
         var occupancy: [UUID: ServerOccupancy] = [:]
+        var planAllowances: [UUID: PlanAllowance] = [:]
+        let now = Date()
         for t in eligible {
             loadUtilization[t.id] = snapshot.loadUtilization(for: t)
             warmth[t.id] = snapshot.warmth(for: t)
             occupancy[t.id] = snapshot.occupancy(for: t)
+            planAllowances[t.id] = snapshot.planAllowance(for: t)
         }
         let strategy = StrategyRegistry.strategy(for: lm.policy.strategy)
         let context = RoutingContext(policy: lm.policy,
@@ -292,7 +295,9 @@ public struct Router: Sendable {
                                      loadUtilization: loadUtilization,
                                      warmth: warmth,
                                      occupancy: occupancy,
-                                     conversationLineage: request.conversationLineage)
+                                     conversationLineage: request.conversationLineage,
+                                     planAllowances: planAllowances,
+                                     now: now)
         var ranked = strategy.rank(eligible, context: context)
 
         // 6b. Between copies of the same model, one already in memory answers

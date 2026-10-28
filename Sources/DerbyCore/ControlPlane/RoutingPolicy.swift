@@ -13,6 +13,7 @@ public enum RoutingStrategyKind: String, Codable, Sendable, CaseIterable, Hashab
     case localFirst = "local_first"
     case cloudFirst = "cloud_first"
     case leastLoaded = "least_loaded"
+    case expiringAllowance = "expiring_allowance"
 
     public var displayName: String {
         switch self {
@@ -26,6 +27,7 @@ public enum RoutingStrategyKind: String, Codable, Sendable, CaseIterable, Hashab
         case .localFirst: return "Local First"
         case .cloudFirst: return "Cloud First"
         case .leastLoaded: return "Least Loaded"
+        case .expiringAllowance: return "Expiring Allowance"
         }
     }
 
@@ -41,12 +43,17 @@ public enum RoutingStrategyKind: String, Codable, Sendable, CaseIterable, Hashab
         case .localFirst: return "Use local models when they are healthy; fall back to the cloud."
         case .cloudFirst: return "Use cloud models first; fall back to local models in an emergency."
         case .leastLoaded: return "Send each request to the target with the most spare capacity right now, counting requests already on their way to it."
+        case .expiringAllowance: return "Spend the plan allowance that would otherwise expire soonest, then other cloud targets, then local models."
         }
     }
 
     /// Strategies whose order is the user's explicit instruction, which Derby
     /// does not quietly rearrange.
     public var respectsConfiguredOrder: Bool { self == .priority || self == .failoverChain }
+
+    /// Strategies whose last resort is a local model: when the attempt cap
+    /// would cut every local target, the last slot is kept for one.
+    public var keepsLocalFallback: Bool { self == .expiringAllowance }
 
     /// Whether the strategy consumes the per-target `weight` field.
     public var usesWeights: Bool { self == .weightedRandom }
