@@ -212,4 +212,34 @@ func registerExpiringAllowanceTests() {
             try expectEqual(providers(decision), ["C1"])
         }
     }
+
+    suite("Expiring allowance / score weight") {
+        test("the weight alone prefers the allowance most at risk") {
+            let a = plan("A"), b = plan("B")
+            let weights = ScoreWeights(quality: 0, latency: 0, cost: 0, health: 0, quota: 0, priority: 0,
+                                       expiringAllowance: 1)
+            let decision = try route([a, b], strategy: .weightedScore,
+                                     allowances: [a.id: running(0.95, left: 1200), b.id: running(0.10, left: 7200)],
+                                     weights: weights)
+            try expectEqual(providers(decision).first, "B")
+            try expect(try expectNotNil(decision.evaluations.first).components.keys.contains("expiringAllowance"))
+        }
+
+        test("weights saved before the dimension decode with it off") {
+            let old = try JSONDecoder().decode(ScoreWeights.self, from: Data(#"{"quality":0.35}"#.utf8))
+            try expectEqual(old.expiringAllowance, 0)
+            let saved = try JSONEncoder().encode(ScoreWeights(expiringAllowance: 0.4))
+            try expectEqual(try JSONDecoder().decode(ScoreWeights.self, from: saved).expiringAllowance, 0.4)
+        }
+
+        test("a target with no plan window scores zero on the dimension") {
+            let box = local()
+            let snapshot = Fixture.snapshot(Fixture.config(accounts: [box],
+                                                           logicalModels: [Fixture.logical("x", accounts: [box])]))
+            let target = try expectNotNil(snapshot.logicalModel(named: "x")?.targets.first)
+            let d = TargetScorer().dimensions(for: target, health: TargetHealth(key: target.key),
+                                              metric: .timeToFirstToken, candidateCount: 1, promptTokens: 100)
+            try expectEqual(d.expiringAllowance, 0)
+        }
+    }
 }

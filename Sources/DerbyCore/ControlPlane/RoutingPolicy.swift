@@ -80,25 +80,29 @@ public struct ScoreWeights: Codable, Sendable, Hashable {
     /// Whether the target is the same model lineage that wrote the conversation
     /// so far, so nothing has to be carried across a family boundary.
     public var continuity: Double
+    /// How much of a subscription's plan window would expire unused if not
+    /// spent now (`PlanAllowance.expiryScore`).
+    public var expiringAllowance: Double
 
     public init(quality: Double = 0.35, latency: Double = 0.20, cost: Double = 0.10,
                 health: Double = 0.20, quota: Double = 0.10, priority: Double = 0.05,
                 providerPreference: Double = 0, localPreference: Double = 0,
                 contextHeadroom: Double = 0, load: Double = 0, warmth: Double = 0,
-                continuity: Double = 0) {
+                continuity: Double = 0, expiringAllowance: Double = 0) {
         self.quality = quality; self.latency = latency; self.cost = cost
         self.health = health; self.quota = quota; self.priority = priority
         self.providerPreference = providerPreference
         self.localPreference = localPreference
         self.contextHeadroom = contextHeadroom
         self.load = load; self.warmth = warmth; self.continuity = continuity
+        self.expiringAllowance = expiringAllowance
     }
 
     // Field by field: weights saved before a dimension existed decode with that
     // dimension switched off, rather than failing the whole logical model.
     private enum CodingKeys: String, CodingKey {
         case quality, latency, cost, health, quota, priority, providerPreference, localPreference
-        case contextHeadroom, load, warmth, continuity
+        case contextHeadroom, load, warmth, continuity, expiringAllowance
     }
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -115,6 +119,7 @@ public struct ScoreWeights: Codable, Sendable, Hashable {
         load = try c.decodeIfPresent(Double.self, forKey: .load) ?? 0
         warmth = try c.decodeIfPresent(Double.self, forKey: .warmth) ?? 0
         continuity = try c.decodeIfPresent(Double.self, forKey: .continuity) ?? 0
+        expiringAllowance = try c.decodeIfPresent(Double.self, forKey: .expiringAllowance) ?? 0
     }
 
     public static let balanced = ScoreWeights()
@@ -127,12 +132,14 @@ public struct ScoreWeights: Codable, Sendable, Hashable {
          ("Health", \.health), ("Spare quota", \.quota), ("Priority", \.priority),
          ("Provider preference", \.providerPreference), ("Local preference", \.localPreference),
          ("Context headroom", \.contextHeadroom), ("Spare capacity", \.load),
-         ("Model already loaded", \.warmth), ("Conversation continuity", \.continuity)]
+         ("Model already loaded", \.warmth), ("Conversation continuity", \.continuity),
+         ("Expiring plan allowance", \.expiringAllowance)]
     }
 
     public var total: Double {
         max(0.0001, quality + latency + cost + health + quota + priority
-            + providerPreference + localPreference + contextHeadroom + load + warmth + continuity)
+            + providerPreference + localPreference + contextHeadroom + load + warmth + continuity
+            + expiringAllowance)
     }
     public var normalized: ScoreWeights {
         let t = total
@@ -141,7 +148,8 @@ public struct ScoreWeights: Codable, Sendable, Hashable {
                             providerPreference: providerPreference / t,
                             localPreference: localPreference / t,
                             contextHeadroom: contextHeadroom / t,
-                            load: load / t, warmth: warmth / t, continuity: continuity / t)
+                            load: load / t, warmth: warmth / t, continuity: continuity / t,
+                            expiringAllowance: expiringAllowance / t)
     }
 }
 

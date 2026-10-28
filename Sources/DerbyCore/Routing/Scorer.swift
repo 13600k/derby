@@ -27,6 +27,7 @@ public struct TargetScorer: Sendable {
         public var load = 0.0
         public var warmth = 0.0
         public var continuity = 0.0
+        public var expiringAllowance = 0.0
 
         public func weighted(by w: ScoreWeights) -> (total: Double, components: [String: Double]) {
             let n = w.normalized
@@ -43,6 +44,7 @@ public struct TargetScorer: Sendable {
                 ("load", load * n.load),
                 ("warmth", warmth * n.warmth),
                 ("continuity", continuity * n.continuity),
+                ("expiringAllowance", expiringAllowance * n.expiringAllowance),
             ]
             var components: [String: Double] = [:]
             var total = 0.0
@@ -61,8 +63,13 @@ public struct TargetScorer: Sendable {
                            promptTokens: Int,
                            loadUtilization: Double = 0,
                            warmth: ModelWarmth = .unknown,
-                           continuity: LineageAffinity? = nil) -> Dimensions {
+                           continuity: LineageAffinity? = nil,
+                           planAllowance: PlanAllowance? = nil,
+                           now: Date = Date()) -> Dimensions {
         var d = Dimensions()
+        // Nothing expires on a target with no plan window, so it earns nothing
+        // here — not the optimistic prior an unmeasured latency gets.
+        d.expiringAllowance = planAllowance?.expiryScore(now: now) ?? 0
         d.load = max(0, 1 - min(1, loadUtilization))
         d.warmth = warmth.score
         // With no earlier answer to continue from, every target is equally continuous.

@@ -171,7 +171,9 @@ public struct WeightedScoreStrategy: RoutingStrategy {
                                               promptTokens: context.promptTokens,
                                               loadUtilization: context.load(for: t),
                                               warmth: context.warmth(for: t),
-                                              continuity: context.continuity(for: t))
+                                              continuity: context.continuity(for: t),
+                                              planAllowance: context.planAllowance(for: t),
+                                              now: context.now)
             let (total, components) = d.weighted(by: weights)
             return RankedTarget(target: t, score: total, components: components)
         }
@@ -208,6 +210,7 @@ public struct WeightedScoreStrategy: RoutingStrategy {
         case "load": return "spare capacity"
         case "warmth": return "a model already in memory"
         case "continuity": return "conversation continuity"
+        case "expiringAllowance": return "plan allowance about to expire"
         default: return key
         }
     }

@@ -21,7 +21,7 @@ Pure SwiftPM, **no third-party dependencies**. Only the Command Line Tools are r
 ```bash
 swift build                        # debug build of DerbyCore + DerbyApp
 swift build -c release             # release build
-swift run DerbyTests               # all 638 tests (~7s, no network)
+swift run DerbyTests               # all 660 tests (~7s, no network)
 swift run DerbyTests Routing       # filter by suite or test name
 DERBY_LIVE=1 swift run DerbyTests Live   # opt-in: this machine's real providers
 
@@ -217,7 +217,6 @@ through the snapshot: each plan's `PlanAllowance`.
   ignored, since their scope cannot be matched to a target. `keepsLocalFallback` gives a local
   target the last slot when the attempt cap would cut it, or "fall back to local" never
   happens behind four cloud targets.
-
 - **A poll never opens the Keychain.** A background read runs with
   `ProviderContext.mayPromptForCredentials == false`, so the default Claude login comes only
   from what a request already cached or the CLI's file; only the Overview's Refresh button may
