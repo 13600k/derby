@@ -421,19 +421,25 @@ public struct Router: Sendable {
                                snapshotVersion: snapshot.version)
     }
 
+    /// Positions of the copies of each model, grouped within the strategy's
+    /// bands so a reorder never carries a target across a tier.
+    static func copyGroups(_ ranked: [RankedTarget]) -> [[Int]] {
+        var groups: [String: [Int]] = [:]
+        for (index, candidate) in ranked.enumerated() {
+            let lineage = candidate.target.lineage
+            guard lineage.isKnown else { continue }
+            groups["\(candidate.band)|\(lineage.identity)", default: []].append(index)
+        }
+        return groups.values.sorted { $0[0] < $1[0] }
+    }
+
     /// Reorders copies of the same model so loaded ones come first, keeping
     /// every other target exactly where the strategy put it.
     static func preferWarmCopies(_ ranked: [RankedTarget], warmth: [UUID: ModelWarmth])
         -> (ranked: [RankedTarget], firstMove: (winner: String, loser: String)?) {
         var out = ranked
-        var groups: [String: [Int]] = [:]
-        for (index, candidate) in ranked.enumerated() {
-            let lineage = candidate.target.lineage
-            guard lineage.isKnown else { continue }
-            groups[lineage.identity, default: []].append(index)
-        }
         var firstMove: (winner: String, loser: String)?
-        for positions in groups.values.sorted(by: { $0[0] < $1[0] }) where positions.count > 1 {
+        for positions in copyGroups(ranked) where positions.count > 1 {
             let members = positions.map { ranked[$0] }
             let reordered = members.enumerated().sorted { a, b in
                 let warmA = (warmth[a.element.target.id] ?? .unknown).isWarm

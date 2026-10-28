@@ -11,14 +11,8 @@ extension Router {
     static func preferConversationAccount(_ ranked: [RankedTarget], account: UUID)
         -> (ranked: [RankedTarget], firstMove: (winner: String, loser: String)?) {
         var out = ranked
-        var groups: [String: [Int]] = [:]
-        for (index, candidate) in ranked.enumerated() {
-            let lineage = candidate.target.lineage
-            guard lineage.isKnown else { continue }
-            groups[lineage.identity, default: []].append(index)
-        }
         var firstMove: (winner: String, loser: String)?
-        for positions in groups.values.sorted(by: { $0[0] < $1[0] }) where positions.count > 1 {
+        for positions in copyGroups(ranked) where positions.count > 1 {
             let members = positions.map { ranked[$0] }
             guard let holder = members.firstIndex(where: { $0.target.account.id == account }), holder > 0 else { continue }
             var reordered = members

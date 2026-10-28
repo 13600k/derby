@@ -53,8 +53,15 @@ public struct RankedTarget: Sendable {
     public var score: Double
     public var components: [String: Double]
     public var note: String?
-    public init(target: ResolvedTarget, score: Double, components: [String: Double] = [:], note: String? = nil) {
+    /// A strategy's hard tier. The router's later reorders (a loaded copy
+    /// first, a conversation kept on its account) move copies of one model
+    /// only within a band, so they can never undo a tier: a spent plan stays
+    /// behind a live one, whatever the conversation or warmth.
+    public var band: Int
+    public init(target: ResolvedTarget, score: Double, components: [String: Double] = [:], note: String? = nil,
+                band: Int = 0) {
         self.target = target; self.score = score; self.components = components; self.note = note
+        self.band = band
     }
 }
 
@@ -423,7 +430,11 @@ public struct ExpiringAllowanceStrategy: RoutingStrategy {
             if a.tier != b.tier { return a.tier.rawValue < b.tier.rawValue }
             if abs(a.key - b.key) > 1e-9 { return a.key < b.key }
             return a.ranked.target.order < b.ranked.target.order
-        }.map(\.ranked)
+        }.map { entry in
+            var ranked = entry.ranked
+            ranked.band = entry.tier.rawValue
+            return ranked
+        }
     }
 
     public func explain(_ ranked: [RankedTarget], context: RoutingContext) -> String {

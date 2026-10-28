@@ -107,14 +107,15 @@ func registerExpiringAllowanceTests() {
     func route(_ accounts: [ProviderAccount], strategy: RoutingStrategyKind = .expiringAllowance,
                allowances: [UUID: PlanAllowance] = [:], health: [TargetKey: TargetHealth] = [:],
                failover: FailoverConfig = FailoverConfig(maxAttempts: 8),
-               weights: ScoreWeights = .balanced) throws -> RoutingDecision {
+               weights: ScoreWeights = .balanced, conversationAccount: UUID? = nil) throws -> RoutingDecision {
         var lm = Fixture.logical("x", accounts: accounts, strategy: strategy, weights: weights, failover: failover)
         lm.policy.maxCandidates = 8
         var snapshot = Fixture.snapshot(Fixture.config(accounts: accounts, logicalModels: [lm]), health: health)
         snapshot.planAllowances = allowances
         return try Router().route(RoutingRequest(logicalModelName: "x",
                                                  requirements: CapabilityRequirements(required: [.text]),
-                                                 promptTokens: 1000),
+                                                 promptTokens: 1000,
+                                                 conversationAccount: conversationAccount),
                                   snapshot: snapshot)
     }
     func providers(_ decision: RoutingDecision) -> [String] { decision.plan.attempts.map(\.target.providerName) }
@@ -165,6 +166,29 @@ func registerExpiringAllowanceTests() {
 
         test("no meter data falls back to configured order then local") {
             try expectEqual(providers(try route([local(), cloud("C1"), cloud("C2")])), ["C1", "C2", "Local"])
+        }
+
+        test("a conversation on a spent plan does not pull it ahead of a live copy") {
+            let now = Date()
+            let sub = Fixture.account("Sub", kind: .chatgptSubscription, models: [Fixture.model("gpt-5.6-sol")])
+            let alt = Fixture.account("Alt", kind: .chatgptSubscription, models: [Fixture.model("gpt-5.6-sol")])
+            let allowances = [sub.id: PlanAllowance(usedFraction: 1, resetsAt: now.addingTimeInterval(3600),
+                                                    spentUntil: now.addingTimeInterval(3600)),
+                              alt.id: running(0.3, left: 7200)]
+            let decision = try route([sub, alt, cloud("Metered"), local()], allowances: allowances,
+                                     failover: FailoverConfig(maxAttempts: 3), conversationAccount: sub.id)
+            try expectEqual(providers(decision), ["Alt", "Metered", "Local"])
+            try expectContains(decision.explanation, "about to expire")
+        }
+
+        test("a spent cloud copy does not jump a local copy for being warm") {
+            let spent = Fixture.account("PlanQwen", kind: .qwenSubscription, models: [Fixture.model("qwen3.5-9b")])
+            let box = Fixture.account("Local", kind: .ollama, models: [Fixture.model("qwen3.5-9b")])
+            let now = Date()
+            let decision = try route([spent, cloud("Metered"), box], allowances: [
+                spent.id: PlanAllowance(usedFraction: 1, resetsAt: now.addingTimeInterval(3600),
+                                        spentUntil: now.addingTimeInterval(3600))])
+            try expectEqual(providers(decision), ["Metered", "Local", "PlanQwen"])
         }
 
         test("equal allowance keeps the configured order") {
