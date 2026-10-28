@@ -16,8 +16,9 @@ import Foundation
 /// one in the past, or one a whole window from now that moves forward with
 /// every read — the three ways a meter can say "nothing started yet".
 ///
-/// `UsageMonitor` does the sending; nothing here is on the request path, and
-/// the router never reads it.
+/// `UsageMonitor` does the sending; nothing here is on the request path.
+/// `PlanAllowance` reads `isIdle` too, so a window this would start counts as
+/// a fresh one when routing ranks it.
 public enum PlanWarmUp {
     /// A reset within this much of a full window away has not started: either
     /// the meter reports an idle window as starting now, or it started in the

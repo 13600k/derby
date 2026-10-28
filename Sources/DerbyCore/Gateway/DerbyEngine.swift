@@ -223,6 +223,7 @@ public actor DerbyEngine {
         snap.accountLoad = live.accountLoad
         snap.loadVersion = live.loadVersion
         snap.residency = await residency.snapshot()
+        snap.planAllowances = await usageMonitor.planAllowances()
         return snap
     }
 
@@ -336,7 +337,8 @@ public actor DerbyEngine {
                                      gatewaySettings: config.gateway,
                                      localAPIKey: cachedLocalKey,
                                      promptLogging: config.logging.promptLogging,
-                                     residency: residency)
+                                     residency: residency,
+                                     usageMonitor: usageMonitor)
         let paused = { [weak self] () async -> Bool in
             guard let self else { return false }
             return await self.routingPaused

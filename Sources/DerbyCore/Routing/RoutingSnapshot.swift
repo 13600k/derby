@@ -51,6 +51,9 @@ public struct RoutingSnapshot: Sendable {
     public var residency: [UUID: AccountResidency]
     /// In-flight and reserved requests per account, read with `health`.
     public var accountLoad: [UUID: HealthRegistry.AccountLoad] = [:]
+    /// Each cloud account's plan window, by account id, from the last good
+    /// meter reading (`UsageMonitor.planAllowances`).
+    public var planAllowances: [UUID: PlanAllowance] = [:]
     /// `HealthRegistry`'s load version when `health` was read, so a
     /// reservation can tell whether anything moved since.
     public var loadVersion: UInt64
@@ -86,6 +89,12 @@ public struct RoutingSnapshot: Sendable {
             return .recentlyUsed
         }
         return .unknown
+    }
+
+    /// The plan window `target` would spend. A local server has no plan.
+    public func planAllowance(for target: ResolvedTarget) -> PlanAllowance? {
+        guard !target.isLocal else { return nil }
+        return planAllowances[target.account.id]
     }
 
     /// What the server behind `target` last said it was doing, while that is

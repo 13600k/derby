@@ -10,7 +10,8 @@ import Foundation
 /// count that misses traffic sent from elsewhere is still better than nothing
 /// as long as it never passes for the provider's figure.
 ///
-/// Display only: the router does not read it.
+/// Mostly for display. The router reads only `PlanAllowance` — a plan's short
+/// window and when it resets — and only from the snapshot.
 public struct ProviderUsage: Sendable, Hashable {
     public enum Source: String, Sendable, Hashable {
         /// The provider's own meter.

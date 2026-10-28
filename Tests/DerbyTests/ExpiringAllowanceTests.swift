@@ -77,4 +77,30 @@ func registerExpiringAllowanceTests() {
                                "not started")
         }
     }
+
+    suite("Expiring allowance / snapshot") {
+        test("the monitor hands routing each plan's window") {
+            let now = Date()
+            let plan = Fixture.account("Plan", kind: .chatgptSubscription, models: [Fixture.model("p")])
+            let metered = Fixture.account("Metered", models: [Fixture.model("m")])
+            let local = Fixture.account("Local", kind: .ollama, models: [Fixture.model("l")])
+            let meter = ProviderUsage(windows: [window(0.3, resetsIn: 3600, now: now)], observedAt: now)
+            let monitor = UsageMonitor(accounts: { [plan, metered, local] },
+                                       fetch: { account, _ in account.id == plan.id ? meter : nil },
+                                       tallies: { _ in [:] })
+            await monitor.refresh()
+            let allowances = await monitor.planAllowances()
+            try expectEqual(Set(allowances.keys), [plan.id])
+            try expectClose(try expectNotNil(allowances[plan.id]).usedFraction, 0.3)
+        }
+
+        test("a local target never carries a plan allowance") {
+            let local = Fixture.account("Local", kind: .ollama, models: [Fixture.model("l")])
+            var snapshot = Fixture.snapshot(Fixture.config(accounts: [local],
+                                                           logicalModels: [Fixture.logical("x", accounts: [local])]))
+            snapshot.planAllowances[local.id] = PlanAllowance(usedFraction: 0.1, resetsAt: Date().addingTimeInterval(600))
+            let target = try expectNotNil(snapshot.logicalModel(named: "x")?.targets.first)
+            try expectNil(snapshot.planAllowance(for: target))
+        }
+    }
 }

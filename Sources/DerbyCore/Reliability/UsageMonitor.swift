@@ -20,7 +20,9 @@ import Foundation
 /// over for the next, so the account that lands in the plan's lane is found
 /// without anything here knowing which provider it is.
 ///
-/// Nothing here is on the request path, and the router never reads it.
+/// Nothing here is on the request path. Routing reads one thing from it —
+/// each plan's `PlanAllowance`, handed over in the snapshot — and never waits
+/// on a meter.
 public actor UsageMonitor {
     /// How often a provider's meter is read.
     public static let pollInterval: Double = 300
@@ -118,6 +120,12 @@ public actor UsageMonitor {
 
     /// The latest status of every account that has something to show.
     public func snapshot() -> [UUID: ProviderUsageStatus] { statuses }
+
+    /// What routing reads of each account's meter: its short window, from the
+    /// last good reading. Derby's own count has none to give.
+    public func planAllowances() -> [UUID: PlanAllowance] {
+        statuses.compactMapValues { $0.usage.flatMap(PlanAllowance.init(usage:)) }
+    }
 
     /// Reads whatever is due. `force` shortens "due" to `minimumRefreshInterval`.
     /// A call made while a pass is running waits for that pass instead of

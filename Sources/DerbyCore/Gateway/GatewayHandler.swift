@@ -16,13 +16,18 @@ public struct GatewayHandler: Sendable {
     let promptLogging: PromptLoggingMode
     let startedAt: Date
     let residency: ResidencyRegistry
+    /// Plan meters, read for each account's `PlanAllowance`. Nil in tests
+    /// that boot a gateway with no monitor.
+    let usageMonitor: UsageMonitor?
 
     public init(state: ControlPlaneState, health: HealthRegistry, telemetry: TelemetryStore,
                 executor: Executor, secrets: any SecretStore, router: Router = Router(),
                 gatewaySettings: GatewaySettings, localAPIKey: String?,
                 promptLogging: PromptLoggingMode, startedAt: Date = Date(),
-                residency: ResidencyRegistry = ResidencyRegistry()) {
+                residency: ResidencyRegistry = ResidencyRegistry(),
+                usageMonitor: UsageMonitor? = nil) {
         self.residency = residency
+        self.usageMonitor = usageMonitor
         self.state = state
         self.health = health
         self.telemetry = telemetry
@@ -148,6 +153,7 @@ public struct GatewayHandler: Sendable {
         snap.accountLoad = live.accountLoad
         snap.loadVersion = live.loadVersion
         snap.residency = await residency.snapshot()
+        snap.planAllowances = await usageMonitor?.planAllowances() ?? [:]
         return snap
     }
 
