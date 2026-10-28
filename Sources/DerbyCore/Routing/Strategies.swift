@@ -430,7 +430,7 @@ public struct ExpiringAllowanceStrategy: RoutingStrategy {
         guard let top = ranked.first else { return "No eligible targets remained after filtering." }
         let label = top.target.label
         switch Tier(top.target, context: context) {
-        case .plan: return "\(label) has the most plan allowance about to expire (\(top.note ?? "")."
+        case .plan: return "\(label) has the most plan allowance about to expire (\(top.note ?? ""))."
         case .unmetered: return "No plan window had allowance to spend, so \(label) ranked first."
         case .local: return "Every cloud target was unavailable, so \(label) was used as the local fallback."
         case .spent: return "Only spent plans remained; \(label) is tried first (\(top.note ?? ""))."

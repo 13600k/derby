@@ -179,6 +179,7 @@ func registerExpiringAllowanceTests() {
             let decision = try route([a, local()], allowances: [a.id: running(0.4, left: 3600)])
             try expectContains(try expectNotNil(decision.evaluations.first?.note), "left, resets in")
             try expectContains(decision.explanation, "about to expire")
+            try expect(decision.explanation.hasSuffix(")."), "unbalanced: \(decision.explanation)")
 
             let c1 = cloud("C1")
             var down = TargetHealth(key: TargetKey(providerID: c1.id, modelID: "c1"))

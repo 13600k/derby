@@ -611,6 +611,48 @@ func registerLiveTests() {
                       + "\(resets), \(moved) → \(idle ? "idle, keep-warm would start it" : "running")")
             }
         }
+
+        /// What `expiring_allowance` makes of this machine's real meters: the
+        /// first model of every enabled account, ranked once.
+        test("expiring allowance ranks the real meters") {
+            guard let engine = await LiveGateway.shared.liveEngine() else { return }
+            // A look, not a warm-up: read the meters as a background poll does,
+            // without starting any window.
+            await engine.usageMonitor.setWarmingSuspended(true)
+            await engine.usageMonitor.refresh()
+            let allowances = await engine.snapshot().planAllowances
+            if allowances.isEmpty { print("      (skipped: no subscription here reports a plan window)"); return }
+
+            var config = await engine.config()
+            let targets = config.providers.filter(\.enabled).compactMap { account in
+                account.models.first(where: \.enabled).map { TargetRef(providerID: account.id, modelUUID: $0.id) }
+            }
+            config.logicalModels = [LogicalModel(name: "live-expiring", targets: targets,
+                                                 policy: RoutingPolicy(strategy: .expiringAllowance, maxCandidates: 16),
+                                                 failover: FailoverConfig(maxAttempts: 16))]
+            var snapshot = RoutingSnapshot.build(config: config, health: [:], version: 1)
+            snapshot.planAllowances = allowances
+            let decision = try Router().route(RoutingRequest(logicalModelName: "live-expiring",
+                                                             requirements: CapabilityRequirements(required: [.text]),
+                                                             promptTokens: 100),
+                                              snapshot: snapshot)
+            for e in decision.evaluations {
+                print("      #\(e.rank + 1) \(e.targetLabel) — \(String(format: "%.3f", e.score)) — \(e.note ?? "")")
+            }
+            print("      \(decision.explanation)")
+
+            let now = Date()
+            let attempts = decision.plan.attempts.map(\.target)
+            func live(_ t: ResolvedTarget) -> PlanAllowance? {
+                snapshot.planAllowance(for: t).flatMap { $0.isSpent(now: now) ? nil : $0 }
+            }
+            let scores = attempts.prefix { live($0) != nil }.map { live($0)!.expiryScore(now: now) }
+            try expectEqual(scores, scores.sorted(by: >), "plans must rank by expiring allowance")
+            if let firstLocal = attempts.firstIndex(where: \.isLocal) {
+                try expect(!attempts[firstLocal...].contains { !$0.isLocal && (live($0) != nil || snapshot.planAllowance(for: $0) == nil) },
+                           "a local target ranked ahead of a cloud target that could answer")
+            }
+        }
     }
 
     // MARK: - Claude subscription
@@ -822,6 +864,11 @@ actor LiveGateway {
         let running = Running(port: port, spy: spy, groups: groups)
         self.running = running
         return running
+    }
+
+    func liveEngine() async -> DerbyEngine? {
+        _ = try? await start()
+        return engine
     }
 
     func ledger() async -> HandoffLedger? {
