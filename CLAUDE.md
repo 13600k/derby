@@ -21,7 +21,7 @@ Pure SwiftPM, **no third-party dependencies**. Only the Command Line Tools are r
 ```bash
 swift build                        # debug build of DerbyCore + DerbyApp
 swift build -c release             # release build
-swift run DerbyTests               # all 629 tests (~7s, no network)
+swift run DerbyTests               # all 634 tests (~7s, no network)
 swift run DerbyTests Routing       # filter by suite or test name
 DERBY_LIVE=1 swift run DerbyTests Live   # opt-in: this machine's real providers
 
@@ -378,6 +378,13 @@ Verified live on this machine while building:
 - **Ollama** verified live, streaming and non-streaming. Current builds honour
   `stream_options.include_usage`; older ones ignore it, which is why the executor estimates
   usage (flagged `isEstimated`) when a stream reports none.
+- **Claude Code's Keychain item is read through `/usr/bin/security`** (`SecurityTool`), the
+  tool Claude Code writes it with and which the item's access list therefore trusts — as
+  Hermes Agent reads it. Read from Derby itself, it asked again after every rebuild: an ad-hoc
+  signature is identified by its hash, so each build is a new app to the Keychain, and one
+  item had collected thirty Derby entries. Write-back after an opt-in refresh stays native:
+  `security -i` splits its input at 4096 bytes, the item is ~5 KB, and as an argument the
+  token would show in `ps`.
 - Derby reads CLI credential stores **read-only by default** ("linked" mode) so it can never
   invalidate the user's `claude`/`codex` login. Token refresh rotates the refresh token, so
   it is opt-in per account and writes the rotated tokens back to keep the CLI working.

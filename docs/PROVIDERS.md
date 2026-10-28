@@ -89,6 +89,8 @@ up after 20 seconds and says exactly that rather than hanging for the request de
 - **Credential.** Claude Code stores its session in the **`Claude Code-credentials`
   Keychain item on macOS**, and often leaves a stale `~/.claude/.credentials.json`
   behind from an older install. Derby reads **both** and uses whichever expires latest.
+  The Keychain item is read through `/usr/bin/security`, which Claude Code writes it with,
+  so reading it raises no dialog — not even after a rebuild changes Derby's signature.
   Reading the file first was a real bug: it produced a long-expired token, and managed
   refresh then failed with HTTP 400 because that refresh token had already been superseded.
 - **Write-back targets the store the credential came from.** Refresh rotates the refresh

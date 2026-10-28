@@ -616,6 +616,25 @@ func registerLiveTests() {
     // MARK: - Claude subscription
 
     suite("Live / Claude subscription") {
+        /// Claude Code writes its Keychain item through `/usr/bin/security`, so
+        /// that tool reads it with no dialog — even for this test binary, which
+        /// is on no item's access list. Reads only; sends nothing.
+        test("the Keychain login is read without a dialog") {
+            let service = CLICredentialReader.claudeCodeKeychainService
+            // Attributes need no access, so this says whether the item exists.
+            guard SecurityTool.run(["find-generic-password", "-s", service]) != nil else {
+                print("      (skipped: no Claude Code login in the Keychain)")
+                return
+            }
+            let started = Clock.monotonic
+            let raw = try expectNotNil(KeychainSecretStore.readForeignGenericPassword(service: service),
+                                       "the item exists but could not be read")
+            let elapsed = Clock.monotonic - started
+            try expect(elapsed < 2, "a read taking \(elapsed)s was waiting on something, likely a dialog")
+            try expectContains(raw, "claudeAiOauth")
+            print("      read in \(Int(elapsed * 1000)) ms, \(raw.utf8.count) bytes")
+        }
+
         /// One request shaped like Hermes's — its system prompt, a tool to call —
         /// through the direct API with the Claude Code login, which must come
         /// back paid for by the plan. Reads the login from a file only

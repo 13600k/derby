@@ -15,6 +15,7 @@ func registerAllTests() {
     registerHTTPTests()
     registerPersistenceTests()
     registerCredentialTests()
+    registerSecurityToolTests()
     registerForwardCompatibilityTests()
     registerCodexCatalogTests()
     registerMultiAccountTests()

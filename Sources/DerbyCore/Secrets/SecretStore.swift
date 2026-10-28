@@ -152,6 +152,12 @@ public final class KeychainSecretStore: SecretStore, @unchecked Sendable {
     /// only to keep a CLI's own credential store in sync after Derby refreshes
     /// a token on its behalf. Returns false when the item is absent or access
     /// is denied.
+    ///
+    /// Unlike reads this stays native, so it can ask once per build. Through
+    /// `security -i` the token would not fit — that splits its input at 4096
+    /// bytes, and Claude Code's item is ~5 KB, twice that as hex — and as an
+    /// argument it would be visible in `ps`. It runs only when opt-in managed
+    /// refresh has rotated a token.
     @discardableResult
     public static func updateForeignGenericPassword(service: String, account: String? = nil,
                                                     value: String) -> Bool {
@@ -159,21 +165,43 @@ public final class KeychainSecretStore: SecretStore, @unchecked Sendable {
                                     kSecAttrService as String: service]
         if let account { query[kSecAttrAccount as String] = account }
         let attributes: [String: Any] = [kSecValueData as String: Data(value.utf8)]
-        return SecItemUpdate(query as CFDictionary, attributes as CFDictionary) == errSecSuccess
+        let updated = SecItemUpdate(query as CFDictionary, attributes as CFDictionary) == errSecSuccess
+        if updated {
+            foreignLock.lock()
+            foreignReads.removeValue(forKey: foreignKey(service, account))
+            foreignLock.unlock()
+        }
+        return updated
+    }
+
+    private static let foreignLock = NSLock()
+    private static var foreignReads: [String: (value: String?, at: Double)] = [:]
+    /// Views read a login several times per render on the main thread, and a
+    /// read is now a process launch (~25 ms) rather than a ~1 ms call.
+    private static let foreignReadLifetime: Double = 2
+
+    private static func foreignKey(_ service: String, _ account: String?) -> String {
+        "\(service)\u{0}\(account ?? "")"
     }
 
     /// Reads a generic-password item belonging to another application (used to
-    /// import CLI credentials). Returns nil rather than throwing when denied.
+    /// import CLI credentials) through `/usr/bin/security`, which never raises a
+    /// dialog for an item that tool wrote. See `SecurityTool`. Returns nil
+    /// rather than throwing when absent or denied.
     public static func readForeignGenericPassword(service: String, account: String? = nil) -> String? {
-        var q: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
-                                kSecAttrService as String: service,
-                                kSecReturnData as String: true,
-                                kSecMatchLimit as String: kSecMatchLimitOne]
-        if let account { q[kSecAttrAccount as String] = account }
-        var item: CFTypeRef?
-        guard SecItemCopyMatching(q as CFDictionary, &item) == errSecSuccess,
-              let data = item as? Data else { return nil }
-        return String(data: data, encoding: .utf8)
+        let key = foreignKey(service, account)
+        foreignLock.lock()
+        if let hit = foreignReads[key], Clock.monotonic - hit.at < foreignReadLifetime {
+            foreignLock.unlock()
+            return hit.value
+        }
+        foreignLock.unlock()
+
+        let value = SecurityTool.readPassword(service: service, account: account)
+        foreignLock.lock()
+        foreignReads[key] = (value, Clock.monotonic)
+        foreignLock.unlock()
+        return value
     }
 }
 
